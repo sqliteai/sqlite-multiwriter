@@ -383,7 +383,7 @@ void mw_cdc_quiesce (mw_db *db) { mw_cdc *c = db->cdc; if (c) { if (!c->ready) {
 // the point up to which the log may be compacted without losing metadata
 void mw_cdc_kick_flush (mw_db *db) { mw_cdc *c = db->cdc; if (c) mw_meta_kick(c->meta); }
 uint64_t mw_cdc_safe_epoch (mw_db *db) { mw_cdc *c = db->cdc; if (c && !c->ready) { mw_meta_ready(c->meta); c->ready = true; } if (!c || !c->ready) return c ? 0 : UINT64_MAX; uint64_t e = mw_meta_safe_epoch(c->meta); if (e != UINT64_MAX) mw_meta_kick(c->meta); return e; }
-void mw_cdc_ensure_schema (sqlite3 *conn, mw_db *db) { if (db->cdc) { (void)mw_meta_schema(conn); (void)mw_meta_register_views(conn); } }
+void mw_cdc_ensure_schema (sqlite3 *conn, mw_db *db) { if (db->cdc) { (void)mw_meta_schema(conn); { mw_cdc *cc = db->cdc; (void)mw_meta_register_views(conn, cc->meta); } } }
 
 // The commit's new pages were renumbered above the end of the file (other commits extended it): what the capture knows about new pages by number is stale. The overflow owners of the
 // new pages are not recorded (a later overflow-only update of them is found by the scan), and the pages the commit allocated and freed again are not on the free list of anybody.

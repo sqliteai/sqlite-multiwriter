@@ -1,6 +1,8 @@
 // Minimal helpers shared by the Multi-Writer test programs.
 #ifndef MW_TEST_H
 #define MW_TEST_H
+#include <glob.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,19 +28,20 @@ static inline int64_t mw_scalar (sqlite3 *db, const char *sql) {
     return v;
 }
 
+// every file that belongs to a database: it, SQLite's own and the engine's (log, segments, index, locks, owner maps): a log that outlives its database is replayed on the next one of the same name
+static inline void mw_rmfiles (const char *path) {
+    char p[600]; const char *sfx[] = {"", "-wal", "-shm", "-journal"};
+    for (int i = 0; i < 4; i++) { snprintf(p, sizeof p, "%s%s", path, sfx[i]); unlink(p); }
+    glob_t g; snprintf(p, sizeof p, "%s-mw*", path);
+    if (glob(p, 0, NULL, &g) == 0) { for (size_t i = 0; i < g.gl_pathc; i++) unlink(g.gl_pathv[i]); globfree(&g); }
+}
 static inline char *mw_tmpdb (char *buf, size_t n, const char *tag) {
     snprintf(buf, n, "/tmp/mw_%s_%d.db", tag, (int)getpid());
-    char p[512];
-    const char *sfx[] = {"", "-wal", "-shm", "-journal"};
-    for (int i = 0; i < 4; i++) { snprintf(p, sizeof p, "%s%s", buf, sfx[i]); unlink(p); }
+    mw_rmfiles(buf);
     return buf;
 }
 
-static inline void mw_rmdb (const char *path) {
-    char p[512];
-    const char *sfx[] = {"", "-wal", "-shm", "-journal"};
-    for (int i = 0; i < 4; i++) { snprintf(p, sizeof p, "%s%s", path, sfx[i]); unlink(p); }
-}
+static inline void mw_rmdb (const char *path) { mw_rmfiles(path); }
 
 #define MW_DONE() do { printf("%s: %d failure(s)\n", __FILE__, mw_failures); return mw_failures ? 1 : 0; } while (0)
 #endif

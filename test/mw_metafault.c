@@ -37,6 +37,7 @@ static void child (const char *path, mw_fault_t fault, int at, int wfd, bool die
         if (i == at) mw_fault_arm(fault, 1);
         char sql[160]; snprintf(sql, sizeof sql, "UPDATE t SET n = n + 1 WHERE id = %d", 1 + i % 20);
         int rc = mw_exec(db, sql);
+        if (getenv("MW_TRACE") && i >= at - 1 && i < at + 8) fprintf(stderr, "   child(%s): commit %d rc=%d %s\n", die ? "die" : "live", i, rc, rc ? sqlite3_errmsg(db) : "");
         if (rc == SQLITE_OK) { acked++; if (write(wfd, &acked, sizeof acked) != sizeof acked) _exit(2); }
         else if (!die && i < at + 3) { mw_fault_disarm_all(); }
     }

@@ -552,7 +552,7 @@ int       mw_log_apply_at (mw_db *db, uint64_t off, uint64_t *out_size, uint64_t
 
 // registry
 void    mw_db_release_ex (mw_db *db, bool sys);
-mw_db  *mw_db_acquire (const char *path, int mode, int mpmode);   // mpmode: 0 single process, 1 multi-process (private stores), 2 multi-process shared mode   // NULL on OOM or if the file is already open in another mode
+mw_db  *mw_db_acquire (const char *path, int mode, int mpmode, bool sys);   // mpmode: 0 single process, 1 multi-process (private stores), 2 multi-process shared mode   // NULL on OOM or if the file is already open in another mode
 void    mw_db_release (mw_db *db);
 
 // snapshots (multiwriter_tx.c)

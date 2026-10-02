@@ -156,7 +156,7 @@ int mw_sync_site_id (sqlite3 *db, uint8_t out[16]) {
 int64_t mw_sync_db_version (sqlite3 *db) { mw_meta *m = meta_of(db); if (!m) return -1; mw_meta_ready(m); return (int64_t)mw_meta_dv(m, mw_meta_epoch(m)); }
 
 // ---- export ----
-typedef struct { uint32_t tid; uint32_t pko; uint32_t pkl; mw_mcell c; int64_t cl; } xcell;      // a cell to export: its table, where its key is in the pool, the cell, the causal length of its row
+typedef mw_xcell xcell;
 static int xcell_cmp (const void *a, const void *b) { const xcell *x = a, *y = b; if (x->c.dv != y->c.dv) return x->c.dv < y->c.dv ? -1 : 1; return x->c.seq != y->c.seq ? (x->c.seq < y->c.seq ? -1 : 1) : 0; }
 int mw_sync_export (sqlite3 *db, int64_t since, uint8_t **payload, size_t *len, int64_t *upto) {
     *payload = NULL; *len = 0;
@@ -170,28 +170,9 @@ int mw_sync_export (sqlite3 *db, int64_t since, uint8_t **payload, size_t *len, 
     sysch sc; buf tuples = {0}; uint32_t nrows = 0;
     rc = sqlite3_exec(db, "BEGIN", NULL, NULL, NULL); if (rc != SQLITE_OK) return rc;
     rc = sch_load(db, &sc); sc.meta = m;
-    // The rows whose newest cell is past `since`, each unpacked: the cells in (since, V] with the causal length of their row, in the order of (db_version, sequence).
-    xcell *xs = NULL; size_t nx = 0, capx = 0; uint8_t *pkpool = NULL; size_t pkn = 0, pkcap = 0;
-    sqlite3_stmt *q = NULL;
-    if (rc == SQLITE_OK) rc = sqlite3_prepare_v2(db, "SELECT tbl, pk, cells FROM mw_rows WHERE dv > ?1", -1, &q, NULL);
-    if (rc == SQLITE_OK) sqlite3_bind_int64(q, 1, since);
-    while (rc == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
-        mw_mcell *rc_cells; int nrc;
-        if (!mw_meta_row_cells(sqlite3_column_blob(q, 2), (size_t)sqlite3_column_bytes(q, 2), &rc_cells, &nrc)) { rc = SQLITE_CORRUPT; break; }
-        int64_t clv = 1; for (int i = 0; i < nrc; i++) if (rc_cells[i].col == CRDT_COL_SENTINEL) clv = rc_cells[i].cv;
-        const void *pk = sqlite3_column_blob(q, 1); size_t pklen = (size_t)sqlite3_column_bytes(q, 1); uint32_t pko = 0; bool stored = false;
-        for (int i = 0; i < nrc && rc == SQLITE_OK; i++) {
-            if (rc_cells[i].dv <= since || rc_cells[i].dv > (int64_t)V) continue;
-            if (!stored) {
-                if (pkn + pklen > pkcap) { size_t nc = (pkn + pklen) * 2 + 4096; uint8_t *np = realloc(pkpool, nc); if (!np) { rc = SQLITE_NOMEM; break; } pkpool = np; pkcap = nc; }
-                memcpy(pkpool + pkn, pk, pklen); pko = (uint32_t)pkn; pkn += pklen; stored = true;
-            }
-            if (nx == capx) { size_t nc = capx ? capx * 2 : 1024; xcell *nxs = realloc(xs, nc * sizeof *xs); if (!nxs) { rc = SQLITE_NOMEM; break; } xs = nxs; capx = nc; }
-            xs[nx++] = (xcell){ (uint32_t)sqlite3_column_int64(q, 0), pko, (uint32_t)pklen, rc_cells[i], clv };
-        }
-        free(rc_cells);
-    }
-    sqlite3_finalize(q); q = NULL;
+    // The cells in (since, V] with the causal length of their row, in the order of (db_version, sequence); read in the snapshot of this connection.
+    xcell *xs = NULL; size_t nx = 0; uint8_t *pkpool = NULL;
+    if (rc == SQLITE_OK && mw_metafile_export(m, db, since, (int64_t)V, &xs, &nx, &pkpool) != 0) rc = SQLITE_ERROR;
     if (rc == SQLITE_OK && nx > 1) qsort(xs, nx, sizeof *xs, xcell_cmp);
     for (size_t xi = 0; rc == SQLITE_OK && xi < nx; xi++) {
         const xcell *x = &xs[xi];

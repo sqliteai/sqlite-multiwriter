@@ -11,6 +11,8 @@
 #include <assert.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <stdio.h>
+#include <unistd.h>
 #include "multiwriter_internal.h"
 
 static mw_db *mw_dbs = NULL;                 // protected by the SQLITE_MUTEX_STATIC_MAIN mutex
@@ -23,7 +25,9 @@ static mw_db *mw_dbs = NULL;                 // protected by the SQLITE_MUTEX_ST
 static void mw_atfork_child (void) { for (mw_db *d = mw_dbs; d; d = d->next) d->orphaned = true; }
 static int mw_atfork_done;
 
-mw_db *mw_db_acquire (const char *path, int mode, int mpmode) {
+// sys: the connection belongs to the metadata store. It is counted together with the reference, under the same mutex: the last connection of the application that closes meanwhile
+// must see both or neither (a count that lags makes it miss that only helper connections are left, and the database is never torn down).
+mw_db *mw_db_acquire (const char *path, int mode, int mpmode, bool sys) {
     const bool mp = mpmode != 0, shared = mpmode == 2;
     sqlite3_mutex *g = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MAIN);
     sqlite3_mutex_enter(g);
@@ -32,7 +36,7 @@ mw_db *mw_db_acquire (const char *path, int mode, int mpmode) {
     while (db && (db->orphaned || strcmp(db->path, path) != 0)) db = db->next;
     if (db) {
         if (db->mode != mode || (mode >= 2 && (db->mp_req != mp || db->shared != shared))) db = NULL;     // one database, one mode (multi-process is a property of the database)
-        else db->refs++;
+        else { db->refs++; if (sys) atomic_fetch_add(&db->sys_refs, 1); }
     } else if ((db = sqlite3_malloc(sizeof(*db))) != NULL) {
         memset(db, 0, sizeof(*db));
         db->path = sqlite3_mprintf("%s", path);
@@ -43,6 +47,7 @@ mw_db *mw_db_acquire (const char *path, int mode, int mpmode) {
             db = NULL;
         } else {
             db->refs = 1;
+            if (sys) atomic_fetch_add(&db->sys_refs, 1);
             db->gc_interval = 64;                    // (the default is set here, not by whichever open sees refs == 1: with concurrent first opens none might, and GC would stay off)
             db->mode = mode;
             db->mp_req = mp;
@@ -94,6 +99,7 @@ void mw_db_release_ex (mw_db *db, bool sys) {
         mw_cdc_quiesce(db);
         sqlite3_mutex_enter(g);
     }
+    if (sys) atomic_fetch_sub(&db->sys_refs, 1);
     if (--db->refs == 0) {
         for (mw_db **pp = &mw_dbs; *pp; pp = &(*pp)->next) {
             if (*pp == db) { *pp = db->next; break; }

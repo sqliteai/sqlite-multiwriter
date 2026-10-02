@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <stdatomic.h>
 #include "multiwriter_meta_priv.h"
+#include "multiwriter_runstore.h"
 #include "multiwriter_internal.h"
 
 typedef struct { mw_mcell *c; int n, cap; } cellvec;
@@ -41,9 +42,9 @@ uint64_t mw_meta_hash (uint32_t tbl, const void *pk, size_t n) {
 mw_meta *mw_meta_new (struct mw_db *db) {
     mw_meta *m = calloc(1, sizeof *m);
     if (!m) return NULL;
-    m->par = 1; { const char *ep = getenv("MW_META_FLUSH_PAR"); if (ep && atoi(ep) > 1) m->par = atoi(ep) > MW_PAR ? MW_PAR : atoi(ep); }
     m->db = db; m->shared = db->shared; m->cap_bytes = 64u << 20;
     const char *e = getenv("MW_META_CACHE_MB"); if (e && atol(e) > 0) m->cap_bytes = (size_t)atol(e) << 20;
+    m->rsx = rsx_new(m->cap_bytes / 2); if (!m->rsx) { free(m); return NULL; }
     for (int i = 0; i < STRIPES; i++) {
         pthread_mutex_init(&m->st[i].mu, NULL);
         m->st[i].nb = 64; m->st[i].b = calloc(m->st[i].nb, sizeof(mentry *));
@@ -63,7 +64,7 @@ void mw_meta_free (mw_meta *m) {
         for (size_t k = 0; m->st[i].b && k < m->st[i].nb; k++) for (mentry *e = m->st[i].b[k], *nx; e; e = nx) { nx = e->next; free(e->cells); free(e); }
         free(m->st[i].b); free(m->st[i].dq); pthread_mutex_destroy(&m->st[i].mu);
     }
-    mw_metafile_free(m); free(m->purge); free(m->bloom);
+    mw_metafile_free(m); rsx_free(m->rsx); free(m->purge); free(m->bloom);
     pthread_mutex_destroy(&m->site_mu); free(m->sites); free(m);
 }
 

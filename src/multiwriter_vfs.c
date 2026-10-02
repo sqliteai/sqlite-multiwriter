@@ -109,7 +109,6 @@ static int mw_close (sqlite3_file *pf) {
         mw_lane_snapshot_end(f->lane);
         mw_db *db = f->lane->db;
         bool sys = f->lane->sys;
-        if (sys) atomic_fetch_sub(&db->sys_refs, 1);
         mw_lane_free(f->lane);
         f->lane = NULL;
         mw_db_release_ex(db, sys);
@@ -253,10 +252,11 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         if (mpmode == 1) mpmode = getenv("MW_MP_PRIVATE") ? 3 : 2;       // shared version index + segmented log is the default; MW_MP_PRIVATE=1 selects the private-store mode (docs §44)
         if (mpmode == 3) mpmode = 1;
         if (mpmode < 0 || mpmode > 2) mpmode = mpmode ? 1 : 0;
-        mw_db *db = mw_db_acquire(name, mode, mpmode);
+        const bool want_sys = sqlite3_uri_boolean(name, "mw_sys", 0) && mode >= 2;
+        mw_db *db = mw_db_acquire(name, mode, mpmode, want_sys);
         mw_lane *lane = db ? sqlite3_malloc(sizeof(mw_lane)) : NULL;
         if (!lane) {
-            mw_db_release(db);
+            mw_db_release_ex(db, want_sys);
             f->real->pMethods->xClose(f->real);
             f->base.pMethods = NULL;
             return SQLITE_NOMEM;
@@ -266,7 +266,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         if (sqlite3_uri_boolean(name, "mw_cdc", 0) && mode >= 2) { sqlite3_mutex_enter(db->mu); if (!db->cdc) (void)mw_cdc_open(db); sqlite3_mutex_leave(db->mu); }
         if (db->cdc && sqlite3_uri_parameter(name, "mw_meta_cache_mb")) mw_cdc_set_cache_mb(db, (int)sqlite3_uri_int64(name, "mw_meta_cache_mb", 64));
         lane->norebase = sqlite3_uri_boolean(name, "mw_norebase", 0) != 0;
-        if (sqlite3_uri_boolean(name, "mw_sys", 0) && mode >= 2) { lane->sys = true; atomic_fetch_add(&db->sys_refs, 1); }
+        if (want_sys) lane->sys = true;
         lane->noreloc = sqlite3_uri_boolean(name, "mw_noreloc", 0) != 0;
         lane->noroute = sqlite3_uri_boolean(name, "mw_noroute", 0) != 0;
         lane->nomerge = sqlite3_uri_boolean(name, "mw_nomerge", 0) != 0;
@@ -291,7 +291,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
             if (rc != SQLITE_OK) {
                 f->lane = NULL;
                 mw_lane_free(lane);
-                mw_db_release(db);
+                mw_db_release_ex(db, want_sys);
                 f->real->pMethods->xClose(f->real);
                 f->base.pMethods = NULL;
                 return rc;

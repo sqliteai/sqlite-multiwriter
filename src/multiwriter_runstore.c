@@ -376,17 +376,27 @@ static int pool_take (mw_rstore *s, int n, uint32_t *out) {                  // 
     return 0;
 }
 // the slots of the free table first (the lowest), then fresh ones past the last in use: taken out of the table (or counted) in one small transaction, and then they are ours
+// The free slots are a bitmap in rows of FREE_CHUNK_BYTES bytes (FREE_CHUNK_SLOTS slots each), every row the same size: freeing and taking slots overwrites rows in place, so this table never allocates
+// or gives back a page of the file either.
+#define FREE_CHUNK_BYTES 512
+#define FREE_CHUNK_SLOTS (FREE_CHUNK_BYTES * 8)
 typedef struct { int want; uint32_t *got; int n; } rsvctx;
 static int rsv_fn (void *ctx, sqlite3 *c) {
-    rsvctx *x = ctx; x->n = 0; sqlite3_stmt *st = NULL;
-    int rc = sqlite3_prepare_v2(c, "SELECT slot FROM mw_free ORDER BY slot LIMIT ?1", -1, &st, NULL); if (rc) return rc;
-    sqlite3_bind_int64(st, 1, x->want);
-    while (x->n < x->want && sqlite3_step(st) == SQLITE_ROW) x->got[x->n++] = (uint32_t)sqlite3_column_int64(st, 0);
-    sqlite3_finalize(st);
-    if (x->n) {
-        sqlite3_stmt *d = NULL; rc = sqlite3_prepare_v2(c, "DELETE FROM mw_free WHERE slot <= ?1", -1, &d, NULL); if (rc) return rc;
-        sqlite3_bind_int64(d, 1, x->got[x->n - 1]); rc = sqlite3_step(d); sqlite3_finalize(d); if (rc != SQLITE_DONE) return rc;
+    rsvctx *x = ctx; x->n = 0; sqlite3_stmt *st = NULL, *up = NULL;
+    int rc = sqlite3_prepare_v2(c, "SELECT chunk, bits FROM mw_free ORDER BY chunk", -1, &st, NULL); if (rc) return rc;
+    rc = sqlite3_prepare_v2(c, "UPDATE mw_free SET bits = ?2 WHERE chunk = ?1", -1, &up, NULL);
+    uint8_t bits[FREE_CHUNK_BYTES];
+    while (!rc && x->n < x->want && sqlite3_step(st) == SQLITE_ROW) {
+        int64_t chunk = sqlite3_column_int64(st, 0); if (sqlite3_column_bytes(st, 1) != FREE_CHUNK_BYTES) continue;
+        memcpy(bits, sqlite3_column_blob(st, 1), FREE_CHUNK_BYTES); bool changed = false;
+        for (int i = 0; i < FREE_CHUNK_BYTES && x->n < x->want; i++) if (bits[i]) for (int b = 0; b < 8 && x->n < x->want; b++) if (bits[i] & (1u << b)) {
+            int64_t slot = chunk * FREE_CHUNK_SLOTS + i * 8 + b; if (slot <= 0) continue;
+            x->got[x->n++] = (uint32_t)slot; bits[i] &= (uint8_t)~(1u << b); changed = true;
+        }
+        if (changed) { sqlite3_bind_int64(up, 1, chunk); sqlite3_bind_blob(up, 2, bits, FREE_CHUNK_BYTES, SQLITE_STATIC); int r2 = sqlite3_step(up); sqlite3_reset(up); if (r2 != SQLITE_DONE) rc = r2; }
     }
+    sqlite3_finalize(st); sqlite3_finalize(up);
+    if (rc) return rc;
     if (x->n < x->want) {
         int64_t next = state_get(c, "next_slot", 1);
         for (int i = x->n; i < x->want; i++) x->got[i] = (uint32_t)(next + (i - x->n));
@@ -395,6 +405,28 @@ static int rsv_fn (void *ctx, sqlite3 *c) {
     }
     if (!state_get(c, "slot_bytes", 0)) { rc = state_put(c, "slot_bytes", compute_slot_bytes(c)); if (rc) return rc; }
     return 0;
+}
+static int slot_cmp (const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
+// the slots become free: their bits are set (one read and one write of a row for all the slots of its chunk)
+static int free_slots (sqlite3 *c, uint32_t *sl, size_t n) {
+    if (!n) return 0;
+    qsort(sl, n, sizeof *sl, slot_cmp);
+    sqlite3_stmt *sel = NULL, *up = NULL, *ins = NULL;
+    int rc = sqlite3_prepare_v2(c, "SELECT bits FROM mw_free WHERE chunk = ?1", -1, &sel, NULL);
+    if (!rc) rc = sqlite3_prepare_v2(c, "UPDATE mw_free SET bits = ?2 WHERE chunk = ?1", -1, &up, NULL);
+    if (!rc) rc = sqlite3_prepare_v2(c, "INSERT INTO mw_free(chunk, bits) VALUES(?1, ?2)", -1, &ins, NULL);
+    uint8_t bits[FREE_CHUNK_BYTES];
+    for (size_t i = 0; !rc && i < n; ) {
+        int64_t chunk = (int64_t)(sl[i] / FREE_CHUNK_SLOTS); bool have = false;
+        sqlite3_bind_int64(sel, 1, chunk);
+        if (sqlite3_step(sel) == SQLITE_ROW && sqlite3_column_bytes(sel, 0) == FREE_CHUNK_BYTES) { memcpy(bits, sqlite3_column_blob(sel, 0), FREE_CHUNK_BYTES); have = true; } else memset(bits, 0, sizeof bits);
+        sqlite3_reset(sel);
+        while (i < n && (int64_t)(sl[i] / FREE_CHUNK_SLOTS) == chunk) { uint32_t o = sl[i] % FREE_CHUNK_SLOTS; bits[o / 8] |= (uint8_t)(1u << (o % 8)); i++; }
+        sqlite3_stmt *w = have ? up : ins; sqlite3_bind_int64(w, 1, chunk); sqlite3_bind_blob(w, 2, bits, FREE_CHUNK_BYTES, SQLITE_STATIC);
+        int r2 = sqlite3_step(w); sqlite3_reset(w); if (r2 != SQLITE_DONE) rc = r2;
+    }
+    sqlite3_finalize(sel); sqlite3_finalize(up); sqlite3_finalize(ins);
+    return rc;
 }
 static int pool_reserve (mw_rstore *s, sqlite3 *c, int want) {            // (no transaction of c is open; the writers' turn is taken inside)
     rsvctx x = { want, malloc((size_t)want * sizeof(uint32_t)), 0 }; if (!x.got) return SQLITE_NOMEM;
@@ -405,7 +437,8 @@ static int pool_reserve (mw_rstore *s, sqlite3 *c, int want) {            // (no
 static int pool_ensure (mw_rstore *s, sqlite3 *c, size_t need) {
     pthread_mutex_lock(&s->pmu); size_t have = s->npool; pthread_mutex_unlock(&s->pmu);
     if (have >= need) return 0;
-    return pool_reserve(s, c, (int)(need - have) + 64);
+    size_t want = need - have + 64; if (want < 1024) want = 1024;                          // (a transaction for every few slots would be all the writing of the flush and the merge: take them by the thousand)
+    return pool_reserve(s, c, (int)want);
 }
 
 // writing the slots of a block (in place when the slot exists: the same size)
@@ -540,14 +573,14 @@ static int tx_remove_run (rsx_tx *t, sqlite3 *c, const rs_run *r) {
     if (rc != SQLITE_OK) return rc;
     sqlite3_bind_int64(st, 1, r->id); rc = sqlite3_step(st); sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return rc ? rc : -1;
-    st = NULL; rc = sqlite3_prepare_v2(c, "INSERT OR IGNORE INTO mw_free(slot) VALUES(?1)", -1, &st, NULL); if (rc) return rc;
-    for (uint32_t b = 0; b < r->nblk && !rc; b++) {
-        uint32_t stored, loclen; const uint8_t *loc; rs_run_block_info(r, b, &stored, &loc, &loclen);
+    size_t cap = 256, n = 0; uint32_t *sl = malloc(cap * sizeof *sl); if (!sl) return SQLITE_NOMEM;
+    for (uint32_t b = 0; b <= r->nblk; b++) {                                                      // (the slots of its blocks, then of its meta)
+        const uint8_t *loc; uint32_t stored, loclen;
+        if (b < r->nblk) rs_run_block_info(r, b, &stored, &loc, &loclen); else { loc = r->mloc; loclen = r->mlocl; }
         const uint8_t *p = loc, *end = loc + loclen; uint64_t slot;
-        while (!rc && sl_get(&p, end, &slot)) { sqlite3_bind_int64(st, 1, (int64_t)slot); rc = sqlite3_step(st); sqlite3_reset(st); if (rc == SQLITE_DONE) rc = 0; }
+        while (loc && sl_get(&p, end, &slot)) { if (n == cap) { cap *= 2; uint32_t *ns = realloc(sl, cap * sizeof *sl); if (!ns) { free(sl); return SQLITE_NOMEM; } sl = ns; } sl[n++] = (uint32_t)slot; }
     }
-    if (!rc && r->mloc) { const uint8_t *p = r->mloc, *end = r->mloc + r->mlocl; uint64_t slot; while (!rc && sl_get(&p, end, &slot)) { sqlite3_bind_int64(st, 1, (int64_t)slot); rc = sqlite3_step(st); sqlite3_reset(st); if (rc == SQLITE_DONE) rc = 0; } }
-    sqlite3_finalize(st);
+    rc = free_slots(c, sl, n); free(sl);
     if (rc) return rc;
     if (t->nrem == t->caprem) { int nc = t->caprem ? t->caprem * 2 : 8; int64_t *nr = realloc(t->rem, (size_t)nc * sizeof *nr); if (!nr) return SQLITE_NOMEM; t->rem = nr; t->caprem = nc; }
     t->rem[t->nrem++] = r->id;
@@ -678,14 +711,19 @@ int rsx_sweep (mw_rstore *s, sqlite3 *rd, sqlite3 *wr) {
         }
         for (int ri = 0; !rc && ri < man->n; ri++) if (man->runs[ri]->mloc) { const uint8_t *p = man->runs[ri]->mloc, *end = p + man->runs[ri]->mlocl; uint64_t sl; while (sl_get(&p, end, &sl)) if ((int64_t)sl <= maxslot) mark[sl] = 1; }
         sqlite3_stmt *q = NULL;
-        if (!rc && sqlite3_prepare_v2(wr, "SELECT slot FROM mw_free", -1, &q, NULL) == SQLITE_OK) { while (sqlite3_step(q) == SQLITE_ROW) { int64_t sl = sqlite3_column_int64(q, 0); if (sl > 0 && sl <= maxslot) mark[sl] = 1; } }
+        if (!rc && sqlite3_prepare_v2(wr, "SELECT chunk, bits FROM mw_free", -1, &q, NULL) == SQLITE_OK) {
+            while (sqlite3_step(q) == SQLITE_ROW) { int64_t chunk = sqlite3_column_int64(q, 0); const uint8_t *bits = sqlite3_column_blob(q, 1); if (sqlite3_column_bytes(q, 1) != FREE_CHUNK_BYTES) continue;
+                for (int i = 0; i < FREE_CHUNK_BYTES; i++) if (bits[i]) for (int b = 0; b < 8; b++) if (bits[i] & (1u << b)) { int64_t sl = chunk * FREE_CHUNK_SLOTS + i * 8 + b; if (sl > 0 && sl <= maxslot) mark[sl] = 1; } }
+        }
         sqlite3_finalize(q);
         pthread_mutex_lock(&s->pmu); for (size_t i = 0; i < s->npool; i++) if (s->pool[i] <= (uint64_t)maxslot) mark[s->pool[i]] = 1; pthread_mutex_unlock(&s->pmu);
-        q = NULL; sqlite3_stmt *ins = NULL;
-        if (!rc && sqlite3_prepare_v2(wr, "SELECT slot FROM mw_slots", -1, &q, NULL) == SQLITE_OK && sqlite3_prepare_v2(wr, "INSERT OR IGNORE INTO mw_free(slot) VALUES(?1)", -1, &ins, NULL) == SQLITE_OK) {
-            while (!rc && sqlite3_step(q) == SQLITE_ROW) { int64_t sl = sqlite3_column_int64(q, 0); if (sl > 0 && sl <= maxslot && !mark[sl]) { sqlite3_bind_int64(ins, 1, sl); int r2 = sqlite3_step(ins); sqlite3_reset(ins); if (r2 != SQLITE_DONE) rc = r2; else leaked++; } }
+        q = NULL; size_t lcap = 256; uint32_t *lk = malloc(lcap * sizeof *lk); size_t ln = 0; if (!lk) rc = SQLITE_NOMEM;
+        if (!rc && sqlite3_prepare_v2(wr, "SELECT slot FROM mw_slots", -1, &q, NULL) == SQLITE_OK) {
+            while (sqlite3_step(q) == SQLITE_ROW) { int64_t sl = sqlite3_column_int64(q, 0); if (sl > 0 && sl <= maxslot && !mark[sl]) { if (ln == lcap) { lcap *= 2; uint32_t *nl = realloc(lk, lcap * sizeof *lk); if (!nl) { rc = SQLITE_NOMEM; break; } lk = nl; } lk[ln++] = (uint32_t)sl; } }
         }
-        sqlite3_finalize(q); sqlite3_finalize(ins);
+        sqlite3_finalize(q);
+        if (!rc) { rc = free_slots(wr, lk, ln); leaked = (int)ln; }
+        free(lk);
     }
     free(mark); rsx_man_release(man);
     if (!rc) rc = sqlite3_exec(wr, "COMMIT", NULL, NULL, NULL);

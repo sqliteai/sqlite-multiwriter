@@ -17,7 +17,7 @@ static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS mw_sites(ord INTEGER PRIMARY KEY, id BLOB NOT NULL);"
     "CREATE TABLE IF NOT EXISTS mw_runs(run INTEGER PRIMARY KEY, age INTEGER NOT NULL, lvl INTEGER NOT NULL, nrows INTEGER NOT NULL, nblk INTEGER NOT NULL, dvmax INTEGER NOT NULL, metalen INTEGER NOT NULL, metaloc BLOB NOT NULL);"
     "CREATE TABLE IF NOT EXISTS mw_slots(slot INTEGER PRIMARY KEY, data BLOB NOT NULL);"
-    "CREATE TABLE IF NOT EXISTS mw_free(slot INTEGER PRIMARY KEY);"
+    "CREATE TABLE IF NOT EXISTS mw_free(chunk INTEGER PRIMARY KEY, bits BLOB NOT NULL);"
     "CREATE TABLE IF NOT EXISTS mw_drops(tbl INTEGER PRIMARY KEY, dv INTEGER NOT NULL);";
 
 static uint64_t now_ns (void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }

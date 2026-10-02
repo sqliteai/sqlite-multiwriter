@@ -27,8 +27,8 @@ Open a database through the VFS with `file:db?mw=2&mw_cdc=1` (threads, one proce
 3. **CRDT core** (`src/crdt/`): the algorithms of sqlite-sync as functions over an abstract state: causal length per row (odd = alive), column version per cell (odd =
    alive, +2 per local update, +1 when it is even), the merge of a remote change (causal length, then column version, then the value, then the site id), the primary-key
    byte format. It is differentially tested against the real sqlite-sync (`test/oracle_*.c`).
-4. **Metadata store** (`multiwriter_meta*.c`, `multiwriter_mmeta.c`): per row the cells (column version, db_version, site, sequence). In one process a striped memory table
-   in front of three ordinary tables of the database file; in several processes a shared index of row buckets into the log. See below.
+4. **Metadata store** (`multiwriter_meta*.c`, `multiwriter_mmeta.c`, `multiwriter_runs.c`, `multiwriter_runstore.c`): per row the cells (column version, db_version, site, sequence). In one process a striped memory table
+   in front of sorted runs kept in ordinary tables of the database file; in several processes a shared index of row buckets into the log. See below.
 5. **Sync API** (`multiwriter_sync.c`): site id, db_version, export a payload since a db_version, apply a payload atomically.
 
 ## What a commit carries
@@ -60,15 +60,29 @@ writes have the head epoch the transaction read them at, installs them, and publ
 cookie moves, under the publication lock. The site table and the list of dropped tables are in the shared header. The flusher is whichever process claims it (a byte lock).
 
 ### The file tables
-`mw_state(k, v)` (`meta_epoch`, `dv_hwm`), `mw_sites(ord, id)` and `mw_rows(tbl, pk, dv, cells)` (WITHOUT ROWID, key `(tbl, pk)`), created by the first connection. A row of `mw_rows` is **one
-row of a user table**: `dv` is the largest db_version among its cells and `cells` is the packed state of all of them (a format byte, the number of cells, then per cell the column + 1 so that the
-sentinel is 0, the version, the db_version, the sequence and the site, as varints). The flush *replaces* the row: the cells are always the complete state, so nothing is read before it is written and a
-cell that disappeared (a dropped column) disappears with it. Packing is what makes wide tables cheap: the flusher does one b-tree insert per row instead of one per cell (a table with five columns
-besides its key flushes in about a quarter of the time, and tracked bulk inserts into it run 3.6 times faster: 2.4k to 8.6k tx/s at 8 threads). The index the export needs, `mw_rows_dv(dv)`, is created by the
-first export (databases that never synchronise do not pay for it). `mw_cells` is a read-only virtual table over `mw_rows` with the columns of the cells (`tbl, pk, col, cv, dv, seq, site`; `col` -1 is
-the causal length), for looking at the metadata in SQL. They are ordinary tables, so the file is self-contained: copy it and the CRDT state comes along. A flusher thread writes what changed since the last flush
-in ordinary logged transactions together with `meta_epoch`: the batch and the epoch it covers are atomic. Reads that miss the cache go through a small pool of read-only connections. With
-`MW_META_FLUSH_PAR=2` a large flush is cut in key ranges written by two connections at once (+10 to +17% on narrow tables; more connections do not help: conflicts on the pages above the leaves).
+`mw_state(k, v)` (`meta_epoch`, `dv_hwm`, `runs_ver`, `next_run`, `next_age`), `mw_sites(ord, id)`, `mw_runs`, `mw_blocks` and `mw_drops`, created by the first connection. They are ordinary tables, so
+the file is self-contained: copy it and the CRDT state comes along. The state of the rows lives in **sorted runs** (`multiwriter_runs.c`, `multiwriter_runstore.c`):
+
+- A *run* is an immutable sequence of rows in key order (table, then key bytes), cut in blocks of about 16 KB. A row is one row of a user table: its key, the largest db_version among its cells and its
+  cells packed as varints (a format byte, the number of cells, then per cell the column + 1 so that the sentinel is 0, the version, the db_version, the sequence and the site). A row with no cells is a
+  deletion marker. The blocks are rows of `mw_blocks(run, blk, data)`; `mw_runs` has one row per run with its *meta*: the first key and the newest db_version of every block, the last key, a Bloom filter
+  (10 bits a row). The metas are kept in memory (a few percent of the data); the blocks are read through a small cache.
+- The flush writes one run (level 0) for every 32768 rows of the batch, in one ordinary logged transaction together with `meta_epoch`, `runs_ver` and the other counters: the batch and the epoch it
+  covers are atomic. It does one pass over the dirty rows, packs them straight into the batch and writes blocks: about 0.15 us a row (the b-tree it replaced, one insert per row, cost 0.7 to 1 us, and
+  4 us with random keys). The rows in memory are the complete state of the row, so the flush replaces; nothing is read before it is written.
+- A *lookup* asks the runs newest first: the key range and the Bloom filter of the run, the fence keys to find the block, the block (cache, or the file), a binary search in it. The first run that has the key
+  answers (a deletion marker: not found). An insert of a key that the filter of known keys has never seen asks nothing.
+- *Merging* is done by a thread of its own: the `fanout` (8) oldest age groups of the lowest level that has that many are merged into the next level, in parts of 128 K rows (new parts first, as ordinary
+  transactions; the inputs are removed last, so a crash in between leaves the same rows twice, which does no harm). The oldest data drops deletion markers and the rows of dropped tables. Flush and merge
+  take one write transaction at a time; with several processes one of them merges at a time (a byte lock) and the others flush.
+- *Export* reads only the blocks whose newest db_version is past `since` (no index to maintain), takes the keys of their rows, and asks the runs for the newest state of each key. `mw_cells` is a read-only
+  virtual table over the runs with the columns of a cell (`tbl, pk, col, cv, dv, seq, site`; `col` -1 is the causal length), for looking at the metadata in SQL (it reads everything into memory: it is a tool
+  for looking). The commits of the metadata connections themselves are not captured (they write only `mw_*` tables, never tracked).
+- Reads that miss the cache of rows go through a small pool of read-only connections, one transaction for the keys of a commit.
+
+Costs and limits: the file is larger while merges lag (every run is written once at its level, and merged output exists beside its inputs until they are removed: 1 to 2 GB more in the benchmarks below, which write
+tens of millions of rows); opening a database reads the keys of all blocks once to fill the filter of known keys (as the b-tree scan did); a database written by an earlier layout of the metadata (`mw_rows`, `mw_cells` as a
+table) has none of the new tables and starts without metadata. Tuning for tests: `MW_META_FANOUT`, `MW_META_PART_ROWS`, `MW_META_CACHE_MB`, `MW_META_FLUSH_ROWS`, `MW_META_FLUSH_MS`, `MW_META_NOMERGE`.
 
 ### Durability and recovery (the rule that makes it ACID)
 - A commit is durable when its record is in the log; its metadata is in the record. A crash can therefore never leave pages without their metadata or metadata without

@@ -396,13 +396,14 @@ static void *merger_main (void *arg) {
         }
         bool stop = m->mth_stop; m->mkick = false; pthread_mutex_unlock(&m->mth_mu);
         if (stop) break;
+        if (m->shared && !mw_mp_meta_lock(m->db, 2, false)) continue;                          // (several processes: one of them merges at a time; the others' flushes go on)
         if (!m->mrd) m->mrd = open_conn(m);
         if (!m->mwr) m->mwr = open_conn(m);
-        if (!m->mrd || !m->mwr) continue;
-        for (;;) {
+        if (m->mrd && m->mwr) for (;;) {
             pthread_mutex_lock(&m->mth_mu); bool st = m->mth_stop; pthread_mutex_unlock(&m->mth_mu);
             if (st || rsx_merge(m->rsx, m->mrd, m->mwr, m->fanout, m->part_rows) <= 0) break;
         }
+        if (m->shared) mw_mp_meta_unlock(m->db, 2);
     }
     return NULL;
 }
@@ -463,10 +464,7 @@ static int flush_impl (mw_meta *m, bool wait) {
         atomic_fetch_add(&m->n_flushes, 1);
     }
     if (rc == SQLITE_OK && !atomic_load(&m->quiescing) && !getenv("MW_META_NOMERGE")) {         // the runs the flushes made are merged into bigger ones (a few rounds a flush at most)
-        if (m->shared) {                                                                        // (several processes: the merge is done here, under the lock of the flush)
-            if (!m->mrd) m->mrd = open_conn(m);
-            if (m->mrd) for (int round = 0; round < 8 && rsx_merge(m->rsx, m->mrd, m->wr, m->fanout, m->part_rows) > 0; round++) ;
-        } else merge_kick(m);
+        merge_kick(m);
     }
     atomic_fetch_add(&m->flush_ns, now_ns() - t0);
     m->last_flush_ns = now_ns();

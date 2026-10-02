@@ -44,12 +44,15 @@ mw_meta *mw_meta_new (struct mw_db *db) {
     if (!m) return NULL;
     m->db = db; m->shared = db->shared; m->cap_bytes = 64u << 20;
     const char *e = getenv("MW_META_CACHE_MB"); if (e && atol(e) > 0) m->cap_bytes = (size_t)atol(e) << 20;
+    m->fanout = 8; m->part_rows = 1u << 17;
+    { const char *e = getenv("MW_META_FANOUT"); if (e && atoi(e) >= 2) m->fanout = atoi(e); e = getenv("MW_META_PART_ROWS"); if (e && atoll(e) >= 1) m->part_rows = (uint64_t)atoll(e); }       // (tests: merge at every chance, in small parts)
     m->rsx = rsx_new(m->cap_bytes / 2); if (!m->rsx) { free(m); return NULL; }
     for (int i = 0; i < STRIPES; i++) {
         pthread_mutex_init(&m->st[i].mu, NULL);
         m->st[i].nb = 64; m->st[i].b = calloc(m->st[i].nb, sizeof(mentry *));
         if (!m->st[i].b) { mw_meta_free(m); return NULL; }
     }
+    pthread_mutex_init(&m->mth_mu, NULL); pthread_cond_init(&m->mth_cv, NULL);
     pthread_mutex_init(&m->site_mu, NULL); pthread_mutex_init(&m->purge_mu, NULL); pthread_mutex_init(&m->file_mu, NULL); pthread_mutex_init(&m->th_mu, NULL); pthread_cond_init(&m->th_cv, NULL);
     for (int i = 0; i < MW_RDN; i++) pthread_mutex_init(&m->rdmu[i], NULL);
     m->capsites = 16; m->sites = calloc(m->capsites, 16); m->nsites = 1;
@@ -65,6 +68,7 @@ void mw_meta_free (mw_meta *m) {
         free(m->st[i].b); free(m->st[i].dq); pthread_mutex_destroy(&m->st[i].mu);
     }
     mw_metafile_free(m); rsx_free(m->rsx); free(m->purge); free(m->bloom);
+    pthread_mutex_destroy(&m->mth_mu); pthread_cond_destroy(&m->mth_cv);
     pthread_mutex_destroy(&m->site_mu); free(m->sites); free(m);
 }
 

@@ -19,7 +19,7 @@ typedef struct { uint32_t tbl; int64_t dv; } rdrop;
 struct mw_rman { _Atomic int refs; int64_t ver; rs_run **runs; int n; rdrop *drops; int nd; };
 
 struct mw_rstore {
-    pthread_mutex_t mu; mw_rman *cur;
+    pthread_mutex_t mu, wmu; mw_rman *cur;
     cslot *slots; size_t nslots; pthread_mutex_t cmu[CSTRIPES];
     _Atomic uint64_t gets, run_probes, bloom_skips, blk_reads, cache_hits, merges, merged_rows, runs_written;
 };
@@ -109,7 +109,7 @@ int rsx_man (mw_rstore *s, sqlite3 *c, mw_rman **out) {
 // ---- the store ----
 mw_rstore *rsx_new (size_t cache_bytes) {
     mw_rstore *s = calloc(1, sizeof *s); if (!s) return NULL;
-    pthread_mutex_init(&s->mu, NULL);
+    pthread_mutex_init(&s->mu, NULL); pthread_mutex_init(&s->wmu, NULL);
     for (int i = 0; i < CSTRIPES; i++) pthread_mutex_init(&s->cmu[i], NULL);
     s->nslots = cache_bytes / (RS_BLOCK_TARGET + 1024); if (s->nslots < 64) s->nslots = 64;
     s->slots = calloc(s->nslots, sizeof *s->slots);
@@ -122,8 +122,10 @@ void rsx_free (mw_rstore *s) {
     for (size_t i = 0; i < s->nslots; i++) cblk_unref(s->slots[i].b);
     free(s->slots); rsx_man_release(s->cur);
     for (int i = 0; i < CSTRIPES; i++) pthread_mutex_destroy(&s->cmu[i]);
-    pthread_mutex_destroy(&s->mu); free(s);
+    pthread_mutex_destroy(&s->mu); pthread_mutex_destroy(&s->wmu); free(s);
 }
+void rsx_wlock (mw_rstore *s) { pthread_mutex_lock(&s->wmu); }
+void rsx_wunlock (mw_rstore *s) { pthread_mutex_unlock(&s->wmu); }
 void rsx_stats_get (mw_rstore *s, rsx_stats *o) {
     o->gets = atomic_load(&s->gets); o->run_probes = atomic_load(&s->run_probes); o->bloom_skips = atomic_load(&s->bloom_skips); o->blk_reads = atomic_load(&s->blk_reads);
     o->cache_hits = atomic_load(&s->cache_hits); o->merges = atomic_load(&s->merges); o->merged_rows = atomic_load(&s->merged_rows); o->runs_written = atomic_load(&s->runs_written);
@@ -380,9 +382,10 @@ static int m_end (void *sctx, const uint8_t *meta, size_t ml, uint64_t nr, uint3
     mctx *m = sctx; sqlite3 *c = m->wr; int rc = SQLITE_BUSY;
     for (int attempt = 0; attempt < 400 && busyish(rc); attempt++) {
         if (attempt) usleep(1000u * (unsigned)(attempt < 20 ? attempt : 20));
-        rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL); if (rc) continue;
+        rsx_wlock(m->s);
+        rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL); if (rc) { rsx_wunlock(m->s); continue; }
         rsx_tx *t = rsx_tx_begin(m->s, c);
-        if (!t) { sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL); rc = SQLITE_NOMEM; break; }
+        if (!t) { sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL); rsx_wunlock(m->s); rc = SQLITE_NOMEM; break; }
         rc = tx_prepare(t, c);
         int64_t id = t->next_run++;
         wctx w = { t, id };
@@ -392,6 +395,7 @@ static int m_end (void *sctx, const uint8_t *meta, size_t ml, uint64_t nr, uint3
         if (!rc) rc = sqlite3_exec(c, "COMMIT", NULL, NULL, NULL);
         if (rc) sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL);
         rsx_tx_end(t, rc == SQLITE_OK);
+        rsx_wunlock(m->s);
     }
     mctx_clear(m);
     return rc;
@@ -406,9 +410,17 @@ int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, int fanout, uint64_t part
     int lvl = -1;
     for (int L = 0; L < 24 && lvl < 0; L++) { int groups = 0; int64_t last = -1; for (int i = 0; i < man->n; i++) if (man->runs[i]->lvl == L && man->runs[i]->age != last) { groups++; last = man->runs[i]->age; } if (groups >= fanout) lvl = L; }
     if (lvl < 0) { rsx_man_release(man); return 0; }
+    // the `fanout` oldest age groups of that level (the manifest is newest first, so they are at its end): a merge has a bounded size however many runs have piled up
     rs_run **in = malloc((size_t)man->n * sizeof *in); int nin = 0; int64_t minage = INT64_MAX;
     if (!in) { rsx_man_release(man); return -1; }
-    for (int i = 0; i < man->n; i++) if (man->runs[i]->lvl == lvl) { in[nin++] = man->runs[i]; if (man->runs[i]->age < minage) minage = man->runs[i]->age; }
+    { int groups = 0; int64_t last = -1;
+      for (int i = man->n - 1; i >= 0 && groups <= fanout; i--) {
+          if (man->runs[i]->lvl != lvl) continue;
+          if (man->runs[i]->age != last) { groups++; last = man->runs[i]->age; if (groups > fanout) break; }
+          in[nin++] = man->runs[i]; if (man->runs[i]->age < minage) minage = man->runs[i]->age;
+      }
+      // (collected oldest first: the merge wants the newest first)
+      for (int a = 0, b = nin - 1; a < b; a++, b--) { rs_run *t = in[a]; in[a] = in[b]; in[b] = t; } }
     bool bottom = true; for (int i = 0; i < man->n; i++) if (man->runs[i]->age < minage) bottom = false;
     plainctx pc; if (sqlite3_prepare_v2(rd, rsx_blk_sql(), -1, &pc.st, NULL) != SQLITE_OK) { free(in); rsx_man_release(man); return -1; }
     mctx mc = { s, wr, lvl + 1, in[0]->age, man, NULL, 0, 0, 0 };
@@ -420,14 +432,16 @@ int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, int fanout, uint64_t part
         rc = SQLITE_BUSY;
         for (int attempt = 0; attempt < 400 && busyish(rc); attempt++) {
             if (attempt) usleep(1000u * (unsigned)(attempt < 20 ? attempt : 20));
-            rc = sqlite3_exec(wr, "BEGIN", NULL, NULL, NULL); if (rc) continue;
+            rsx_wlock(s);
+            rc = sqlite3_exec(wr, "BEGIN", NULL, NULL, NULL); if (rc) { rsx_wunlock(s); continue; }
             rsx_tx *t = rsx_tx_begin(s, wr);
-            if (!t) { sqlite3_exec(wr, "ROLLBACK", NULL, NULL, NULL); rc = SQLITE_NOMEM; break; }
+            if (!t) { sqlite3_exec(wr, "ROLLBACK", NULL, NULL, NULL); rsx_wunlock(s); rc = SQLITE_NOMEM; break; }
             for (int i = 0; !rc && i < nin; i++) rc = tx_remove_run(t, wr, in[i]->id);
             if (!rc) rc = rsx_tx_finish(t, wr);
             if (!rc) rc = sqlite3_exec(wr, "COMMIT", NULL, NULL, NULL);
             if (rc) sqlite3_exec(wr, "ROLLBACK", NULL, NULL, NULL);
             rsx_tx_end(t, rc == SQLITE_OK);
+            rsx_wunlock(s);
         }
     }
     free(in); rsx_man_release(man);

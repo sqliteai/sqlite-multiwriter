@@ -135,7 +135,7 @@ static int lane_publish (mw_lane *lane) {
     }
     { static _Atomic int tr = MW_KNOB_UNSET; if (mw_knob_flag(&tr, "MW_PAGE_TRACE")) { char line[2048]; int o = snprintf(line, sizeof line, "PAGES n=%d:", lane->ws_n); for (int i = 0; i < lane->ws_n && o < (int)sizeof line - 12; i++) o += snprintf(line + o, sizeof line - (size_t)o, " %u", (unsigned)lane->ws_pgnos[i]); fprintf(stderr, "%s\n", line); } }   // (diagnostic: the page numbers of every commit, to map them to B-trees offline)
     if (mw_rowdiff_enabled() && !lane->norebase) mw_rowdiff_commit(lane, imgs);
-    if (db->cdc && !lane->norebase) mw_cdc_prepare(lane, imgs);
+    if (db->cdc && !lane->norebase) { if (lane->sys) mw_cdc_skip(lane); else mw_cdc_prepare(lane, imgs); }       // (the metadata store's own commits write only mw_* tables: never tracked, never in the owner maps: nothing to capture)
     mw_validate v = { .snapshot_epoch = lane->tx.snapshot_epoch, .check_cookie = true, .cookie = cookie, .read_pgnos = ro, .n_read = nro,
                       .own_pgnos = lane->own_pg, .own_n = lane->own_n, .own_epoch = lane->own_epoch };
     uint64_t epoch = 0;

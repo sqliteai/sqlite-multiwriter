@@ -106,7 +106,7 @@ static sqlite3 *open_conn (mw_meta *m) {
 void mw_metafile_free (mw_meta *m) {
     for (int i = 0; i < MW_RDN; i++) { sqlite3_finalize(m->rds[i]); sqlite3_close(m->rd[i]); m->rds[i] = NULL; m->rd[i] = NULL; }
     sqlite3_close(m->wr); m->wr = NULL;
-    sqlite3_close(m->mrd); m->mrd = NULL;
+    sqlite3_close(m->mrd); m->mrd = NULL; sqlite3_close(m->mwr); m->mwr = NULL;
     free(m->uri); m->uri = NULL;
 }
 
@@ -334,9 +334,10 @@ static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool l
     int rc;
     if (!atomic_load_explicit(&m->schema_seen, memory_order_relaxed)) { rc = mw_meta_schema(c); if (rc != SQLITE_OK) return rc; atomic_store(&m->schema_seen, true); }
     atomic_store(&m->tables_ok, true);
-    if ((rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL)) != SQLITE_OK) return rc;
+    rsx_wlock(m->rsx);
+    if ((rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL)) != SQLITE_OK) { rsx_wunlock(m->rsx); return rc; }
     rsx_tx *t = rsx_tx_begin(m->rsx, c);
-    if (!t) { sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL); return SQLITE_NOMEM; }
+    if (!t) { sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL); rsx_wunlock(m->rsx); return SQLITE_NOMEM; }
     sqlite3_stmt *site = NULL, *state = NULL, *hw = NULL;
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_sites(ord, id) VALUES(?1, ?2)", -1, &site, NULL);
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_state(k, v) VALUES('meta_epoch', ?1)", -1, &state, NULL);
@@ -361,6 +362,7 @@ static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool l
     if (rc != SQLITE_OK) sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL);
     else atomic_fetch_add(&m->flushed_cells, cells);
     rsx_tx_end(t, rc == SQLITE_OK);
+    rsx_wunlock(m->rsx);
     return rc;
 }
 
@@ -381,6 +383,38 @@ static int write_range (mw_meta *m, sqlite3 *c, fitem *v, int i0, int n, bool la
     }
     return rc;
 }
+void mw_meta_run_stats (mw_meta *m, uint64_t out[9]) { rsx_stats st; rsx_stats_get(m->rsx, &st); out[0] = st.gets; out[1] = st.run_probes; out[2] = st.bloom_skips; out[3] = st.blk_reads; out[4] = st.cache_hits; out[5] = st.merges; out[6] = st.merged_rows; out[7] = st.runs_written; out[8] = (uint64_t)st.nruns; }
+
+// ---- the merger thread (one process) ----
+static void *merger_main (void *arg) {
+    mw_meta *m = arg;
+    for (;;) {
+        pthread_mutex_lock(&m->mth_mu);
+        while (!m->mth_stop && !m->mkick) {
+            struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_nsec += 500 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+            if (pthread_cond_timedwait(&m->mth_cv, &m->mth_mu, &until) != 0) break;
+        }
+        bool stop = m->mth_stop; m->mkick = false; pthread_mutex_unlock(&m->mth_mu);
+        if (stop) break;
+        if (!m->mrd) m->mrd = open_conn(m);
+        if (!m->mwr) m->mwr = open_conn(m);
+        if (!m->mrd || !m->mwr) continue;
+        for (;;) {
+            pthread_mutex_lock(&m->mth_mu); bool st = m->mth_stop; pthread_mutex_unlock(&m->mth_mu);
+            if (st || rsx_merge(m->rsx, m->mrd, m->mwr, m->fanout, m->part_rows) <= 0) break;
+        }
+    }
+    return NULL;
+}
+static void merge_kick (mw_meta *m) {
+    if (getenv("MW_META_NOMERGE")) return;
+    pthread_mutex_lock(&m->mth_mu);
+    m->mkick = true;
+    if (!m->mth_running && !m->mth_stop) { if (pthread_create(&m->mth, NULL, merger_main, m) == 0) m->mth_running = true; }
+    pthread_cond_signal(&m->mth_cv);
+    pthread_mutex_unlock(&m->mth_mu);
+}
+
 static int flush_impl (mw_meta *m, bool wait) {
     if (!m->attached) return 0;
     mw_meta_ready(m);
@@ -429,8 +463,10 @@ static int flush_impl (mw_meta *m, bool wait) {
         atomic_fetch_add(&m->n_flushes, 1);
     }
     if (rc == SQLITE_OK && !atomic_load(&m->quiescing) && !getenv("MW_META_NOMERGE")) {         // the runs the flushes made are merged into bigger ones (a few rounds a flush at most)
-        if (!m->mrd) m->mrd = open_conn(m);
-        if (m->mrd) for (int round = 0; round < 8 && rsx_merge(m->rsx, m->mrd, m->wr, 4, 1u << 17) > 0; round++) ;
+        if (m->shared) {                                                                        // (several processes: the merge is done here, under the lock of the flush)
+            if (!m->mrd) m->mrd = open_conn(m);
+            if (m->mrd) for (int round = 0; round < 8 && rsx_merge(m->rsx, m->mrd, m->wr, m->fanout, m->part_rows) > 0; round++) ;
+        } else merge_kick(m);
     }
     atomic_fetch_add(&m->flush_ns, now_ns() - t0);
     m->last_flush_ns = now_ns();
@@ -502,14 +538,18 @@ void mw_meta_quiesce (mw_meta *m) {
     m->th_stop = true; pthread_cond_broadcast(&m->th_cv);
     bool run = m->th_running; pthread_mutex_unlock(&m->th_mu);
     if (run) { pthread_join(m->th, NULL); m->th_running = false; }
+    pthread_mutex_lock(&m->mth_mu); m->mth_stop = true; pthread_cond_broadcast(&m->mth_cv); bool mrun = m->mth_running; pthread_mutex_unlock(&m->mth_mu);
+    if (mrun) { pthread_join(m->mth, NULL); m->mth_running = false; }
     if (m->shared ? atomic_load(&m->db->shm->meta_state) == 2 : atomic_load(&m->ready)) mw_meta_flush(m);
     pthread_mutex_lock(&m->th_mu); m->th_stop = false; pthread_mutex_unlock(&m->th_mu);       // (a later open starts the thread again)
-    sqlite3 *conns[MW_RDN + 2]; sqlite3_stmt *stmts[MW_RDN]; int nc = 0;
+    pthread_mutex_lock(&m->mth_mu); m->mth_stop = false; pthread_mutex_unlock(&m->mth_mu);
+    sqlite3 *conns[MW_RDN + 3]; sqlite3_stmt *stmts[MW_RDN]; int nc = 0;
     pthread_mutex_lock(&m->file_mu);
     for (int i = 0; i < MW_RDN; i++) { pthread_mutex_lock(&m->rdmu[i]); stmts[i] = m->rds[i]; m->rds[i] = NULL; if (m->rd[i]) conns[nc++] = m->rd[i]; m->rd[i] = NULL; pthread_mutex_unlock(&m->rdmu[i]); }
     if (m->wr) conns[nc++] = m->wr;
     m->wr = NULL;
     if (m->mrd) { conns[nc++] = m->mrd; m->mrd = NULL; }
+    if (m->mwr) { conns[nc++] = m->mwr; m->mwr = NULL; }
     pthread_mutex_unlock(&m->file_mu);
     atomic_store(&m->quiescing, 0);
     // the last connection to close releases the database for good, and that frees this store: nothing of it may be touched after the closes

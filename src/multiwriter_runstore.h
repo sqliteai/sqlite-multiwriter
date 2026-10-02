@@ -38,6 +38,8 @@ int rsx_scan_since (mw_rstore *s, sqlite3 *c, mw_rman *m, int64_t since, void (*
 int rsx_scan_all (mw_rstore *s, sqlite3 *c, int (*cb)(void *ctx, uint32_t tbl, const uint8_t *pk, size_t pklen, const mw_mcell *cells, int n), void *ctx);
 
 // ---- writing (the flusher; one thread at a time) ----
+void rsx_wlock (mw_rstore *s);                                              // one write transaction on the runs at a time (a flush's, a merge's): held from BEGIN to COMMIT
+void rsx_wunlock (mw_rstore *s);
 typedef struct rsx_tx rsx_tx;
 rsx_tx *rsx_tx_begin (mw_rstore *s, sqlite3 *c);                           // in an open transaction of c; NULL: error
 // a run of level 0 from the items [i0, i1) of a batch in key order

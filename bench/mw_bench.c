@@ -169,7 +169,12 @@ static int do_txn (agent_t *a) {
         case W_BULK: {
             char big[100 * 160 + 64]; bool wide = getenv("MW_BENCH_BULK_WIDE") != NULL;      // (wide: five columns besides the key, six cells a row with the sentinel)
             size_t n = (size_t)snprintf(big, sizeof big, wide ? "INSERT INTO bkw(id,a,b,c,d,v) VALUES" : "INSERT INTO bk(id,v) VALUES");
-            for (int i = 0; i < 100; i++) n += (size_t)snprintf(big + n, sizeof big - n, wide ? "%s(%llu,1,2,3,4,'0123456789012345678901234567890123456789')" : "%s(%llu,'0123456789012345678901234567890123456789012345678901234567890123')", i ? "," : "", ((unsigned long long)a->id << 32) | (a->commits * 100 + (uint64_t)i));
+            static int rnd_keys = -1; if (rnd_keys < 0) rnd_keys = getenv("MW_BENCH_BULK_RANDOM") != NULL;             // (random keys, like UUIDs: the rows of a flush are spread over the whole key space)
+            for (int i = 0; i < 100; i++) {
+                unsigned long long key = ((unsigned long long)a->id << 32) | (a->commits * 100 + (uint64_t)i);
+                if (rnd_keys) { key ^= key >> 33; key *= 0xff51afd7ed558ccdull; key ^= key >> 33; key *= 0xc4ceb9fe1a85ec53ull; key ^= key >> 33; key &= 0x7fffffffffffffffull; }
+                n += (size_t)snprintf(big + n, sizeof big - n, wide ? "%s(%llu,1,2,3,4,'0123456789012345678901234567890123456789')" : "%s(%llu,'0123456789012345678901234567890123456789012345678901234567890123')", i ? "," : "", key);
+            }
             if (cfg.think_us) { struct timespec ts = { 0, (long)cfg.think_us * 1000 }; nanosleep(&ts, NULL); }
             if (cfg.begin_wait) {                                  // explicit transaction: BEGIN IMMEDIATE is where SQLite takes the write lock (and waits for it)
                 rc = exec_(a->db, "BEGIN IMMEDIATE");

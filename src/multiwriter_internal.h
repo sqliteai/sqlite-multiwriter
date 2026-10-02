@@ -586,6 +586,7 @@ void     mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch);
 struct mw_meta *mw_cdc_meta (mw_db *db);
 void     mw_cdc_quiesce (mw_db *db);
 void     mw_shared_repair (mw_db *db);
+void     mw_cdc_skip (mw_lane *lane);
 void     mw_cdc_set_cache_mb (mw_db *db, int mb);
 void     mw_cdc_kick_flush (mw_db *db);
 int      mw_cdc_shared_create (mw_db *db);

@@ -46,7 +46,9 @@ struct mw_meta {
     char *uri; bool attached; _Atomic bool tables_ok, ready;
     pthread_mutex_t file_mu;                                     // ready / flush / writer connection
     sqlite3 *wr;                                                 // the flusher's connection
-    sqlite3 *mrd; struct mw_rstore *rsx; bool merging; _Atomic bool schema_seen;                           // the others of a parallel flush, and how many ranges a big flush is cut in
+    int fanout; uint64_t part_rows;                                                                          // merging: runs of a level that make a merge, rows of a part
+    sqlite3 *mrd, *mwr; struct mw_rstore *rsx; _Atomic bool schema_seen;
+    pthread_t mth; bool mth_running, mth_stop, mkick; pthread_mutex_t mth_mu; pthread_cond_t mth_cv;            // the thread that merges the runs (one process)                           // the others of a parallel flush, and how many ranges a big flush is cut in
     #define MW_RDN 4
     sqlite3 *rd[MW_RDN]; sqlite3_stmt *rds[MW_RDN]; pthread_mutex_t rdmu[MW_RDN];
     pthread_t th; bool th_running; bool th_stop; bool kicked; bool kick_pending; pthread_mutex_t th_mu; pthread_cond_t th_cv;

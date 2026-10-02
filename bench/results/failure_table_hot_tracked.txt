@@ -1,0 +1,10 @@
+hot rows of a tracked table (UPDATE ct SET a=a+1, 4 rows), busy_timeout=0, no retries, synchronous=off, 3 s
+stock agents=10:    result: VALID  (integrity_check=ok, committed=54) | 1505651 of 1505686 = 100.00% | tx/s=12
+stock-wal agents=10:    result: VALID  (integrity_check=ok, committed=61144) | 598320 of 645141 = 92.74% | tx/s=15584
+multiwriter agents=10:    result: VALID  (integrity_check=ok, committed=197723) | 8745 of 156467 = 5.59% | tx/s=49107
+stock agents=100:    result: VALID  (integrity_check=ok, committed=0) | 2386708 of 2386708 = 100.00% | tx/s=0
+stock-wal agents=100:    result: VALID  (integrity_check=ok, committed=10462) | 1427243 of 1435262 = 99.44% | tx/s=2670
+multiwriter agents=100:    result: VALID  (integrity_check=ok, committed=153953) | 4855 of 121536 = 3.99% | tx/s=38791
+stock agents=1000:    result: VALID  (integrity_check=ok, committed=0) | 2173010 of 2173010 = 100.00% | tx/s=0
+stock-wal agents=1000:    result: VALID  (integrity_check=ok, committed=5177) | 190710 of 194942 = 97.83% | tx/s=1409
+multiwriter agents=1000:    result: VALID  (integrity_check=ok, committed=139237) | 4273 of 105682 = 4.04% | tx/s=33725

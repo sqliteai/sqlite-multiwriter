@@ -55,9 +55,10 @@ int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, int fanout, uint64_t part
 // how far the merges are behind: the age groups at level 0 and in all
 void rsx_backlog (mw_rstore *s, int *l0, int *total);
 
-int rsx_sweep (mw_rstore *s, sqlite3 *rd, sqlite3 *wr);   // removes the blocks of runs that have no row (what a dead merge left); returns how many runs it found
+int rsx_sweep (mw_rstore *s, sqlite3 *rd, sqlite3 *wr);   // gives back the slots that nobody has (those of dead processes); returns how many
+int rsx_release_pool (mw_rstore *s, sqlite3 *c);            // at the close: the slots we hold become free again
 
-typedef struct { uint64_t gets, run_probes, bloom_skips, blk_reads, cache_hits, merges, merged_rows, runs_written, merge_retries; int nruns; } rsx_stats;
+typedef struct { uint64_t gets, run_probes, bloom_skips, blk_reads, cache_hits, merges, merged_rows, runs_written, merge_retries, swept_slots; int nruns; } rsx_stats;
 void rsx_stats_get (mw_rstore *s, rsx_stats *out);
 
 #endif

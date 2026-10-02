@@ -7,6 +7,8 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <signal.h>
+#include <errno.h>
 #include "multiwriter_meta_priv.h"
 #include "multiwriter_runstore.h"
 
@@ -23,10 +25,11 @@ struct mw_rman { _Atomic int refs; int64_t ver; rs_run **runs; int n; rdrop *dro
 struct mw_rstore {
     pthread_mutex_t mu, wmu; mw_rman *cur;
     cslot *cs; size_t ncs; pthread_mutex_t cmu[CSTRIPES];
+    uint32_t *hslot; uintptr_t *howner; size_t nh, caph;                      // slots taken out of the pool by a transaction or a part that has not finished (so that the register of reservations covers them)
     pthread_mutex_t pmu; uint32_t *pool; size_t npool, cappool;               // slots taken from the free table (or fresh) and not used yet
     _Atomic uint32_t slot_bytes;                                             // the size of a slot: the file's, found or decided at the first use
     _Atomic int bl0, ball;                                                   // age groups at level 0 and in all, of the current list
-    _Atomic uint64_t merge_retries, merge_ns; _Atomic uint64_t gets, run_probes, bloom_skips, blk_reads, cache_hits, merges, merged_rows, runs_written;
+    _Atomic uint64_t merge_retries, merge_ns, swept_slots; _Atomic uint64_t gets, run_probes, bloom_skips, blk_reads, cache_hits, merges, merged_rows, runs_written;
 };
 
 // a retry after a conflict: at once the first times (the other commit is over by now), then a little longer, never the tens of milliseconds a bulk writer would sleep
@@ -149,7 +152,7 @@ static void cblk_unref (cblk *b) { if (b && atomic_fetch_sub(&b->refs, 1) == 1) 
 void rsx_free (mw_rstore *s) {
     if (!s) return;
     for (size_t i = 0; i < s->ncs; i++) cblk_unref(s->cs[i].b);
-    free(s->cs); free(s->pool); pthread_mutex_destroy(&s->pmu); rsx_man_release(s->cur);
+    free(s->cs); free(s->pool); free(s->hslot); free(s->howner); pthread_mutex_destroy(&s->pmu); rsx_man_release(s->cur);
     for (int i = 0; i < CSTRIPES; i++) pthread_mutex_destroy(&s->cmu[i]);
     pthread_mutex_destroy(&s->mu); pthread_mutex_destroy(&s->wmu); free(s);
 }
@@ -168,7 +171,7 @@ void rsx_wunlock (mw_rstore *s) { pthread_mutex_unlock(&s->wmu); }
 void rsx_stats_get (mw_rstore *s, rsx_stats *o) {
     o->gets = atomic_load(&s->gets); o->run_probes = atomic_load(&s->run_probes); o->bloom_skips = atomic_load(&s->bloom_skips); o->blk_reads = atomic_load(&s->blk_reads);
     o->cache_hits = atomic_load(&s->cache_hits); o->merges = atomic_load(&s->merges); o->merged_rows = atomic_load(&s->merged_rows); o->runs_written = atomic_load(&s->runs_written);
-    pthread_mutex_lock(&s->mu); o->nruns = s->cur ? s->cur->n : 0; o->merge_retries = atomic_load(&s->merge_retries); pthread_mutex_unlock(&s->mu);
+    pthread_mutex_lock(&s->mu); o->nruns = s->cur ? s->cur->n : 0; o->merge_retries = atomic_load(&s->merge_retries); o->swept_slots = atomic_load(&s->swept_slots); pthread_mutex_unlock(&s->mu);
 }
 
 // ---- where the blocks are: slots ----
@@ -375,12 +378,48 @@ static int pool_take (mw_rstore *s, int n, uint32_t *out) {                  // 
     pthread_mutex_unlock(&s->pmu);
     return 0;
 }
+static int held_add (mw_rstore *s, const void *owner, const uint32_t *sl, int k) {
+    pthread_mutex_lock(&s->pmu);
+    if (s->nh + (size_t)k > s->caph) { size_t nc = (s->nh + (size_t)k) * 2 + 256; uint32_t *a = realloc(s->hslot, nc * sizeof *a); uintptr_t *b = realloc(s->howner, nc * sizeof *b); if (a) s->hslot = a; if (b) s->howner = b; if (!a || !b) { pthread_mutex_unlock(&s->pmu); return -1; } s->caph = nc; }
+    for (int i = 0; i < k; i++) { s->hslot[s->nh] = sl[i]; s->howner[s->nh] = (uintptr_t)owner; s->nh++; }
+    pthread_mutex_unlock(&s->pmu);
+    return 0;
+}
+static void held_drop (mw_rstore *s, const void *owner) {
+    pthread_mutex_lock(&s->pmu);
+    size_t j = 0; for (size_t i = 0; i < s->nh; i++) if (s->howner[i] != (uintptr_t)owner) { s->hslot[j] = s->hslot[i]; s->howner[j] = s->howner[i]; j++; }
+    s->nh = j;
+    pthread_mutex_unlock(&s->pmu);
+}
+// every slot this process has (pool and held), plus `extra`, as sorted ranges [gap from the end of the last, length] in varints: the entry of this process in the register of reservations
+static int slot_cmp (const void *a, const void *b);
+static int ledger_encode (mw_rstore *s, const uint32_t *extra, int nextra, uint8_t **out, size_t *outlen) {
+    pthread_mutex_lock(&s->pmu);
+    size_t n = s->npool + s->nh + (size_t)nextra; uint32_t *all = malloc((n ? n : 1) * sizeof *all);
+    if (!all) { pthread_mutex_unlock(&s->pmu); return -1; }
+    size_t k = 0; memcpy(all, s->pool, s->npool * sizeof *all); k = s->npool; memcpy(all + k, s->hslot, s->nh * sizeof *all); k += s->nh; memcpy(all + k, extra, (size_t)nextra * sizeof *all); k += (size_t)nextra;
+    pthread_mutex_unlock(&s->pmu);
+    qsort(all, k, sizeof *all, slot_cmp);
+    uint8_t *buf = malloc(k * 10 + 16); if (!buf) { free(all); return -1; }
+    size_t w = 0; uint64_t prev_end = 0;
+    for (size_t i = 0; i < k; ) {
+        size_t j = i + 1; while (j < k && (all[j] == all[j - 1] || all[j] == all[j - 1] + 1)) j++;
+        w += sl_put(buf + w, all[i] - prev_end); w += sl_put(buf + w, (uint64_t)all[j - 1] - all[i] + 1); prev_end = (uint64_t)all[j - 1] + 1; i = j;
+    }
+    free(all); *out = buf; *outlen = w; return 0;
+}
+static int ledger_put (mw_rstore *s, sqlite3 *c, const uint32_t *extra, int nextra) {
+    uint8_t *b; size_t bl; if (ledger_encode(s, extra, nextra, &b, &bl)) return SQLITE_NOMEM;
+    sqlite3_stmt *st = NULL; int rc = sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_resv(pid, slots) VALUES(?1, ?2)", -1, &st, NULL);
+    if (!rc) { sqlite3_bind_int64(st, 1, (int64_t)getpid()); sqlite3_bind_blob(st, 2, b, (int)bl, SQLITE_STATIC); rc = sqlite3_step(st); rc = rc == SQLITE_DONE ? 0 : rc; }
+    sqlite3_finalize(st); free(b); return rc;
+}
 // the slots of the free table first (the lowest), then fresh ones past the last in use: taken out of the table (or counted) in one small transaction, and then they are ours
 // The free slots are a bitmap in rows of FREE_CHUNK_BYTES bytes (FREE_CHUNK_SLOTS slots each), every row the same size: freeing and taking slots overwrites rows in place, so this table never allocates
 // or gives back a page of the file either.
 #define FREE_CHUNK_BYTES 512
 #define FREE_CHUNK_SLOTS (FREE_CHUNK_BYTES * 8)
-typedef struct { int want; uint32_t *got; int n; } rsvctx;
+typedef struct { mw_rstore *s; int want; uint32_t *got; int n; } rsvctx;
 static int rsv_fn (void *ctx, sqlite3 *c) {
     rsvctx *x = ctx; x->n = 0; sqlite3_stmt *st = NULL, *up = NULL;
     int rc = sqlite3_prepare_v2(c, "SELECT chunk, bits FROM mw_free ORDER BY chunk", -1, &st, NULL); if (rc) return rc;
@@ -404,7 +443,7 @@ static int rsv_fn (void *ctx, sqlite3 *c) {
         x->n = x->want;
     }
     if (!state_get(c, "slot_bytes", 0)) { rc = state_put(c, "slot_bytes", compute_slot_bytes(c)); if (rc) return rc; }
-    return 0;
+    return ledger_put(x->s, c, x->got, x->n);                                                    // (what this process holds, written with the reservation: a sweep of another process knows whose they are)
 }
 static int slot_cmp (const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
 // the slots become free: their bits are set (one read and one write of a row for all the slots of its chunk)
@@ -429,7 +468,7 @@ static int free_slots (sqlite3 *c, uint32_t *sl, size_t n) {
     return rc;
 }
 static int pool_reserve (mw_rstore *s, sqlite3 *c, int want) {            // (no transaction of c is open; the writers' turn is taken inside)
-    rsvctx x = { want, malloc((size_t)want * sizeof(uint32_t)), 0 }; if (!x.got) return SQLITE_NOMEM;
+    rsvctx x = { s, want, malloc((size_t)want * sizeof(uint32_t)), 0 }; if (!x.got) return SQLITE_NOMEM;
     int rc = small_txn(s, c, rsv_fn, &x);
     if (!rc) pool_put(s, x.got, x.n);
     free(x.got); return rc;
@@ -491,6 +530,7 @@ static int tx_prepare (rsx_tx *t, sqlite3 *c) {
 // k slots from the pool for this transaction (they go back to the pool if it does not commit)
 static int tx_take (rsx_tx *t, int k, uint32_t *sl) {
     if (pool_take(t->s, k, sl) != 0) return RSX_NEED_SLOTS;
+    if (held_add(t->s, t, sl, k)) { pool_put(t->s, sl, k); return -1; }
     if (t->ntaken + k > t->captaken) { int nc = (t->ntaken + k) * 2 + 64; uint32_t *nt = realloc(t->taken, (size_t)nc * sizeof *nt); if (!nt) { pool_put(t->s, sl, k); return -1; } t->taken = nt; t->captaken = nc; }
     memcpy(t->taken + t->ntaken, sl, (size_t)k * sizeof *sl); t->ntaken += k;
     return 0;
@@ -595,6 +635,7 @@ int rsx_tx_finish (rsx_tx *t, sqlite3 *c) {
 void rsx_tx_end (rsx_tx *t, bool committed) {
     if (!t) return;
     sqlite3_finalize(t->ins_run); if (t->sw_open) slotw_close(&t->sw);
+    held_drop(t->s, t);
     if (!committed && t->ntaken) pool_put(t->s, t->taken, t->ntaken);                      // (the slots were not used: they stay ours)
     if (committed && (t->nadd || t->nrem || t->nd)) {
         mw_rman *nm = calloc(1, sizeof *nm); mw_rman *b = t->base;
@@ -625,7 +666,7 @@ typedef struct {
     mw_rstore *s; sqlite3 *wr; int out_lvl; int64_t out_age; const mw_rman *man;
     oblk *blks; int nblks, capblks; uint8_t *loc; size_t loccap; int64_t part_id;      // part_id: the number of the run being written (taken before its first block)
 } mctx;
-static void mctx_clear (mctx *m) { for (int i = 0; i < m->nblks; i++) { free(m->blks[i].d); free(m->blks[i].sl); } m->nblks = 0; }
+static void mctx_clear (mctx *m) { for (int i = 0; i < m->nblks; i++) { free(m->blks[i].d); free(m->blks[i].sl); } m->nblks = 0; held_drop(m->s, m); }
 // a block of the output: its slots are chosen now (the locator goes into the meta), the data is written later, a few blocks to a transaction
 static int m_emit (void *ctx, uint32_t blk, const uint8_t *d, size_t len, const uint8_t **loc, size_t *loclen) {
     mctx *m = ctx; uint32_t sb = atomic_load(&m->s->slot_bytes) - SLOT_HDR; int k = (int)((len + sb - 1) / sb);
@@ -634,6 +675,7 @@ static int m_emit (void *ctx, uint32_t blk, const uint8_t *d, size_t len, const 
     uint32_t *sl = malloc((size_t)k * sizeof *sl); uint8_t *cp = malloc(len); if (!sl || !cp) { free(sl); free(cp); return -1; }
     if (pool_take(m->s, k, sl) != 0) { free(sl); free(cp); return -1; }
     memcpy(cp, d, len);
+    if (held_add(m->s, m, sl, k)) { pool_put(m->s, sl, k); free(sl); free(cp); return -1; }
     m->blks[m->nblks++] = (oblk){ blk, cp, len, sl, k };
     size_t ll; if (loc_encode(sl, k, &m->loc, &m->loccap, &ll) != 0) return -1;
     *loc = m->loc; *loclen = ll;
@@ -694,15 +736,32 @@ static int m_end (void *sctx, const uint8_t *meta, size_t ml, uint64_t nr, uint3
     mctx_clear(m);
     return rc;
 }
-// Slots that nobody has (a process that died between taking slots and writing the run, a merge that failed): in the table, in no run, not free, not in our hands. Found by comparing, and given
-// to the free table. Several processes hold slots in memory that look the same: only for a database that this process alone uses.
+// At the close: the slots this process holds go back to the free ones and its entry in the register of reservations is removed
+static int release_fn (void *ctx, sqlite3 *c) {
+    mw_rstore *s = ctx;
+    pthread_mutex_lock(&s->pmu); size_t n = s->npool; uint32_t *cp = malloc((n ? n : 1) * sizeof *cp); if (cp) memcpy(cp, s->pool, n * sizeof *cp); pthread_mutex_unlock(&s->pmu);
+    if (!cp) return SQLITE_NOMEM;
+    int rc = free_slots(c, cp, n); free(cp);
+    if (!rc) { sqlite3_stmt *d = NULL; rc = sqlite3_prepare_v2(c, "DELETE FROM mw_resv WHERE pid = ?1", -1, &d, NULL); if (!rc) { sqlite3_bind_int64(d, 1, (int64_t)getpid()); rc = sqlite3_step(d); rc = rc == SQLITE_DONE ? 0 : rc; } sqlite3_finalize(d); }
+    return rc;
+}
+int rsx_release_pool (mw_rstore *s, sqlite3 *c) {
+    int rc = small_txn(s, c, release_fn, s);
+    if (!rc) { pthread_mutex_lock(&s->pmu); s->npool = 0; pthread_mutex_unlock(&s->pmu); }
+    return rc;
+}
+static bool pid_alive (int64_t pid) { return pid > 0 && (kill((pid_t)pid, 0) == 0 || errno == EPERM); }
+// Slots that nobody has: in the table, in no run, not free and not held by a process that is alive. The register of reservations says what every process holds (it is written in the
+// transaction that takes the slots); the processes that are gone (killed with a pool, or in the middle of a merge) are the ones whose slots come back. The caller is the one that merges
+// (one process at a time) and takes the turn of the writers; our own slots are in memory.
 int rsx_sweep (mw_rstore *s, sqlite3 *rd, sqlite3 *wr) {
     (void)rd;
     rsx_wlock(s);
     int rc = sqlite3_exec(wr, "BEGIN", NULL, NULL, NULL); int leaked = 0;
-    mw_rman *man = NULL; uint8_t *mark = NULL; int64_t maxslot = 0;
+    mw_rman *man = NULL; uint8_t *mark = NULL; int64_t maxslot = 0; int64_t dead[64]; int ndead = 0;
     if (!rc) rc = rsx_man(s, wr, &man);
-    if (!rc) { sqlite3_stmt *q = NULL; if (sqlite3_prepare_v2(wr, "SELECT coalesce(max(slot), 0) FROM mw_slots", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) maxslot = sqlite3_column_int64(q, 0); sqlite3_finalize(q); }
+    if (!rc) { sqlite3_stmt *q = NULL; if (sqlite3_prepare_v2(wr, "SELECT coalesce(max(slot), 0) FROM mw_slots", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) maxslot = sqlite3_column_int64(q, 0); sqlite3_finalize(q);
+        int64_t nx = state_get(wr, "next_slot", 1) - 1; if (nx > maxslot) maxslot = nx; }                              // (a number that was taken and never written is a slot too)
     if (!rc && maxslot > 0) {
         mark = calloc((size_t)maxslot + 2, 1); if (!mark) rc = SQLITE_NOMEM;
         for (int ri = 0; !rc && ri < man->n; ri++) for (uint32_t b = 0; b < man->runs[ri]->nblk; b++) {
@@ -716,19 +775,33 @@ int rsx_sweep (mw_rstore *s, sqlite3 *rd, sqlite3 *wr) {
                 for (int i = 0; i < FREE_CHUNK_BYTES; i++) if (bits[i]) for (int b = 0; b < 8; b++) if (bits[i] & (1u << b)) { int64_t sl = chunk * FREE_CHUNK_SLOTS + i * 8 + b; if (sl > 0 && sl <= maxslot) mark[sl] = 1; } }
         }
         sqlite3_finalize(q);
-        pthread_mutex_lock(&s->pmu); for (size_t i = 0; i < s->npool; i++) if (s->pool[i] <= (uint64_t)maxslot) mark[s->pool[i]] = 1; pthread_mutex_unlock(&s->pmu);
-        q = NULL; size_t lcap = 256; uint32_t *lk = malloc(lcap * sizeof *lk); size_t ln = 0; if (!lk) rc = SQLITE_NOMEM;
-        if (!rc && sqlite3_prepare_v2(wr, "SELECT slot FROM mw_slots", -1, &q, NULL) == SQLITE_OK) {
-            while (sqlite3_step(q) == SQLITE_ROW) { int64_t sl = sqlite3_column_int64(q, 0); if (sl > 0 && sl <= maxslot && !mark[sl]) { if (ln == lcap) { lcap *= 2; uint32_t *nl = realloc(lk, lcap * sizeof *lk); if (!nl) { rc = SQLITE_NOMEM; break; } lk = nl; } lk[ln++] = (uint32_t)sl; } }
+        // what the processes that are alive hold (the register), and what this one holds (memory)
+        q = NULL;
+        if (!rc && sqlite3_prepare_v2(wr, "SELECT pid, slots FROM mw_resv", -1, &q, NULL) == SQLITE_OK) {
+            while (sqlite3_step(q) == SQLITE_ROW) {
+                int64_t pid = sqlite3_column_int64(q, 0);
+                if (pid == (int64_t)getpid()) continue;
+                if (!pid_alive(pid)) { if (ndead < 64) dead[ndead++] = pid; continue; }
+                const uint8_t *p = sqlite3_column_blob(q, 1), *end = p + sqlite3_column_bytes(q, 1); uint64_t gap, len, pos = 0;
+                while (p && sl_get(&p, end, &gap) && sl_get(&p, end, &len)) { pos += gap; for (uint64_t k = 0; k < len; k++) if ((int64_t)(pos + k) <= maxslot) mark[pos + k] = 1; pos += len; }
+            }
         }
         sqlite3_finalize(q);
+        pthread_mutex_lock(&s->pmu);
+        for (size_t i = 0; i < s->npool; i++) if (s->pool[i] <= (uint64_t)maxslot) mark[s->pool[i]] = 1;
+        for (size_t i = 0; i < s->nh; i++) if (s->hslot[i] <= (uint64_t)maxslot) mark[s->hslot[i]] = 1;
+        pthread_mutex_unlock(&s->pmu);
+        size_t lcap = 256; uint32_t *lk = malloc(lcap * sizeof *lk); size_t ln = 0; if (!lk) rc = SQLITE_NOMEM;
+        for (int64_t sl = 1; !rc && sl <= maxslot; sl++) if (!mark[sl]) { if (ln == lcap) { lcap *= 2; uint32_t *nl = realloc(lk, lcap * sizeof *lk); if (!nl) { rc = SQLITE_NOMEM; break; } lk = nl; } lk[ln++] = (uint32_t)sl; }
         if (!rc) { rc = free_slots(wr, lk, ln); leaked = (int)ln; }
         free(lk);
     }
+    for (int i = 0; !rc && i < ndead; i++) { sqlite3_stmt *d = NULL; if (sqlite3_prepare_v2(wr, "DELETE FROM mw_resv WHERE pid = ?1", -1, &d, NULL) == SQLITE_OK) { sqlite3_bind_int64(d, 1, dead[i]); sqlite3_step(d); } sqlite3_finalize(d); }
     free(mark); rsx_man_release(man);
     if (!rc) rc = sqlite3_exec(wr, "COMMIT", NULL, NULL, NULL);
     if (rc) sqlite3_exec(wr, "ROLLBACK", NULL, NULL, NULL);
     rsx_wunlock(s);
+    if (!rc) atomic_fetch_add(&s->swept_slots, (uint64_t)leaked);
     return rc ? -1 : leaked;
 }
 int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, int fanout, uint64_t part_rows) {

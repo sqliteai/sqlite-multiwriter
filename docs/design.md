@@ -60,7 +60,7 @@ writes have the head epoch the transaction read them at, installs them, and publ
 cookie moves, under the publication lock. The site table and the list of dropped tables are in the shared header. The flusher is whichever process claims it (a byte lock).
 
 ### The file tables
-`mw_state(k, v)` (`meta_epoch`, `dv_hwm`, `runs_ver`, `next_run`, `next_age`, `next_slot`, `slot_bytes`), `mw_sites(ord, id)`, `mw_runs`, `mw_slots`, `mw_free` and `mw_drops`, created by the first connection.
+`mw_state(k, v)` (`meta_epoch`, `dv_hwm`, `runs_ver`, `next_run`, `next_age`, `next_slot`, `slot_bytes`), `mw_sites(ord, id)`, `mw_runs`, `mw_slots`, `mw_free`, `mw_resv` and `mw_drops`, created by the first connection.
 They are ordinary tables, so the file is self-contained: copy it and the CRDT state comes along. The state of the rows lives in **sorted runs** (`multiwriter_runs.c`, `multiwriter_runstore.c`):
 
 - A *run* is an immutable sequence of rows in key order (table, then key bytes), cut in blocks of about 16 KB. A row is one row of a user table: its key, the largest db_version among its cells and its
@@ -71,9 +71,11 @@ They are ordinary tables, so the file is self-contained: copy it and the CRDT st
   block and the part it belongs to (a slot read for another run is an error, not a wrong answer). A slot that is written again is overwritten where it is (SQLite does that when the new record has the size of the
   old one), so the metadata never allocates a page of the file or gives one back to its free list, which is what every writer of the application meets at its commit (all the conflicts of the transactions of the metadata
   with the writers were on page 1, the header of the file: a database that is growing writes it at every commit). A run that goes (merged) gives its slots to `mw_free`, a bitmap in rows of 512 bytes
-  that is updated in place too; the next run takes the lowest free slots first, then new ones past the last. A process takes slots by the thousand into a pool in memory (one small transaction), and gives the unused ones back
-  when its transaction does not commit. Slots that nobody has (a process that died with its pool, a merge that failed) are found by comparing the table with the runs and the free bitmap, when the one
-  process that uses the database starts its merge thread; with several processes they stay lost (space only).
+  that is updated in place too; the next run takes the lowest free slots first, then new ones past the last. A process takes slots by the thousand into a pool in memory (one small transaction, which also writes the process's entry in `mw_resv(pid, slots)`: everything it holds, as ranges, in the transaction that
+  takes them), and gives the unused ones back when its transaction does not commit and, at the close, all of them (and its entry goes). Slots that nobody has (a process that was killed with its pool, a merge that failed)
+  are found by comparing the numbers taken so far with the runs, the free bitmap and what the processes that are alive hold (their entries in `mw_resv`; ours is in memory): what is left belongs to nobody and becomes free,
+  and the entries of dead processes are deleted. The merge thread does this when it starts and every ten seconds, under the lock that makes it the only merger (a pid that was reused keeps its slots lost
+  until it ends: space only, never a slot taken from a live process).
 - The flush writes one run (level 0) for every 32768 rows of the batch, in one ordinary logged transaction together with `meta_epoch`, `runs_ver` and the other counters: the batch and the epoch it
   covers are atomic. It does one pass over the dirty rows, packs them straight into the batch and writes blocks: about 0.15 us a row (the b-tree it replaced, one insert per row, cost 0.7 to 1 us, and
   4 us with random keys). The rows in memory are the complete state of the row, so the flush replaces; nothing is read before it is written.

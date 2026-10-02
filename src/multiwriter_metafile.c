@@ -18,6 +18,7 @@ static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS mw_runs(run INTEGER PRIMARY KEY, age INTEGER NOT NULL, lvl INTEGER NOT NULL, nrows INTEGER NOT NULL, nblk INTEGER NOT NULL, dvmax INTEGER NOT NULL, metalen INTEGER NOT NULL, metaloc BLOB NOT NULL);"
     "CREATE TABLE IF NOT EXISTS mw_slots(slot INTEGER PRIMARY KEY, data BLOB NOT NULL);"
     "CREATE TABLE IF NOT EXISTS mw_free(chunk INTEGER PRIMARY KEY, bits BLOB NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS mw_resv(pid INTEGER PRIMARY KEY, slots BLOB NOT NULL);"
     "CREATE TABLE IF NOT EXISTS mw_drops(tbl INTEGER PRIMARY KEY, dv INTEGER NOT NULL);";
 
 static uint64_t now_ns (void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
@@ -66,9 +67,9 @@ bool mw_meta_row_cells (const void *blob, size_t len, mw_mcell **c, int *n) { in
 
 int mw_meta_schema (sqlite3 *c) {
     sqlite3_stmt *st = NULL; int have = 0;
-    if (sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_runs','mw_slots','mw_free','mw_drops')", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) have = sqlite3_column_int(st, 0);
+    if (sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_runs','mw_slots','mw_free','mw_drops','mw_resv')", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) have = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
-    if (have == 6) return SQLITE_OK;
+    if (have == 7) return SQLITE_OK;
     int rc = SQLITE_BUSY;
     for (int i = 0; i < 100 && busyish(rc); i++) {
         rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL);
@@ -386,7 +387,7 @@ static int write_range (mw_meta *m, sqlite3 *c, fitem *v, int i0, int n, bool la
     }
     return rc;
 }
-void mw_meta_run_stats (mw_meta *m, uint64_t out[12]) { rsx_stats st; rsx_stats_get(m->rsx, &st); out[11] = st.merge_retries; { int l0, all; rsx_backlog(m->rsx, &l0, &all); out[9] = (uint64_t)l0; out[10] = (uint64_t)all; } out[0] = st.gets; out[1] = st.run_probes; out[2] = st.bloom_skips; out[3] = st.blk_reads; out[4] = st.cache_hits; out[5] = st.merges; out[6] = st.merged_rows; out[7] = st.runs_written; out[8] = (uint64_t)st.nruns; }
+void mw_meta_run_stats (mw_meta *m, uint64_t out[13]) { rsx_stats st; rsx_stats_get(m->rsx, &st); out[11] = st.merge_retries; out[12] = st.swept_slots; { int l0, all; rsx_backlog(m->rsx, &l0, &all); out[9] = (uint64_t)l0; out[10] = (uint64_t)all; } out[0] = st.gets; out[1] = st.run_probes; out[2] = st.bloom_skips; out[3] = st.blk_reads; out[4] = st.cache_hits; out[5] = st.merges; out[6] = st.merged_rows; out[7] = st.runs_written; out[8] = (uint64_t)st.nruns; }
 
 // ---- the merger thread (one process) ----
 static void *merger_main (void *arg) {
@@ -402,7 +403,10 @@ static void *merger_main (void *arg) {
         if (m->shared && !mw_mp_meta_lock(m->db, 2, false)) continue;                          // (several processes: one of them merges at a time; the others' flushes go on)
         if (!m->mrd) m->mrd = open_conn(m);
         if (!m->mwr) m->mwr = open_conn(m);
-        if (m->mrd && m->mwr && !m->swept) { if (!m->shared) (void)rsx_sweep(m->rsx, m->mrd, m->mwr); m->swept = true; }
+        if (m->mrd && m->mwr) {                                                                  // (slots of processes that are gone come back: at the start and then every few seconds)
+            static uint64_t every = 0; if (!every) { const char *e = getenv("MW_META_SWEEP_MS"); every = (e ? (uint64_t)atoll(e) : 10000) * 1000000ull; }
+            if (!m->swept || now_ns() - m->sweep_ns > every) { (void)rsx_sweep(m->rsx, m->mrd, m->mwr); m->swept = true; m->sweep_ns = now_ns(); }
+        }
         if (m->mrd && m->mwr) for (;;) {
             pthread_mutex_lock(&m->mth_mu); bool st = m->mth_stop; pthread_mutex_unlock(&m->mth_mu);
             if (st || rsx_merge(m->rsx, m->mrd, m->mwr, m->fanout, m->part_rows) <= 0) break;
@@ -543,6 +547,7 @@ void mw_meta_quiesce (mw_meta *m) {
     pthread_mutex_lock(&m->mth_mu); m->mth_stop = true; pthread_cond_broadcast(&m->mth_cv); bool mrun = m->mth_running; pthread_mutex_unlock(&m->mth_mu);
     if (mrun) { pthread_join(m->mth, NULL); m->mth_running = false; }
     if (m->shared ? atomic_load(&m->db->shm->meta_state) == 2 : atomic_load(&m->ready)) mw_meta_flush(m);
+    if (m->wr && (m->shared ? atomic_load(&m->db->shm->meta_state) == 2 : atomic_load(&m->ready))) (void)rsx_release_pool(m->rsx, m->wr);      // (the slots we hold go back to the free ones, and our entry in the register of reservations goes)
     pthread_mutex_lock(&m->th_mu); m->th_stop = false; pthread_mutex_unlock(&m->th_mu);       // (a later open starts the thread again)
     pthread_mutex_lock(&m->mth_mu); m->mth_stop = false; pthread_mutex_unlock(&m->mth_mu);
     sqlite3 *conns[MW_RDN + 3]; sqlite3_stmt *stmts[MW_RDN]; int nc = 0;

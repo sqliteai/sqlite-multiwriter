@@ -73,7 +73,7 @@ uint64_t mw_meta_flushed (mw_meta *m);
 uint64_t mw_meta_dirty (mw_meta *m);
 uint64_t mw_meta_dirty_limit (mw_meta *m);
 uint32_t mw_meta_run_pressure (mw_meta *m);                  // microseconds a commit should wait: the merges of the runs are behind
-void mw_meta_run_stats (mw_meta *m, uint64_t out[12]);       // lookups, runs probed, skipped by the filter, blocks read, cache hits, merges, rows merged, runs written, runs now
+void mw_meta_run_stats (mw_meta *m, uint64_t out[13]);       // lookups, runs probed, skipped by the filter, blocks read, cache hits, merges, rows merged, runs written, runs now
 typedef struct { uint32_t tid; uint32_t pko; uint32_t pkl; mw_mcell c; int64_t cl; } mw_xcell;      // a cell to export: its table, where its key is in the pool, the cell, the causal length of its row
 int mw_metafile_export (mw_meta *m, sqlite3 *c, int64_t since, int64_t upto, mw_xcell **out, size_t *n, uint8_t **pkpool);   // (a transaction is open on c; free out and the pool)
 int mw_meta_register_views (sqlite3 *c, mw_meta *m);                                      // the read-only virtual table mw_cells (the cells of the runs, unpacked)

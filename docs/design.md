@@ -88,7 +88,7 @@ They are ordinary tables, so the file is self-contained: copy it and the CRDT st
   hides newer versions the first output holds (found by the SIGKILL rounds of `mw_mpmeta`). The oldest data (no run outside the merge up to the age of the output) drops deletion markers and the rows of dropped tables.
   With several processes one of them merges at a time (a byte lock) and the others flush.
 - *Back-pressure*: when the merges are behind (more than 48 age groups at level 0, or 144 in all) the commits of the application wait in proportion (up to 20 ms); the flush is never held (the log can only be
-  compacted up to the flushed point). The connections of the metadata themselves never wait for the writers: no turn behind them for hot pages, no throttle, no hard limit of the log (which commits wait for past 768 MB
+  compacted up to the flushed point). The connections of the metadata themselves never wait for the writers: no turn behind them for hot pages, no place in the queue of admission (its few slots shared by all processes were held by the long transactions of the flusher and the merger of every process: 64 processes went from 9k to 3k tx/s), no throttle, no hard limit of the log (which commits wait for past 768 MB
   so that the 1 GB mapping of the log is never outgrown).
 - *Export* reads only the blocks whose newest db_version is past `since` (no index to maintain), takes the keys of their rows, and asks the runs for the newest state of each key. `mw_cells` is a read-only
   virtual table over the runs with the columns of a cell (`tbl, pk, col, cv, dv, seq, site`; `col` -1 is the causal length), for looking at the metadata in SQL (it reads everything into memory: it is a tool

@@ -52,7 +52,7 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
     // The wait *sleeps* (50 us polls, at most 20 ms, then goes optimistic): measured against a spinning turn and a
     // condition-variable turn, sleeping is clearly best (10 agents: appends 192k vs 108k tx/s, hot rows 228k vs 130k),
     // because lanes that are not contending keep running instead of being woken in lock-step.
-    if (db->mp && lane->recent_writer && lane->adm_slot < 0 && lane->tx_long_run < 3 && !lane->forced_snapshot) mw_mp_admit(lane);      // (a writer of the previous transaction waits for a slot when there are many processes)
+    if (db->mp && lane->recent_writer && lane->adm_slot < 0 && lane->tx_long_run < 3 && !lane->forced_snapshot && !lane->sys) mw_mp_admit(lane);      // (a writer of the previous transaction waits for a slot when there are many processes)
     uint64_t tturn0 = MW_T0();
     if (lane->retry_credit > 0 && lane->private_mode && !lane->holds_hot && !lane->sys) {      // (the metadata store's connections never queue for a turn behind the writers: the writers wait for them)
         if (lane->tx_long_run >= 3) {

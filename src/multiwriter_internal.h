@@ -19,6 +19,14 @@
 #include <stdbool.h>
 #include "multiwriter.h"
 #include "multiwriter_vsshared.h"
+#include "multiwriter_catalog.h"
+
+// One row of the net change of a commit. pk: the key as sqlite-sync encodes it (NULL if the row could not be decoded); oldpk: an update that changed the key; changed: bit i = cell i of
+// the table changed (bit 63 = all of them); tab NULL: a row in a page whose table is unknown.
+typedef struct { int kind; const mw_tab *tab; uint32_t root; int64_t rowid; uint8_t *pk; size_t pklen; uint8_t *oldpk; size_t oldpklen; uint64_t changed; } mw_chg;
+typedef struct { uint32_t page, leaf; } mw_ovupd;                    // overflow page -> the leaf page holding the cell whose record spills into it
+typedef struct { mw_chg *chg; int n; uint32_t *freed; int nfreed; mw_ovupd *ovupd; int novupd; int unknown_ovfl; mw_rowdiff_info info; } mw_rd_result;
+
 
 typedef struct mw_db   mw_db;
 typedef struct { uint64_t epoch, end; } mw_pend;   // a record that was copied out of order: its epoch and the file offset where it ends
@@ -200,9 +208,8 @@ struct mw_lane {
     sqlite3_stmt *rb_st[7];     // prepared statements of the helpers (extract, base version | row cl, cell version, insert, BEGIN, COMMIT)
     int         rb_sync;        // synchronous level set on rb_c (-1: not yet)
     sqlite3    *rb_c, *rb_v;    // cached rebase helper connections (writer at the latest snapshot / overlay reader)
-    // CDC prototype (mw_cdc=1, docs §55): the cell versions this transaction will put in the store when it commits
-    vsh_key    *cdc_keys; vsh_val *cdc_vals; int cdc_n, cdc_cap;
-    uint32_t   *cdc_freed; int cdc_nfreed;
+    // change capture (mw_cdc=1): the row changes of the transaction being committed, and the catalog they were decoded with
+    mw_rd_result cdc_res; mw_cat *cdc_cat; int cdc_nfreed;
     int64_t     min_reserved;   // lowest db_version reserved by the current transaction, 0 = none (protected by db->mu)
     uint64_t    writer_id;      // unique per connection (lane) in this process; NOT the sqlite-sync site_id
     mw_tx_info  tx;             // current/last transaction
@@ -520,14 +527,19 @@ void     mw_gate_exit (mw_db *db);
 void     mw_gate_close (mw_db *db, mw_lane *owner);       // starving rebase: exclusive side
 void     mw_gate_open (mw_db *db);   // multiwriter_rebase.c: replay the logical changes at the latest snapshot
 void     mw_lane_rebase_free (mw_lane *lane);
-typedef struct { void *ctx; uint32_t (*old_owner) (void *ctx, uint32_t pgno); } mw_rd_owner;      // the table (root page) a page belonged to before the commit, 0 if unknown
-typedef struct { mw_rowchg *chg; int n; uint32_t *freed; int nfreed; mw_rowdiff_info info; } mw_rd_result;
+typedef struct { void *ctx; uint32_t (*old_owner) (void *ctx, uint32_t pgno); uint32_t (*ovfl_owner) (void *ctx, uint32_t pgno); const mw_cat *cat; } mw_rd_owner;      // the table (root page) a page belonged to before the commit, 0 if unknown; the schema
+// One row of the net change of a commit. pk: the key as sqlite-sync encodes it (NULL if the row could not be decoded); oldpk: an update that changed the key; changed: bit i = cell i of the
+// table changed (bit 63 = all of them).
+void     mw_rd_result_free (mw_rd_result *r);
 int      mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_owner *own, mw_rd_result *res);
 bool     mw_rd_snap_page (mw_lane *lane, uint32_t pgno, uint8_t *dst);
 int      mw_cdc_open (mw_db *db);
-int      mw_cdc_get (mw_db *db, mw_cdc_cell *cell);
+int      mw_cdc_set_public_sink (mw_db *db, const mw_capture_sink *s);
 void     mw_cdc_close (mw_db *db);
 void     mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs);
+typedef void (*mw_cdc_sink_fn) (void *arg, const mw_chg *chg, int n, const mw_rowdiff_info *info);
+void     mw_cdc_set_sink (mw_db *db, mw_cdc_sink_fn fn, void *arg);
+void     mw_cdc_lane_free (mw_lane *lane);
 void     mw_cdc_apply_owner (mw_db *db, mw_lane *lane, const uint32_t *pgnos, const uint8_t *const *images, int n);
 void     mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch);
 bool     mw_rowdiff_enabled (void);

@@ -354,7 +354,7 @@ void mw_lane_free (mw_lane *lane) {
     sqlite3_free(lane->rs_bits);
     sqlite3_free(lane->rs_list);
     mw_lane_rebase_free(lane);
-    free(lane->cdc_keys); free(lane->cdc_vals); free(lane->cdc_freed);
+    mw_cdc_lane_free(lane);
     sqlite3_free(lane);
 }
 
@@ -491,7 +491,7 @@ static int lm_file_control (sqlite3_file *pf, int op, void *arg) {
     }
     if (op == MW_FCNTL_COMPACT) { mw_compact_result *r = (mw_compact_result *)arg; return mw_db_compact(lane->db, r); }
     if (op == MW_FCNTL_LANE_PTR) { *(void **)arg = lane; return SQLITE_OK; }
-    if (op == MW_FCNTL_CDC_GET) return mw_cdc_get(lane->db, (mw_cdc_cell *)arg);
+    if (op == MW_FCNTL_CDC_SINK) return mw_cdc_set_public_sink(lane->db, (const mw_capture_sink *)arg);
     if (op == MW_FCNTL_GC) { *(uint64_t *)arg = mw_db_gc(lane->db); return SQLITE_OK; }
     if (op == SQLITE_FCNTL_MMAP_SIZE) { *(sqlite3_int64 *)arg = 0; return SQLITE_OK; }   // mmap disabled: reports 0 disabled: reads must go through xRead
     if (op == SQLITE_FCNTL_SIZE_HINT) return SQLITE_OK;         // we never grow the real file from a lane

@@ -9,6 +9,7 @@
 #ifndef __CLOUDSYNC_MULTIWRITER__
 #define __CLOUDSYNC_MULTIWRITER__
 
+#include <stddef.h>
 #include <stdint.h>
 #include "sqlite3.h"
 
@@ -119,10 +120,13 @@ typedef struct { int pages, opaque, index_pages, interior, schema, undecodable; 
 typedef void (*mw_rowdiff_sink_fn) (void *arg, const mw_rowchg *chg, int n, const mw_rowdiff_info *info);
 void mw_rowdiff_set_sink (mw_rowdiff_sink_fn fn, void *arg);
 
-// CDC prototype (docs §55), connections opened with mw_cdc=1: the version the capture holds for a cell. table_root = the table's rootpage in sqlite_schema, col = the
-// column index in the record (the INTEGER PRIMARY KEY column is 0 and has no cell), 0xFFFF = the row's delete marker. found = 0 if the cell was never captured.
-#define MW_FCNTL_CDC_GET  0x4d57000c
-typedef struct { uint32_t table_root; int col; int64_t rowid; uint32_t cv, dv; int found; } mw_cdc_cell;
+// Change capture (URI mw_cdc=1; docs/design.md). The row-level changes of every commit of the connection's database, derived in the VFS from the pages: the table, the primary key as
+// sqlite-sync encodes it, what happened (1 insert, 2 update, 3 delete) and for an update the cells that changed (bit i = the i-th non-key column; bit 63: all of them) and, if the key itself
+// changed, the old key. Called from the committing thread before the commit is published, for every attempt (a refused commit is reported again when it is retried).
+typedef struct { int kind; const char *table; const uint8_t *pk; size_t pklen; const uint8_t *oldpk; size_t oldpklen; uint64_t changed; int64_t rowid; } mw_capture_row;
+typedef void (*mw_capture_fn) (void *arg, const mw_capture_row *rows, int n);
+#define MW_FCNTL_CDC_SINK 0x4d57000c       // sqlite3_file_control(db, "main", MW_FCNTL_CDC_SINK, &(mw_capture_sink){ fn, arg })
+typedef struct { mw_capture_fn fn; void *arg; } mw_capture_sink;
 
 #define MW_FCNTL_COMPACT  0x4d57000a   // sqlite3_file_control(db, "main", MW_FCNTL_COMPACT, mw_compact_result *)
 typedef struct {

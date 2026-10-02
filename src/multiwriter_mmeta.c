@@ -229,13 +229,12 @@ static void col_cb (void *arg, uint32_t bucket, uint64_t epoch, uint64_t loc) {
             c->cells[k] = (mw_mcell){ (int64_t)cv, dvp ? (int64_t)(dvp - 1) : (int64_t)dvres, (uint32_t)col, (uint32_t)site, (uint32_t)seq };
         }
         int n = purge_filter(db, (uint32_t)tbl, c->cells, (int)nc);
-        int dirtyc = 0; bool sen = false;
-        for (int k = 0; k < n; k++) { if (c->cells[k].col == CRDT_COL_SENTINEL) sen = true; if (c->cells[k].dv > (int64_t)c->F) dirtyc++; }
+        int dirtyc = 0;
+        for (int k = 0; k < n; k++) if (c->cells[k].dv > (int64_t)c->F) dirtyc++;
         if (!dirtyc) continue;
-        bool drop = sen;                                                                       // a row that was ever deleted: its cells in the file may be stale ones: rewrite them all
-        fitem *it = mw_fbatch_add(c->out, (uint32_t)tbl, pk, (uint32_t)pklen, drop, drop ? n : dirtyc);
+        fitem *it = mw_fbatch_add(c->out, (uint32_t)tbl, pk, (uint32_t)pklen, false, n);         // (the whole state of the row: the file replaces its copy)
         if (!it) { c->err = 1; return; }
-        int k2 = 0; for (int k = 0; k < n; k++) if (drop || c->cells[k].dv > (int64_t)c->F) it->c[k2++] = c->cells[k];
+        for (int k = 0; k < n; k++) it->c[k] = c->cells[k];
     }
 }
 int mm_collect (mw_meta *m, uint64_t F, uint64_t Fe, fbatch *out) {

@@ -72,6 +72,9 @@ int      mw_meta_export_index (sqlite3 *conn);                                  
 uint64_t mw_meta_flushed (mw_meta *m);
 uint64_t mw_meta_dirty (mw_meta *m);
 uint64_t mw_meta_dirty_limit (mw_meta *m);
+int mw_meta_register_views (sqlite3 *c);                                      // the read-only virtual table mw_cells (the cells of mw_rows, unpacked)
+uint8_t *mw_meta_row_pack (const mw_mcell *c, int n, size_t *len);
+bool mw_meta_row_cells (const void *blob, size_t len, mw_mcell **c, int *n);   // the cells of a packed row of mw_rows (caller frees)
 uint64_t mw_meta_epoch (mw_meta *m);
 uint64_t mw_meta_dv (mw_meta *m, uint64_t epoch);                               // the db_version of an epoch of this incarnation                                              // the last commit made visible                                              // rows changed since the last flush
 

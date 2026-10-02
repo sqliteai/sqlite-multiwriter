@@ -60,9 +60,15 @@ writes have the head epoch the transaction read them at, installs them, and publ
 cookie moves, under the publication lock. The site table and the list of dropped tables are in the shared header. The flusher is whichever process claims it (a byte lock).
 
 ### The file tables
-`mw_state(k, v)` (`meta_epoch`, `dv_hwm`), `mw_sites(ord, id)`, `mw_cells(tbl, pk, col, cv, dv, seq, site)` (WITHOUT ROWID, plus an index on `dv, seq`), created by the first
-connection. They are ordinary tables, so the file is self-contained: copy it and the CRDT state comes along. A flusher thread writes what changed since the last flush in one
-ordinary logged transaction together with `meta_epoch`: the batch and the epoch it covers are atomic. Reads that miss the cache go through a small pool of read-only connections.
+`mw_state(k, v)` (`meta_epoch`, `dv_hwm`), `mw_sites(ord, id)` and `mw_rows(tbl, pk, dv, cells)` (WITHOUT ROWID, key `(tbl, pk)`), created by the first connection. A row of `mw_rows` is **one
+row of a user table**: `dv` is the largest db_version among its cells and `cells` is the packed state of all of them (a format byte, the number of cells, then per cell the column + 1 so that the
+sentinel is 0, the version, the db_version, the sequence and the site, as varints). The flush *replaces* the row: the cells are always the complete state, so nothing is read before it is written and a
+cell that disappeared (a dropped column) disappears with it. Packing is what makes wide tables cheap: the flusher does one b-tree insert per row instead of one per cell (a table with five columns
+besides its key flushes in about a quarter of the time, and tracked bulk inserts into it run 3.6 times faster: 2.4k to 8.6k tx/s at 8 threads). The index the export needs, `mw_rows_dv(dv)`, is created by the
+first export (databases that never synchronise do not pay for it). `mw_cells` is a read-only virtual table over `mw_rows` with the columns of the cells (`tbl, pk, col, cv, dv, seq, site`; `col` -1 is
+the causal length), for looking at the metadata in SQL. They are ordinary tables, so the file is self-contained: copy it and the CRDT state comes along. A flusher thread writes what changed since the last flush
+in ordinary logged transactions together with `meta_epoch`: the batch and the epoch it covers are atomic. Reads that miss the cache go through a small pool of read-only connections. With
+`MW_META_FLUSH_PAR=2` a large flush is cut in key ranges written by two connections at once (+10 to +17% on narrow tables; more connections do not help: conflicts on the pages above the leaves).
 
 ### Durability and recovery (the rule that makes it ACID)
 - A commit is durable when its record is in the log; its metadata is in the record. A crash can therefore never leave pages without their metadata or metadata without

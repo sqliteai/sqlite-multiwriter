@@ -156,6 +156,8 @@ int mw_sync_site_id (sqlite3 *db, uint8_t out[16]) {
 int64_t mw_sync_db_version (sqlite3 *db) { mw_meta *m = meta_of(db); if (!m) return -1; mw_meta_ready(m); return (int64_t)mw_meta_dv(m, mw_meta_epoch(m)); }
 
 // ---- export ----
+typedef struct { uint32_t tid; uint32_t pko; uint32_t pkl; mw_mcell c; int64_t cl; } xcell;      // a cell to export: its table, where its key is in the pool, the cell, the causal length of its row
+static int xcell_cmp (const void *a, const void *b) { const xcell *x = a, *y = b; if (x->c.dv != y->c.dv) return x->c.dv < y->c.dv ? -1 : 1; return x->c.seq != y->c.seq ? (x->c.seq < y->c.seq ? -1 : 1) : 0; }
 int mw_sync_export (sqlite3 *db, int64_t since, uint8_t **payload, size_t *len, int64_t *upto) {
     *payload = NULL; *len = 0;
     mw_meta *m = meta_of(db); if (!m) return SQLITE_MISUSE;
@@ -168,36 +170,54 @@ int mw_sync_export (sqlite3 *db, int64_t since, uint8_t **payload, size_t *len, 
     sysch sc; buf tuples = {0}; uint32_t nrows = 0;
     rc = sqlite3_exec(db, "BEGIN", NULL, NULL, NULL); if (rc != SQLITE_OK) return rc;
     rc = sch_load(db, &sc); sc.meta = m;
-    sqlite3_stmt *q = NULL, *cl = NULL;
-    if (rc == SQLITE_OK) rc = sqlite3_prepare_v2(db, "SELECT tbl, pk, col, cv, dv, seq, site FROM mw_cells WHERE dv > ?1 AND dv <= ?2 ORDER BY dv, seq", -1, &q, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_prepare_v2(db, "SELECT cv FROM mw_cells WHERE tbl = ?1 AND pk = ?2 AND col = -1", -1, &cl, NULL);
-    if (rc == SQLITE_OK) { sqlite3_bind_int64(q, 1, since); sqlite3_bind_int64(q, 2, (int64_t)V); }
+    // The rows whose newest cell is past `since`, each unpacked: the cells in (since, V] with the causal length of their row, in the order of (db_version, sequence).
+    xcell *xs = NULL; size_t nx = 0, capx = 0; uint8_t *pkpool = NULL; size_t pkn = 0, pkcap = 0;
+    sqlite3_stmt *q = NULL;
+    if (rc == SQLITE_OK) rc = sqlite3_prepare_v2(db, "SELECT tbl, pk, cells FROM mw_rows WHERE dv > ?1", -1, &q, NULL);
+    if (rc == SQLITE_OK) sqlite3_bind_int64(q, 1, since);
     while (rc == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
-        uint32_t tid = (uint32_t)sqlite3_column_int64(q, 0); syt *t = by_tid(&sc, tid); if (!t) continue;
-        const void *pk = sqlite3_column_blob(q, 1); size_t pklen = (size_t)sqlite3_column_bytes(q, 1);
-        int64_t col = sqlite3_column_int64(q, 2); crdt_value val = { CRDT_NULL, 0, 0, NULL, 0 }; const char *cname; int cell = -1;
-        {                                                                          // the cell of the file may be older than the row we read in this snapshot (a commit since the flush): its value would not be its own; the newer cell goes in the next export
+        mw_mcell *rc_cells; int nrc;
+        if (!mw_meta_row_cells(sqlite3_column_blob(q, 2), (size_t)sqlite3_column_bytes(q, 2), &rc_cells, &nrc)) { rc = SQLITE_CORRUPT; break; }
+        int64_t clv = 1; for (int i = 0; i < nrc; i++) if (rc_cells[i].col == CRDT_COL_SENTINEL) clv = rc_cells[i].cv;
+        const void *pk = sqlite3_column_blob(q, 1); size_t pklen = (size_t)sqlite3_column_bytes(q, 1); uint32_t pko = 0; bool stored = false;
+        for (int i = 0; i < nrc && rc == SQLITE_OK; i++) {
+            if (rc_cells[i].dv <= since || rc_cells[i].dv > (int64_t)V) continue;
+            if (!stored) {
+                if (pkn + pklen > pkcap) { size_t nc = (pkn + pklen) * 2 + 4096; uint8_t *np = realloc(pkpool, nc); if (!np) { rc = SQLITE_NOMEM; break; } pkpool = np; pkcap = nc; }
+                memcpy(pkpool + pkn, pk, pklen); pko = (uint32_t)pkn; pkn += pklen; stored = true;
+            }
+            if (nx == capx) { size_t nc = capx ? capx * 2 : 1024; xcell *nxs = realloc(xs, nc * sizeof *xs); if (!nxs) { rc = SQLITE_NOMEM; break; } xs = nxs; capx = nc; }
+            xs[nx++] = (xcell){ (uint32_t)sqlite3_column_int64(q, 0), pko, (uint32_t)pklen, rc_cells[i], clv };
+        }
+        free(rc_cells);
+    }
+    sqlite3_finalize(q); q = NULL;
+    if (rc == SQLITE_OK && nx > 1) qsort(xs, nx, sizeof *xs, xcell_cmp);
+    for (size_t xi = 0; rc == SQLITE_OK && xi < nx; xi++) {
+        const xcell *x = &xs[xi];
+        uint32_t tid = x->tid; syt *t = by_tid(&sc, tid); if (!t) continue;
+        const void *pk = pkpool + x->pko; size_t pklen = x->pkl;
+        int64_t col = x->c.col == CRDT_COL_SENTINEL ? -1 : (int64_t)x->c.col; crdt_value val = { CRDT_NULL, 0, 0, NULL, 0 }; const char *cname; int cell = -1;
+        {                                                                          // the cell of the file may be older than the row we read in this snapshot (a commit since the flush): its value would not be its own; the newer cell goes in the next payload
             mw_mcell *live; int nl; bool ahead = false;
-            if (mw_meta_row(m, tid, pk, pklen, &live, &nl) == 0) { for (int i = 0; i < nl; i++) if ((int64_t)live[i].col == col || (col == -1 && live[i].col == CRDT_COL_SENTINEL)) { if (live[i].dv > sqlite3_column_int64(q, 4)) ahead = true; } free(live); }
+            if (mw_meta_row(m, tid, pk, pklen, &live, &nl) == 0) { for (int i = 0; i < nl; i++) if (live[i].col == x->c.col && live[i].dv > x->c.dv) ahead = true; free(live); }
             if (ahead) continue;
         }
         if (col == -1) cname = CRDT_SENTINEL;
         else { cell = cell_by_id(t, (uint32_t)col); if (cell < 0) continue; cname = t->cell[cell]; if (!base_value(&sc, t, cell, pk, pklen, &val)) val = (crdt_value){ CRDT_NULL, 0, 0, NULL, 0 }; }
-        int64_t clv = 1; sqlite3_bind_int64(cl, 1, tid); sqlite3_bind_blob(cl, 2, pk, (int)pklen, SQLITE_STATIC);
-        if (col == -1) clv = sqlite3_column_int64(q, 3); else if (sqlite3_step(cl) == SQLITE_ROW) clv = sqlite3_column_int64(cl, 0);
-        sqlite3_reset(cl);
-        uint8_t site[16]; if (!mw_meta_site_id(m, (uint32_t)sqlite3_column_int64(q, 6), site)) memset(site, 0, 16);
+        int64_t clv = x->cl;
+        uint8_t site[16]; if (!mw_meta_site_id(m, x->c.site, site)) memset(site, 0, 16);
         crdt_value tv[NCOLS] = {
             { CRDT_TEXT, 0, 0, t->name, strlen(t->name) }, { CRDT_BLOB, 0, 0, pk, pklen }, { CRDT_TEXT, 0, 0, cname, strlen(cname) }, val,
-            { CRDT_INTEGER, sqlite3_column_int64(q, 3), 0, NULL, 0 }, { CRDT_INTEGER, sqlite3_column_int64(q, 4), 0, NULL, 0 }, { CRDT_BLOB, 0, 0, site, 16 },
-            { CRDT_INTEGER, clv, 0, NULL, 0 }, { CRDT_INTEGER, sqlite3_column_int64(q, 5), 0, NULL, 0 } };
+            { CRDT_INTEGER, x->c.cv, 0, NULL, 0 }, { CRDT_INTEGER, x->c.dv, 0, NULL, 0 }, { CRDT_BLOB, 0, 0, site, 16 },
+            { CRDT_INTEGER, clv, 0, NULL, 0 }, { CRDT_INTEGER, (int64_t)x->c.seq, 0, NULL, 0 } };
         size_t need = crdt_tuple_encode(tv, NCOLS, NULL, 0); uint8_t *tmp = malloc(need);
         if (!tmp) { rc = SQLITE_NOMEM; break; }
         crdt_tuple_encode(tv, NCOLS, tmp, need);
         if (buf_add(&tuples, tmp, need)) rc = SQLITE_NOMEM;
         free(tmp); nrows++;
     }
-    sqlite3_finalize(q); sqlite3_finalize(cl); sch_free(&sc);
+    free(xs); free(pkpool); sch_free(&sc);
     sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     if (rc == SQLITE_OK && nrows) rc = container_encode(&tuples, nrows, payload, len);
     free(tuples.p);

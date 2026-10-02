@@ -14,21 +14,57 @@
 static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS mw_state(k TEXT PRIMARY KEY NOT NULL, v) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS mw_sites(ord INTEGER PRIMARY KEY, id BLOB NOT NULL);"
-    "CREATE TABLE IF NOT EXISTS mw_cells(tbl INTEGER NOT NULL, pk BLOB NOT NULL, col INTEGER NOT NULL, cv INTEGER NOT NULL, dv INTEGER NOT NULL, seq INTEGER NOT NULL, site INTEGER NOT NULL, PRIMARY KEY(tbl, pk, col)) WITHOUT ROWID;"
-    "CREATE INDEX IF NOT EXISTS mw_cells_sen ON mw_cells(tbl, pk) WHERE col = -1;";
+    "CREATE TABLE IF NOT EXISTS mw_rows(tbl INTEGER NOT NULL, pk BLOB NOT NULL, dv INTEGER NOT NULL, cells BLOB NOT NULL, PRIMARY KEY(tbl, pk)) WITHOUT ROWID;";
 
 static uint64_t now_ns (void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 static bool busyish (int rc) { int p = rc & 0xff; return p == SQLITE_BUSY || p == SQLITE_LOCKED; }
 
 // The index that lets the export find the cells changed since a db_version costs a random insert per cell at every flush: it is created by the first export (the databases that never
 // synchronise do not pay for it), and the flush maintains it from then on.
-int mw_meta_export_index (sqlite3 *c) { return sqlite3_exec(c, "CREATE INDEX IF NOT EXISTS mw_cells_dv ON mw_cells(dv, seq)", NULL, NULL, NULL); }
+int mw_meta_export_index (sqlite3 *c) { return sqlite3_exec(c, "CREATE INDEX IF NOT EXISTS mw_rows_dv ON mw_rows(dv)", NULL, NULL, NULL); }
+
+// ---- the row as the file holds it ----
+// One row of mw_rows per row of a user table: its key, the largest db_version of its cells (what the export looks for) and all its cells, packed: a format byte, the number of cells, then
+// per cell the column (+1, so the sentinel is 0), version, db_version, sequence and site as varints. The cells are the complete state of the row: a flush replaces them all.
+#define ROW_FORMAT 1
+static size_t put_var (uint8_t *p, uint64_t v) { size_t n = 0; while (v >= 0x80) { p[n++] = (uint8_t)(v | 0x80); v >>= 7; } p[n++] = (uint8_t)v; return n; }
+static bool get_var (const uint8_t **p, const uint8_t *end, uint64_t *v) {
+    uint64_t r = 0; int sh = 0;
+    while (*p < end && sh < 64) { uint8_t b = *(*p)++; r |= (uint64_t)(b & 0x7f) << sh; if (!(b & 0x80)) { *v = r; return true; } sh += 7; }
+    return false;
+}
+// the packed cells in `out` (room for 1 + 10 + 45 bytes a cell); returns the length
+static size_t row_pack (const mw_mcell *c, int n, uint8_t *out) {
+    size_t w = 0; out[w++] = ROW_FORMAT; w += put_var(out + w, (uint64_t)n);
+    for (int i = 0; i < n; i++) {
+        w += put_var(out + w, (uint64_t)(uint32_t)(c[i].col + 1u)); w += put_var(out + w, (uint64_t)c[i].cv); w += put_var(out + w, (uint64_t)c[i].dv);
+        w += put_var(out + w, c[i].seq); w += put_var(out + w, c[i].site);
+    }
+    return w;
+}
+#define ROW_PACK_MAX(n) (16 + (size_t)(n) * 48)
+// the cells of a packed row, appended to `*c` (grown as needed; `*n` the count so far); false when the blob is not one
+static bool row_unpack (const uint8_t *p, size_t len, mw_mcell **c, int *n, int *cap) {
+    const uint8_t *end = p + len; uint64_t cnt;
+    if (len < 2 || *p++ != ROW_FORMAT || !get_var(&p, end, &cnt) || cnt > (1u << 20)) return false;
+    if (*n + (int)cnt > *cap) { int nc = (*n + (int)cnt) * 2 + 4; mw_mcell *nm = realloc(*c, (size_t)nc * sizeof **c); if (!nm) return false; *c = nm; *cap = nc; }
+    for (uint64_t i = 0; i < cnt; i++) {
+        uint64_t col, cv, dv, seq, site;
+        if (!get_var(&p, end, &col) || !get_var(&p, end, &cv) || !get_var(&p, end, &dv) || !get_var(&p, end, &seq) || !get_var(&p, end, &site)) return false;
+        (*c)[(*n)++] = (mw_mcell){ (int64_t)cv, (int64_t)dv, (uint32_t)(col - 1u), (uint32_t)site, (uint32_t)seq };
+    }
+    return true;
+}
+// (tests) the packed form of cells: the blob, malloc'ed
+uint8_t *mw_meta_row_pack (const mw_mcell *c, int n, size_t *len) { uint8_t *b = malloc(ROW_PACK_MAX(n)); if (!b) return NULL; *len = row_pack(c, n, b); return b; }
+// for the export and the virtual table of tests: the cells of the blob of a row
+bool mw_meta_row_cells (const void *blob, size_t len, mw_mcell **c, int *n) { int cap = 0; *c = NULL; *n = 0; if (row_unpack(blob, len, c, n, &cap)) return true; free(*c); *c = NULL; *n = 0; return false; }
 
 int mw_meta_schema (sqlite3 *c) {
     sqlite3_stmt *st = NULL; int have = 0;
-    if (sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_cells','mw_cells_sen')", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) have = sqlite3_column_int(st, 0);
+    if (sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_rows')", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) have = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
-    if (have == 4) return SQLITE_OK;
+    if (have == 3) return SQLITE_OK;
     int rc = SQLITE_BUSY;
     for (int i = 0; i < 100 && busyish(rc); i++) {
         rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL);
@@ -80,16 +116,13 @@ int mw_metafile_load (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw
     pthread_mutex_lock(&m->rdmu[slot]);
 locked:
     if (!m->rd[slot]) m->rd[slot] = open_conn(m);
-    if (m->rd[slot] && !m->rds[slot]) sqlite3_prepare_v2(m->rd[slot], "SELECT col, cv, dv, seq, site FROM mw_cells WHERE tbl = ?1 AND pk = ?2", -1, &m->rds[slot], NULL);
+    if (m->rd[slot] && !m->rds[slot]) sqlite3_prepare_v2(m->rd[slot], "SELECT cells FROM mw_rows WHERE tbl = ?1 AND pk = ?2", -1, &m->rds[slot], NULL);
     int rc = 0;                                                                 // (no table yet, or a statement that cannot be prepared: the row is not in the file)
     if (m->rds[slot]) {
         sqlite3_stmt *st = m->rds[slot];
         sqlite3_bind_int64(st, 1, tbl); sqlite3_bind_blob(st, 2, pk, (int)pklen, SQLITE_STATIC);
         int cap = 0, cnt = 0; mw_mcell *c = NULL; rc = 0; int r;
-        while ((r = sqlite3_step(st)) == SQLITE_ROW) {
-            if (cnt == cap) { cap = cap ? cap * 2 : 8; mw_mcell *nc = realloc(c, (size_t)cap * sizeof *c); if (!nc) { rc = -1; break; } c = nc; }
-            c[cnt++] = (mw_mcell){ sqlite3_column_int64(st, 1), sqlite3_column_int64(st, 2), (uint32_t)sqlite3_column_int64(st, 0), (uint32_t)sqlite3_column_int64(st, 4), (uint32_t)sqlite3_column_int64(st, 3) };
-        }
+        while ((r = sqlite3_step(st)) == SQLITE_ROW) { if (!row_unpack(sqlite3_column_blob(st, 0), (size_t)sqlite3_column_bytes(st, 0), &c, &cnt, &cap)) { rc = -1; break; } }
         if (r != SQLITE_DONE && rc == 0) rc = -1;
         sqlite3_reset(st); sqlite3_clear_bindings(st);
         if (rc == 0) {
@@ -117,7 +150,7 @@ int mw_metafile_load_many (mw_meta *m, int n, const uint32_t *tbl, const uint8_t
     pthread_mutex_lock(&m->rdmu[slot]);
 locked:
     if (!m->rd[slot]) m->rd[slot] = open_conn(m);
-    if (m->rd[slot] && !m->rds[slot]) sqlite3_prepare_v2(m->rd[slot], "SELECT col, cv, dv, seq, site FROM mw_cells WHERE tbl = ?1 AND pk = ?2", -1, &m->rds[slot], NULL);
+    if (m->rd[slot] && !m->rds[slot]) sqlite3_prepare_v2(m->rd[slot], "SELECT cells FROM mw_rows WHERE tbl = ?1 AND pk = ?2", -1, &m->rds[slot], NULL);
     int rc = 0;
     if (m->rds[slot]) {
         sqlite3_stmt *st = m->rds[slot];
@@ -125,10 +158,7 @@ locked:
         for (int i = 0; i < n && rc == 0; i++) {
             sqlite3_bind_int64(st, 1, tbl[i]); sqlite3_bind_blob(st, 2, pk[i], (int)pklen[i], SQLITE_STATIC);
             int cap = 0, cnt = 0; mw_mcell *c = NULL; int r;
-            while ((r = sqlite3_step(st)) == SQLITE_ROW) {
-                if (cnt == cap) { cap = cap ? cap * 2 : 4; mw_mcell *nc = realloc(c, (size_t)cap * sizeof *c); if (!nc) { rc = -1; break; } c = nc; }
-                c[cnt++] = (mw_mcell){ sqlite3_column_int64(st, 1), sqlite3_column_int64(st, 2), (uint32_t)sqlite3_column_int64(st, 0), (uint32_t)sqlite3_column_int64(st, 4), (uint32_t)sqlite3_column_int64(st, 3) };
-            }
+            while ((r = sqlite3_step(st)) == SQLITE_ROW) { if (!row_unpack(sqlite3_column_blob(st, 0), (size_t)sqlite3_column_bytes(st, 0), &c, &cnt, &cap)) { rc = -1; break; } }
             if (r != SQLITE_DONE && rc == 0) rc = -1;
             sqlite3_reset(st); sqlite3_clear_bindings(st);
             if (rc == 0) { cells[i] = c; ncells[i] = cnt; } else free(c);
@@ -148,12 +178,12 @@ locked:
     return rc;
 }
 
-// the filter of deleted rows from the file (the partial index over the causal-length entries makes this a scan of the deleted rows only)
+// the filter of the keys the file knows (every row of a table has a causal-length entry): a scan of the keys
 int mw_metafile_load_tombstones (mw_meta *m) {
     if (!m->attached) return 0;
     sqlite3 *c = open_conn(m); if (!c) return -1;
     sqlite3_stmt *st = NULL; int n = 0;
-    if (sqlite3_prepare_v2(c, "SELECT tbl, pk FROM mw_cells WHERE col = -1", -1, &st, NULL) == SQLITE_OK)
+    if (sqlite3_prepare_v2(c, "SELECT tbl, pk FROM mw_rows", -1, &st, NULL) == SQLITE_OK)
         while (sqlite3_step(st) == SQLITE_ROW) { mw_meta_bloom_add(m, (uint32_t)sqlite3_column_int64(st, 0), sqlite3_column_blob(st, 1), (size_t)sqlite3_column_bytes(st, 1)); n++; }
     sqlite3_finalize(st); sqlite3_close(c);
     return 0;
@@ -166,7 +196,7 @@ void mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *s
     if (!m->attached) return;
     sqlite3 *c = open_conn(m); if (!c) return;
     sqlite3_stmt *st = NULL; int have = 0;
-    if (sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_cells')", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) have = sqlite3_column_int(st, 0);
+    if (sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_rows')", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) have = sqlite3_column_int(st, 0);
     sqlite3_finalize(st); st = NULL;
     if (have == 3) {
         m->tables_ok = true;
@@ -244,13 +274,12 @@ static int collect (mw_meta *m, uint64_t F, fbatch *out, mentry **det) {
             pthread_mutex_lock(&st->mu);
             for (int blk = 0; e && blk < DIRTY_BLOCK; blk++, e = e->dnext) {
                 if (e->tbl == 0xFFFFFFFFu) continue;                                  // (its table was dropped meanwhile)
-                int nc = 0; for (int i = 0; i < e->n; i++) if (e->cells[i].dv > (int64_t)F) nc++;
-                bool drop = e->drop_ver > F;
+                bool changed = e->drop_ver > F; for (int i = 0; i < e->n && !changed; i++) if (e->cells[i].dv > (int64_t)F) changed = true;
                 e->fver = e->ver;
-                if (!nc && !drop) continue;
-                fitem *it = mw_fbatch_add(out, e->tbl, e->pk, e->pklen, drop, nc);
+                if (!changed) continue;
+                fitem *it = mw_fbatch_add(out, e->tbl, e->pk, e->pklen, false, e->n);                    // (the whole state of the row: the file replaces its copy)
                 if (!it) { pthread_mutex_unlock(&st->mu); mw_fbatch_free(out); return -1; }
-                int k = 0; for (int i = 0; i < e->n; i++) if (e->cells[i].dv > (int64_t)F) it->c[k++] = e->cells[i];
+                for (int i = 0; i < e->n; i++) it->c[i] = e->cells[i];
             }
             pthread_mutex_unlock(&st->mu);
         }
@@ -327,24 +356,25 @@ static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool l
     m->tables_ok = true;
     if ((rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL)) != SQLITE_OK) return rc;
     sqlite3_stmt *del = NULL, *ins = NULL, *site = NULL, *state = NULL, *hw = NULL;
-    sqlite3_prepare_v2(c, "DELETE FROM mw_cells WHERE tbl = ?1 AND pk = ?2 AND col <> -1", -1, &del, NULL);
-    sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_cells(tbl, pk, col, cv, dv, seq, site) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)", -1, &ins, NULL);
+    sqlite3_prepare_v2(c, "DELETE FROM mw_rows WHERE tbl = ?1 AND pk = ?2", -1, &del, NULL);
+    sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_rows(tbl, pk, dv, cells) VALUES(?1, ?2, ?3, ?4)", -1, &ins, NULL);
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_sites(ord, id) VALUES(?1, ?2)", -1, &site, NULL);
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_state(k, v) VALUES('meta_epoch', ?1)", -1, &state, NULL);
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_state(k, v) VALUES('dv_hwm', ?1)", -1, &hw, NULL);
     rc = (del && ins && site && state && hw) ? SQLITE_OK : SQLITE_ERROR;
-    for (int i = 0; i0 == 0 && i < npurge && rc == SQLITE_OK; i++) { char q[80]; snprintf(q, sizeof q, "DELETE FROM mw_cells WHERE tbl = %u AND dv < %llu", purge[i].tbl, (unsigned long long)purge[i].epoch); rc = sqlite3_exec(c, q, NULL, NULL, NULL); }
+    for (int i = 0; i0 == 0 && i < npurge && rc == SQLITE_OK; i++) { char q[80]; snprintf(q, sizeof q, "DELETE FROM mw_rows WHERE tbl = %u AND dv < %llu", purge[i].tbl, (unsigned long long)purge[i].epoch); rc = sqlite3_exec(c, q, NULL, NULL, NULL); }
     uint64_t cells = 0;
+    uint8_t *pack = NULL; size_t packcap = 0;
     for (int i = i0; i < n && rc == SQLITE_OK; i++) {
-        if (v[i].drop) { sqlite3_bind_int64(del, 1, v[i].tbl); sqlite3_bind_blob(del, 2, v[i].pk, (int)v[i].pklen, SQLITE_STATIC); if (sqlite3_step(del) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(del); }
-        for (int k = 0; k < v[i].n && rc == SQLITE_OK; k++) {
-            const mw_mcell *x = &v[i].c[k];
-            sqlite3_bind_int64(ins, 1, v[i].tbl); sqlite3_bind_blob(ins, 2, v[i].pk, (int)v[i].pklen, SQLITE_STATIC);
-            sqlite3_bind_int64(ins, 3, x->col == CRDT_COL_SENTINEL ? -1 : (int64_t)x->col); sqlite3_bind_int64(ins, 4, x->cv); sqlite3_bind_int64(ins, 5, x->dv);
-            sqlite3_bind_int64(ins, 6, x->seq); sqlite3_bind_int64(ins, 7, x->site);
-            if (sqlite3_step(ins) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(ins); cells++;
-        }
+        if (!v[i].n) { sqlite3_bind_int64(del, 1, v[i].tbl); sqlite3_bind_blob(del, 2, v[i].pk, (int)v[i].pklen, SQLITE_STATIC); if (sqlite3_step(del) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(del); continue; }
+        size_t need = ROW_PACK_MAX(v[i].n);
+        if (need > packcap) { uint8_t *np = realloc(pack, need * 2); if (!np) { rc = SQLITE_NOMEM; break; } pack = np; packcap = need * 2; }
+        size_t len = row_pack(v[i].c, v[i].n, pack);
+        int64_t dvmax = 0; for (int k = 0; k < v[i].n; k++) if (v[i].c[k].dv > dvmax) dvmax = v[i].c[k].dv;
+        sqlite3_bind_int64(ins, 1, v[i].tbl); sqlite3_bind_blob(ins, 2, v[i].pk, (int)v[i].pklen, SQLITE_STATIC); sqlite3_bind_int64(ins, 3, dvmax); sqlite3_bind_blob(ins, 4, pack, (int)len, SQLITE_STATIC);
+        if (sqlite3_step(ins) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(ins); cells += (uint64_t)v[i].n;
     }
+    free(pack);
     for (uint32_t o = sflushed; last && o < nsites && rc == SQLITE_OK; o++) {
         uint8_t id[16]; if (!mw_meta_site_id(m, o, id)) continue;
         sqlite3_bind_int64(site, 1, o); sqlite3_bind_blob(site, 2, id, 16, SQLITE_STATIC);
@@ -541,3 +571,61 @@ void mw_meta_quiesce (mw_meta *m) {
     for (int i = 0; i < MW_RDN; i++) sqlite3_finalize(stmts[i]);
     for (int i = 0; i < nc; i++) sqlite3_close(conns[i]);
 }
+
+// ---- mw_cells: the cells of mw_rows as the rows of a table ----
+// A read-only virtual table (eponymous: there is nothing to create) with the columns the file tables used to have, for people and tools that want to look at the metadata in SQL:
+// SELECT * FROM mw_cells; col is -1 for a row's own entry (the causal length).
+typedef struct { sqlite3_vtab base; sqlite3 *db; } cells_vt;
+typedef struct { sqlite3_vtab_cursor base; sqlite3_stmt *st; mw_mcell *c; int n, i; sqlite3_int64 rowid; bool eof; } cells_cur;
+static int cv_connect (sqlite3 *db, void *aux, int argc, const char *const *argv, sqlite3_vtab **out, char **err) {
+    (void)aux; (void)argc; (void)argv; (void)err;
+    int rc = sqlite3_declare_vtab(db, "CREATE TABLE x(tbl INTEGER, pk BLOB, col INTEGER, cv INTEGER, dv INTEGER, seq INTEGER, site INTEGER)");
+    if (rc != SQLITE_OK) return rc;
+    cells_vt *v = sqlite3_malloc(sizeof *v); if (!v) return SQLITE_NOMEM;
+    memset(v, 0, sizeof *v); v->db = db; *out = &v->base;
+    return SQLITE_OK;
+}
+static int cv_disconnect (sqlite3_vtab *vt) { sqlite3_free(vt); return SQLITE_OK; }
+static int cv_bestindex (sqlite3_vtab *vt, sqlite3_index_info *info) { (void)vt; info->estimatedCost = 1e9; info->estimatedRows = 1000000; return SQLITE_OK; }
+static int cv_open (sqlite3_vtab *vt, sqlite3_vtab_cursor **out) { (void)vt; cells_cur *c = sqlite3_malloc(sizeof *c); if (!c) return SQLITE_NOMEM; memset(c, 0, sizeof *c); *out = &c->base; return SQLITE_OK; }
+static int cv_close (sqlite3_vtab_cursor *cur) { cells_cur *c = (cells_cur *)cur; sqlite3_finalize(c->st); free(c->c); sqlite3_free(c); return SQLITE_OK; }
+static int cv_advance (cells_cur *c) {                       // to the next row of mw_rows that has cells
+    for (;;) {
+        int r = sqlite3_step(c->st);
+        if (r == SQLITE_DONE) { c->eof = true; return SQLITE_OK; }
+        if (r != SQLITE_ROW) return r;
+        free(c->c); c->c = NULL; c->n = 0; c->i = 0;
+        if (!mw_meta_row_cells(sqlite3_column_blob(c->st, 2), (size_t)sqlite3_column_bytes(c->st, 2), &c->c, &c->n)) return SQLITE_CORRUPT;
+        if (c->n) return SQLITE_OK;
+    }
+}
+static int cv_filter (sqlite3_vtab_cursor *cur, int idxn, const char *idxs, int argc, sqlite3_value **argv) {
+    (void)idxn; (void)idxs; (void)argc; (void)argv;
+    cells_cur *c = (cells_cur *)cur; cells_vt *v = (cells_vt *)cur->pVtab;
+    sqlite3_finalize(c->st); c->st = NULL; c->eof = false; c->rowid = 0;
+    int rc = sqlite3_prepare_v2(v->db, "SELECT tbl, pk, cells FROM mw_rows", -1, &c->st, NULL);
+    if (rc != SQLITE_OK) { c->eof = true; return SQLITE_OK; }                  // (no table yet: no cells)
+    return cv_advance(c);
+}
+static int cv_next (sqlite3_vtab_cursor *cur) {
+    cells_cur *c = (cells_cur *)cur; c->rowid++;
+    if (++c->i < c->n) return SQLITE_OK;
+    return cv_advance(c);
+}
+static int cv_eof (sqlite3_vtab_cursor *cur) { return ((cells_cur *)cur)->eof; }
+static int cv_column (sqlite3_vtab_cursor *cur, sqlite3_context *ctx, int col) {
+    cells_cur *c = (cells_cur *)cur; const mw_mcell *x = &c->c[c->i];
+    switch (col) {
+        case 0: sqlite3_result_int64(ctx, sqlite3_column_int64(c->st, 0)); break;
+        case 1: sqlite3_result_blob(ctx, sqlite3_column_blob(c->st, 1), sqlite3_column_bytes(c->st, 1), SQLITE_TRANSIENT); break;
+        case 2: sqlite3_result_int64(ctx, x->col == CRDT_COL_SENTINEL ? -1 : (int64_t)x->col); break;
+        case 3: sqlite3_result_int64(ctx, x->cv); break;
+        case 4: sqlite3_result_int64(ctx, x->dv); break;
+        case 5: sqlite3_result_int64(ctx, x->seq); break;
+        default: sqlite3_result_int64(ctx, x->site); break;
+    }
+    return SQLITE_OK;
+}
+static int cv_rowid (sqlite3_vtab_cursor *cur, sqlite3_int64 *r) { *r = ((cells_cur *)cur)->rowid; return SQLITE_OK; }
+static const sqlite3_module cells_module = { 0, NULL, cv_connect, cv_bestindex, cv_disconnect, NULL, cv_open, cv_close, cv_filter, cv_next, cv_eof, cv_column, cv_rowid };
+int mw_meta_register_views (sqlite3 *c) { return sqlite3_create_module(c, "mw_cells", &cells_module, NULL); }

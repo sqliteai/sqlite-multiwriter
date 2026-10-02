@@ -176,6 +176,11 @@ int mw_sync_export (sqlite3 *db, int64_t since, uint8_t **payload, size_t *len, 
         uint32_t tid = (uint32_t)sqlite3_column_int64(q, 0); syt *t = by_tid(&sc, tid); if (!t) continue;
         const void *pk = sqlite3_column_blob(q, 1); size_t pklen = (size_t)sqlite3_column_bytes(q, 1);
         int64_t col = sqlite3_column_int64(q, 2); crdt_value val = { CRDT_NULL, 0, 0, NULL, 0 }; const char *cname; int cell = -1;
+        {                                                                          // the cell of the file may be older than the row we read in this snapshot (a commit since the flush): its value would not be its own; the newer cell goes in the next export
+            mw_mcell *live; int nl; bool ahead = false;
+            if (mw_meta_row(m, tid, pk, pklen, &live, &nl) == 0) { for (int i = 0; i < nl; i++) if ((int64_t)live[i].col == col || (col == -1 && live[i].col == CRDT_COL_SENTINEL)) { if (live[i].dv > sqlite3_column_int64(q, 4)) ahead = true; } free(live); }
+            if (ahead) continue;
+        }
         if (col == -1) cname = CRDT_SENTINEL;
         else { cell = cell_by_id(t, (uint32_t)col); if (cell < 0) continue; cname = t->cell[cell]; if (!base_value(&sc, t, cell, pk, pklen, &val)) val = (crdt_value){ CRDT_NULL, 0, 0, NULL, 0 }; }
         int64_t clv = 1; sqlite3_bind_int64(cl, 1, tid); sqlite3_bind_blob(cl, 2, pk, (int)pklen, SQLITE_STATIC);

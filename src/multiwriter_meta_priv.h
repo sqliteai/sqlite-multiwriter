@@ -47,7 +47,7 @@ struct mw_meta {
     sqlite3 *wr;                                                 // the flusher's connection
     #define MW_RDN 4
     sqlite3 *rd[MW_RDN]; sqlite3_stmt *rds[MW_RDN]; pthread_mutex_t rdmu[MW_RDN];
-    pthread_t th; bool th_running; bool th_stop; bool kicked; pthread_mutex_t th_mu; pthread_cond_t th_cv;
+    pthread_t th; bool th_running; bool th_stop; bool kicked; bool kick_pending; pthread_mutex_t th_mu; pthread_cond_t th_cv;
     struct mw_purge { uint32_t tbl; uint64_t epoch; } *purge; int npurge, cappurge; pthread_mutex_t purge_mu;       // tables dropped since the last flush: the cells of the file older than the drop are dead, and deleted with the next batch
     uint64_t last_flush_ns; uint32_t sites_flushed;
     _Atomic uint64_t n_flushes, flushed_cells, flush_ns, flush_retries;
@@ -66,6 +66,11 @@ void     mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_
 #endif
 
 typedef struct { uint32_t tbl; uint8_t *pk; uint32_t pklen; bool drop; int n; mw_mcell *c; } fitem;       // a row to write to the file tables: its cells (drop: the file's other cells of the row go first)
+// the rows of a flush: the items, and the bytes they point to (keys and cells) in blocks of their own (a flush holds hundreds of thousands of rows: no allocation per row)
+typedef struct { fitem *v; int n, cap; uint8_t **blocks; int nblocks, capblocks; size_t used, blockcap; } fbatch;
+void *mw_fbatch_alloc (fbatch *b, size_t n);
+fitem *mw_fbatch_add (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t pklen, bool drop, int ncells);   // a new item with its key copied and room for ncells cells (c[ ] to be filled); NULL on memory failure
+void   mw_fbatch_free (fbatch *b);
 
 // ---- the shared-mode backend (multiwriter_mmeta.c) ----
 #define MW_NBUCKETS ((1u << 21) - 1)
@@ -84,7 +89,7 @@ int      mm_replay (struct mw_db *db, uint64_t epoch, const uint8_t *ext, uint32
 int      mm_ready (mw_meta *m);
 static inline int64_t mw_meta_origin (mw_meta *m);
 int      mm_flush (mw_meta *m);
-int      mm_collect (mw_meta *m, uint64_t F, uint64_t Fe, fitem **out, int *n);        // the rows whose newest state is in (F, V]: what the next flush writes
+int      mm_collect (mw_meta *m, uint64_t F, uint64_t Fe, fbatch *out);        // the rows whose newest state is in (F, V]: what the next flush writes
 
 // the offset between the epochs of this incarnation of the database and the db_versions of the cells
 #include "multiwriter_internal.h"

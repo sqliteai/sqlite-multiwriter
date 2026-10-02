@@ -211,8 +211,27 @@ int mw_meta_ready (mw_meta *m) {
 }
 
 // ---- flushing ----
-static int collect (mw_meta *m, uint64_t F, fitem **out, int *nout) {
-    int cap = 0, n = 0; fitem *v = NULL;
+void *mw_fbatch_alloc (fbatch *b, size_t n) {
+    n = (n + 7) & ~(size_t)7;
+    if (!b->nblocks || b->used + n > b->blockcap) {
+        size_t cap = n > (1u << 20) ? n : (1u << 20);
+        if (b->nblocks == b->capblocks) { int nc = b->capblocks ? b->capblocks * 2 : 16; uint8_t **nb = realloc(b->blocks, (size_t)nc * sizeof *nb); if (!nb) return NULL; b->blocks = nb; b->capblocks = nc; }
+        uint8_t *blk = malloc(cap); if (!blk) return NULL;
+        b->blocks[b->nblocks++] = blk; b->used = 0; b->blockcap = cap;
+    }
+    void *p = b->blocks[b->nblocks - 1] + b->used; b->used += n; return p;
+}
+fitem *mw_fbatch_add (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t pklen, bool drop, int ncells) {
+    if (b->n == b->cap) { int nc = b->cap ? b->cap * 2 : 1024; fitem *nv = realloc(b->v, (size_t)nc * sizeof *nv); if (!nv) return NULL; b->v = nv; b->cap = nc; }
+    uint8_t *k = mw_fbatch_alloc(b, pklen ? pklen : 1); mw_mcell *c = mw_fbatch_alloc(b, (size_t)(ncells ? ncells : 1) * sizeof(mw_mcell));
+    if (!k || !c) return NULL;
+    memcpy(k, pk, pklen);
+    fitem *it = &b->v[b->n++]; *it = (fitem){ tbl, k, pklen, drop, ncells, c };
+    return it;
+}
+void mw_fbatch_free (fbatch *b) { for (int i = 0; i < b->nblocks; i++) free(b->blocks[i]); free(b->blocks); free(b->v); memset(b, 0, sizeof *b); }
+
+static int collect (mw_meta *m, uint64_t F, fbatch *out) {
     for (int s = 0; s < STRIPES; s++) {
         stripe *st = &m->st[s];
         pthread_mutex_lock(&st->mu);
@@ -221,20 +240,13 @@ static int collect (mw_meta *m, uint64_t F, fitem **out, int *nout) {
             bool drop = e->drop_ver > F;
             e->fver = e->ver;
             if (!nc && !drop) continue;
-            if (n == cap) { cap = cap ? cap * 2 : 256; fitem *nv = realloc(v, (size_t)cap * sizeof *v); if (!nv) { pthread_mutex_unlock(&st->mu); goto fail; } v = nv; }
-            fitem *it = &v[n]; it->tbl = e->tbl; it->pklen = e->pklen; it->drop = drop; it->n = nc;
-            it->pk = malloc(e->pklen ? e->pklen : 1); it->c = malloc((size_t)(nc ? nc : 1) * sizeof(mw_mcell));
-            if (!it->pk || !it->c) { free(it->pk); free(it->c); pthread_mutex_unlock(&st->mu); goto fail; }
-            memcpy(it->pk, e->pk, e->pklen);
+            fitem *it = mw_fbatch_add(out, e->tbl, e->pk, e->pklen, drop, nc);
+            if (!it) { pthread_mutex_unlock(&st->mu); mw_fbatch_free(out); return -1; }
             int k = 0; for (int i = 0; i < e->n; i++) if (e->cells[i].dv > (int64_t)F) it->c[k++] = e->cells[i];
-            n++;
         }
         pthread_mutex_unlock(&st->mu);
     }
-    *out = v; *nout = n; return 0;
-fail:
-    for (int i = 0; i < n; i++) { free(v[i].pk); free(v[i].c); }
-    free(v); return -1;
+    return 0;
 }
 
 // the batch in the order of the table's key (table, then key bytes): inserts into the b-tree then walk it instead of jumping about. Sorting fitems directly chases a pointer per
@@ -346,8 +358,9 @@ static int flush_impl (mw_meta *m, bool wait) {
     if (!dirty && nsites <= sflushed && npurge == 0) goto out;
     if (!m->wr) m->wr = open_conn(m);
     if (!m->wr) { rc = SQLITE_CANTOPEN; goto out; }
-    fitem *v = NULL; int n = 0;
-    if ((sh ? mm_collect(m, F, Fe, &v, &n) : collect(m, F, &v, &n)) != 0) { rc = SQLITE_NOMEM; goto out; }
+    fbatch fb = {0};
+    if ((sh ? mm_collect(m, F, Fe, &fb) : collect(m, F, &fb)) != 0) { rc = SQLITE_NOMEM; goto out; }
+    fitem *v = fb.v; int n = fb.n;
     sort_items(v, n);
     uint64_t hw0 = sh ? atomic_load(&sh->dv_hwm) : atomic_load(&m->hwm);
     rc = SQLITE_OK;
@@ -362,8 +375,7 @@ static int flush_impl (mw_meta *m, bool wait) {
         if (last) break;
         i0 = i1;
     }
-    for (int i = 0; i < n; i++) { free(v[i].pk); free(v[i].c); }
-    free(v);
+    mw_fbatch_free(&fb);
     if (rc == SQLITE_OK) {
         if (sh) {
             atomic_store(&sh->sites_flushed, nsites); atomic_store(&sh->dv_hwm, m->new_hwm);
@@ -400,7 +412,8 @@ uint64_t mw_meta_epoch (mw_meta *m) { return m->shared ? atomic_load_explicit(&m
 uint64_t mw_meta_dirty (mw_meta *m) {
     if (!m->shared) return atomic_load(&m->ndirty);
     mw_shm *sh = m->db->shm;                                                   // dirty: a commit with metadata is newer than the last flush (the count is a measure for the flusher's pace only)
-    if (atomic_load(&sh->meta_last) <= atomic_load(&sh->meta_flushed)) return 0;
+    uint64_t F = atomic_load(&sh->meta_flushed), o = atomic_load(&sh->dv_origin);          // (the flushed point is a db_version, the newest commit with metadata an epoch)
+    if (atomic_load(&sh->meta_last) <= (F > o ? F - o : 0)) return 0;
     uint64_t d = atomic_load(&sh->meta_dirty); return d ? d : 1;
 }
 uint64_t mw_meta_flushed (mw_meta *m) { return m->shared ? atomic_load(&m->db->shm->meta_flushed) : atomic_load(&m->flushed); }
@@ -420,7 +433,7 @@ static void *flusher_main (void *arg) {
             struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_nsec += 100 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
             pthread_cond_timedwait(&m->th_cv, &m->th_mu, &until);
         }
-        bool stop = m->th_stop, kicked = m->kicked; m->kicked = false;
+        bool stop = m->th_stop, kicked = m->kicked; m->kicked = false; __atomic_store_n(&m->kick_pending, false, __ATOMIC_RELAXED);
         pthread_mutex_unlock(&m->th_mu);
         if (stop) break;
         uint64_t d;
@@ -434,8 +447,9 @@ static void *flusher_main (void *arg) {
 
 void mw_meta_kick (mw_meta *m) {
     if (!m->attached || !(m->shared ? atomic_load(&m->db->shm->meta_state) == 2 : atomic_load(&m->ready))) return;
+    if (m->th_running && __atomic_load_n(&m->kick_pending, __ATOMIC_RELAXED)) return;                    // (the thread has been asked already and has not looked yet: nothing to add)
     pthread_mutex_lock(&m->th_mu);
-    m->kicked = true;
+    m->kicked = true; __atomic_store_n(&m->kick_pending, true, __ATOMIC_RELAXED);
     if (!m->th_running && !m->th_stop) { if (pthread_create(&m->th, NULL, flusher_main, m) == 0) m->th_running = true; }
     pthread_cond_signal(&m->th_cv);
     pthread_mutex_unlock(&m->th_mu);

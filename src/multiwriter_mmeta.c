@@ -191,7 +191,7 @@ int mm_ready (mw_meta *m) {
         uint64_t F = 0, hwm = 0; uint32_t flushed_sites = 0; uint8_t own[16]; bool have_own = false;
         mw_metafile_load_state(m, &F, &hwm, &flushed_sites, &have_own, own);
         atomic_store(&sh->dv_origin, hwm); atomic_store(&sh->dv_hwm, hwm);
-        if (!have_own) arc4random_buf(own, 16);
+        if (!have_own) sqlite3_randomness(16, own);
         mm_site_install_db(m->db, 0, own);
         if (!have_own) { /* a fresh id: it is written with the first flush */ }
         atomic_store(&sh->sites_flushed, flushed_sites);
@@ -204,30 +204,44 @@ int mm_ready (mw_meta *m) {
     return 0;
 }
 
-typedef struct { mw_meta *m; uint64_t F; fitem *v; int n, cap; int err; } col_ctx;
+// The flush reads every dirty bucket once: the group is parsed in place into buffers that live for the whole scan (no allocation per bucket).
+typedef struct { mw_meta *m; uint64_t F; fbatch *out; int err; uint8_t *raw; size_t rawcap; mw_mcell *cells; int ccap; } col_ctx;
 static void col_cb (void *arg, uint32_t bucket, uint64_t epoch, uint64_t loc) {
-    col_ctx *c = arg; mm_group g; (void)bucket;
+    col_ctx *c = arg; mw_db *db = c->m->db; (void)bucket;
     if (c->err) return;
-    if (!read_group(c->m, loc, epoch, bucket, &g)) { c->err = 1; return; }                     // (a segment that is gone held a state older than the base: it is in the file)
-    for (int i = 0; i < g.n; i++) {
-        const mm_row *r = &g.rows[i]; int nc = 0; bool has_sentinel = false;
-        for (int k = 0; k < r->n; k++) { if (r->c[k].col == CRDT_COL_SENTINEL) has_sentinel = true; if (r->c[k].dv > (int64_t)c->F) nc++; }
-        if (!nc) continue;
-        bool drop = has_sentinel;                                                              // a row that was ever deleted: its cells in the file may be stale ones: rewrite them all
-        if (drop) { nc = r->n; }
-        if (c->n == c->cap) { c->cap = c->cap ? c->cap * 2 : 256; fitem *nv = realloc(c->v, (size_t)c->cap * sizeof *nv); if (!nv) { c->err = 1; break; } c->v = nv; }
-        fitem *it = &c->v[c->n]; it->tbl = r->tbl; it->pklen = r->pklen; it->drop = drop; it->n = nc;
-        it->pk = malloc(r->pklen ? r->pklen : 1); it->c = malloc((size_t)(nc ? nc : 1) * sizeof(mw_mcell));
-        if (!it->pk || !it->c) { free(it->pk); free(it->c); c->err = 1; break; }
-        memcpy(it->pk, r->pk, r->pklen);
-        int k2 = 0; for (int k = 0; k < r->n; k++) if (drop || r->c[k].dv > (int64_t)c->F) it->c[k2++] = r->c[k];
-        c->n++;
+    const uint64_t dvres = epoch + (uint64_t)mw_meta_origin(c->m);
+    uint8_t hb[5]; if (!mw_seglog_read(db, loc, 0, 5, hb)) { c->err = 1; return; }          // (a segment that is gone held a state older than the base: it is in the file; but the scan only meets versions newer than the flushed point)
+    const uint8_t *p = hb; uint64_t glen; if (rv(&p, hb + 5, &glen) || glen > (64u << 20)) { c->err = 1; return; }
+    size_t hl = (size_t)(p - hb), total = hl + (size_t)glen;
+    if (total > c->rawcap) { uint8_t *nr = realloc(c->raw, total + 256); if (!nr) { c->err = 1; return; } c->raw = nr; c->rawcap = total + 256; }
+    if (!mw_seglog_read(db, loc, 0, (uint32_t)total, c->raw)) { c->err = 1; return; }
+    const uint8_t *q = c->raw + hl, *end = c->raw + total; uint64_t bk, nrows;
+    if (rv(&q, end, &bk) || rv(&q, end, &nrows)) { c->err = 1; return; }
+    for (uint64_t i = 0; i < nrows; i++) {
+        uint64_t tbl, pklen, nc;
+        if (rv(&q, end, &tbl) || rv(&q, end, &pklen) || q + pklen > end) { c->err = 1; return; }
+        const uint8_t *pk = q; q += pklen;
+        if (rv(&q, end, &nc) || nc > (1u << 20)) { c->err = 1; return; }
+        if ((int)nc > c->ccap) { int cc = (int)nc * 2 + 8; mw_mcell *nm = realloc(c->cells, (size_t)cc * sizeof *nm); if (!nm) { c->err = 1; return; } c->cells = nm; c->ccap = cc; }
+        for (uint64_t k = 0; k < nc; k++) {
+            uint64_t col, cv, dvp, site, seq;
+            if (rv(&q, end, &col) || rv(&q, end, &cv) || rv(&q, end, &dvp) || rv(&q, end, &site) || rv(&q, end, &seq)) { c->err = 1; return; }
+            c->cells[k] = (mw_mcell){ (int64_t)cv, dvp ? (int64_t)(dvp - 1) : (int64_t)dvres, (uint32_t)col, (uint32_t)site, (uint32_t)seq };
+        }
+        int n = purge_filter(db, (uint32_t)tbl, c->cells, (int)nc);
+        int dirtyc = 0; bool sen = false;
+        for (int k = 0; k < n; k++) { if (c->cells[k].col == CRDT_COL_SENTINEL) sen = true; if (c->cells[k].dv > (int64_t)c->F) dirtyc++; }
+        if (!dirtyc) continue;
+        bool drop = sen;                                                                       // a row that was ever deleted: its cells in the file may be stale ones: rewrite them all
+        fitem *it = mw_fbatch_add(c->out, (uint32_t)tbl, pk, (uint32_t)pklen, drop, drop ? n : dirtyc);
+        if (!it) { c->err = 1; return; }
+        int k2 = 0; for (int k = 0; k < n; k++) if (drop || c->cells[k].dv > (int64_t)c->F) it->c[k2++] = c->cells[k];
     }
-    mm_group_free(&g);
 }
-int mm_collect (mw_meta *m, uint64_t F, uint64_t Fe, fitem **out, int *n) {
-    col_ctx c = { m, F, NULL, 0, 0, 0 };
-    shidx_scan(m->db->rx, Fe, UINT64_MAX, col_cb, &c);                  // (the newest state of every bucket changed since F, whatever its epoch: it holds the older ones)
-    if (c.err) { for (int i = 0; i < c.n; i++) { free(c.v[i].pk); free(c.v[i].c); } free(c.v); return -1; }
-    *out = c.v; *n = c.n; return 0;
+int mm_collect (mw_meta *m, uint64_t F, uint64_t Fe, fbatch *out) {
+    col_ctx c = { m, F, out, 0, NULL, 0, NULL, 0 };
+    shidx_scan(m->db->rx, Fe, UINT64_MAX, col_cb, &c);                          // (the newest state of every bucket changed since F, whatever its epoch: it holds the older ones)
+    free(c.raw); free(c.cells);
+    if (c.err) { mw_fbatch_free(out); return -1; }
+    return 0;
 }

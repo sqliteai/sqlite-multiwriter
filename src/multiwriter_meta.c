@@ -52,7 +52,7 @@ mw_meta *mw_meta_new (struct mw_db *db) {
     for (int i = 0; i < MW_RDN; i++) pthread_mutex_init(&m->rdmu[i], NULL);
     m->capsites = 16; m->sites = calloc(m->capsites, 16); m->nsites = 1;
     if (!m->sites) { mw_meta_free(m); return NULL; }
-    if (!m->shared) { arc4random_buf(m->sites[0], 16); m->bloom = calloc((1u << 23) / 64, sizeof(uint64_t)); }             // this database's own id: replaced by the one in the file when it has one (shared mode: it is in the shared header)
+    if (!m->shared) { sqlite3_randomness(16, m->sites[0]); m->bloom = calloc((1u << 23) / 64, sizeof(uint64_t)); }             // this database's own id: replaced by the one in the file when it has one (shared mode: it is in the shared header)
     return m;
 }
 
@@ -208,6 +208,8 @@ void mw_ovl_clear (mw_ovl *o) {
     o->nbk = 0; o->ng = 0; if (o->bkh) memset(o->bkh, 0xff, (size_t)o->bkhcap * sizeof(int));
     o->npurge = 0;
     o->n = 0; if (o->hash) memset(o->hash, 0xff, (size_t)o->hcap * sizeof(int));
+    if (o->cap > 65536) { free(o->rows); o->rows = NULL; o->cap = 0; free(o->hash); o->hash = NULL; o->hcap = 0; }             // (a bulk load must not leave its tables behind)
+    if (o->capbk > 65536) { free(o->bk); o->bk = NULL; o->capbk = 0; free(o->bkh); o->bkh = NULL; o->bkhcap = 0; }
 }
 void mw_ovl_free (mw_ovl *o) { if (!o) return; mw_ovl_clear(o); free(o->purge); free(o->bk); free(o->bkh); free(o->gbucket); free(o->goff); free(o->gseen); free(o->rows); free(o->hash); free(o); }
 void mw_ovl_set_value_fn (mw_ovl *o, mw_value_fn fn, void *arg) { o->vfn = fn; o->varg = arg; }

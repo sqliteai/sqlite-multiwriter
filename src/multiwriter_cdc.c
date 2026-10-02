@@ -29,7 +29,7 @@ typedef struct {
     _Atomic uint32_t *ovo;                               // overflow page -> the leaf (or index) page holding the cell whose record spills into it
     bool ovfl_complete;                                  // ovo covers every record with overflow of the database (built by a scan on the first overflow page written without its cell)
     mw_cat *cat; uint32_t cookie; bool built;
-    mw_meta *meta; bool ready;  // the CRDT metadata; ready once the extensions found in the log at recovery are applied
+    mw_meta *meta; _Atomic bool ready;  // the CRDT metadata; ready once the extensions found in the log at recovery are applied
     mw_cdc_sink_fn sink; void *sink_arg;                  // tests: every commit's changes
     _Atomic uint64_t commits, changes, unowned, builds, ovfl_scans, ovfl_unattributed, ns_prepare, ns_build;
 } mw_cdc;

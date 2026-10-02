@@ -75,8 +75,7 @@ int mw_metafile_load (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw
     pthread_mutex_lock(&m->rdmu[slot]);
 locked:
     if (!m->rd[slot]) m->rd[slot] = open_conn(m);
-    if (m->rd[slot] && !m->rds[slot]) { int prc = sqlite3_prepare_v2(m->rd[slot], "SELECT col, cv, dv, seq, site FROM mw_cells WHERE tbl = ?1 AND pk = ?2", -1, &m->rds[slot], NULL); if (prc != SQLITE_OK && getenv("MW_MM_DEBUG")) fprintf(stderr, "metafile: prepare failed: %d %s\n", prc, sqlite3_errmsg(m->rd[slot])); }
-    if (!m->rd[slot] && getenv("MW_MM_DEBUG")) fprintf(stderr, "metafile: cannot open a reader connection\n");
+    if (m->rd[slot] && !m->rds[slot]) sqlite3_prepare_v2(m->rd[slot], "SELECT col, cv, dv, seq, site FROM mw_cells WHERE tbl = ?1 AND pk = ?2", -1, &m->rds[slot], NULL);
     int rc = 0;                                                                 // (no table yet, or a statement that cannot be prepared: the row is not in the file)
     if (m->rds[slot]) {
         sqlite3_stmt *st = m->rds[slot];

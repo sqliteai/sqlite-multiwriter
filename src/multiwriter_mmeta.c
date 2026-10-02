@@ -112,9 +112,8 @@ static bool read_group (mw_meta *m, uint64_t loc, uint64_t epoch, uint32_t bucke
 int mm_head (mw_meta *m, uint32_t bucket, mm_group *g) {
     memset(g, 0, sizeof *g);
     uint64_t ep, loc;
-    if (getenv("MW_MM_BUCKET") && (uint32_t)atoi(getenv("MW_MM_BUCKET")) == bucket) fprintf(stderr, "head read: bucket %u head_epoch %llu\n", bucket, (unsigned long long)shidx_head_epoch(m->db->rx, bucket));
-    if (!shidx_lookup(m->db->rx, bucket, UINT64_MAX, &ep, &loc)) { if (getenv("MW_MM_DEBUG3")) { uint64_t he = shidx_head_epoch(m->db->rx, bucket); if (he) fprintf(stderr, "mm_head: lookup missed bucket %u but head epoch is %llu\n", bucket, (unsigned long long)he); } return 0; }
-    if (!read_group(m, loc, ep, bucket, g)) { if (getenv("MW_MM_DEBUG")) fprintf(stderr, "mm_head: bucket %u version epoch %llu at %llx unreadable (base %llu flushed %llu)\n", bucket, (unsigned long long)ep, (unsigned long long)loc, (unsigned long long)atomic_load(&m->db->shm->base_epoch), (unsigned long long)atomic_load(&m->db->shm->meta_flushed)); memset(g, 0, sizeof *g); return 0; }
+    if (!shidx_lookup(m->db->rx, bucket, UINT64_MAX, &ep, &loc)) return 0;
+    if (!read_group(m, loc, ep, bucket, g)) { memset(g, 0, sizeof *g); g->epoch = ep; return 0; }     // (unreadable: its segment is gone, so it is older than the base and its rows are in the file; the epoch is still the one the transaction read)
     return 0;
 }
 
@@ -143,8 +142,7 @@ int mm_install (mw_db *db, mw_lane *lane, uint64_t epoch, uint64_t ext_loc) {
         if (!locs) return SQLITE_NOMEM;
         for (int i = 0; i < ng; i++) locs[i] = MW_LOC(MW_LOC_SEG(ext_loc), MW_LOC_OFF(ext_loc) + lane->cdc_goff[i]);
         int rc = shidx_install(db->rx, epoch, 0, ng, lane->cdc_gbucket, locs);
-        if (getenv("MW_MM_BUCKET")) { uint32_t want = (uint32_t)atoi(getenv("MW_MM_BUCKET")); for (int i = 0; i < ng; i++) if (lane->cdc_gbucket[i] == want) fprintf(stderr, "install: bucket %u epoch %llu rc %d head_now %llu\n", want, (unsigned long long)epoch, rc, (unsigned long long)shidx_head_epoch(db->rx, want)); }
-        if (ng > 16) free(locs);
+            if (ng > 16) free(locs);
         if (rc != 0) return SQLITE_FULL;
         if (atomic_fetch_add(&sh->meta_dirty, (uint64_t)ng) + (uint64_t)ng >= 2048) mw_cdc_kick_flush(db);
     }

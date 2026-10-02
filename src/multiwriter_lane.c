@@ -493,7 +493,7 @@ static int lm_file_control (sqlite3_file *pf, int op, void *arg) {
     if (op == MW_FCNTL_LANE_PTR) { *(void **)arg = lane; return SQLITE_OK; }
     if (op == MW_FCNTL_GATE) { if (*(int *)arg) mw_gate_close(lane->db, lane); else mw_gate_open(lane->db); return SQLITE_OK; }
     if (op == MW_FCNTL_DECLARE) { lane->cdc_decl = arg; return SQLITE_OK; }
-    if (op == MW_FCNTL_VACUUM_BEGIN) { lane->cdc_vacuum = true; return SQLITE_OK; }
+    if (op == MW_FCNTL_VACUUM_BEGIN) { lane->cdc_vacuum = arg ? *(int *)arg != 0 : true; return SQLITE_OK; }       // (an int 0 clears it: the statement is over)
     if (op == MW_FCNTL_META) { *(void **)arg = mw_cdc_meta(lane->db); return *(void **)arg ? SQLITE_OK : SQLITE_NOTFOUND; }
     if (op == MW_FCNTL_CDC_SINK) return mw_cdc_set_public_sink(lane->db, (const mw_capture_sink *)arg);
     if (op == MW_FCNTL_GC) { *(uint64_t *)arg = mw_db_gc(lane->db); return SQLITE_OK; }

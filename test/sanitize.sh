@@ -1,38 +1,39 @@
 #!/bin/bash
-# Builds the Multi-Writer tests and the benchmark with a sanitizer and runs them.
-# usage: test/multiwriter/sanitize.sh <asan|ubsan|tsan> [test ...]      (run from the repository root; macOS arm64 flags as in the Makefile)
-# asan: memory errors; ubsan: undefined behaviour, misaligned access, signed overflow; tsan: data races (races inside the sqlite-sync core, the benchmark harness and
-# the test programs themselves are reported too: read the first frames, only the multiwriter_*.c ones concern the engine).
+# Builds tests with a sanitizer and runs them.
+#   test/sanitize.sh asan|ubsan|tsan [test ...]        (from the repository root)
+# asan: memory errors; ubsan: undefined behaviour; tsan: data races (SQLite itself and the test programs are reported too: read the first frames,
+# only the multiwriter_*.c ones concern the engine). Default tests: the metadata ones. Oracle tests (oracle_*) link sqlite-sync's sources too.
 set -e
 KIND=${1:-asan}; shift || true
 case $KIND in
   asan)  SAN="-fsanitize=address";;
-  ubsan) if gcc --version 2>&1 | grep -qi clang; then SAN="-fsanitize=undefined,alignment,integer -fno-sanitize=unsigned-integer-overflow,unsigned-shift-base,implicit-conversion -fno-sanitize-recover=undefined"
-         else SAN="-fsanitize=undefined -fno-sanitize-recover=undefined"; fi;;     # (GNU gcc, Linux: no "integer" group)
+  ubsan) SAN="-fsanitize=undefined,alignment,integer -fno-sanitize=unsigned-integer-overflow,unsigned-shift-base,implicit-conversion -fno-sanitize-recover=undefined";;
   tsan)  SAN="-fsanitize=thread";;
   *) echo "usage: $0 asan|ubsan|tsan [tests]"; exit 2;;
 esac
-OUT=build/$KIND; BIN=dist/$KIND; mkdir -p $OUT $BIN
-ARCH=$(uname -m); [ "$ARCH" = arm64 ] && ARCHF="-arch arm64" || ARCHF=""
-INC="-Isrc -Isrc/sqlite -Isrc/postgresql -Isrc/network -Isqlite -Icurl/include -Imodules/fractional-indexing -Isrc/multiwriter"
-DEFS="-DCLOUDSYNC_MULTIWRITER -DSQLITE_ENABLE_PREUPDATE_HOOK -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"
-CF="$INC $DEFS -O1 -g $SAN -fno-omit-frame-pointer $ARCHF -DSQLITE_CORE -DCLOUDSYNC_UNITTEST -DCLOUDSYNC_OMIT_NETWORK -DCLOUDSYNC_OMIT_PRINT_RESULT"
-for f in src/multiwriter/multiwriter_*.c src/cloudsync.c src/dbutils.c src/lz4.c src/pk.c src/utils.c src/network.c src/block.c \
-         src/sqlite/cloudsync_changes_sqlite.c src/sqlite/cloudsync_sqlite.c src/sqlite/database_sqlite.c src/sqlite/sql_sqlite.c modules/fractional-indexing/fractional_indexing.c; do
-  [ -f $f ] && gcc -w $CF -c $f -o $OUT/$(basename $f .c).o
-done
-gcc -w -O1 -g $SAN $ARCHF $INC $DEFS -DSQLITE_EXTRA_INIT=mw_extra_init -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DSQLITE_DQS=0 -DSQLITE_CORE -c sqlite/sqlite3.c -o $OUT/sqlite3.o
-TESTS=${@:-"mw_lanes mw_reloc mw_stagedlog mw_compact mw_durability mw_structural mw_rebase mw_multiproc mw_shidx mw_shared bench/mw_bench"}
-LIBS=$(ls $OUT/*.o | grep -v "/mw_")
+OUT=build/$KIND; BIN=dist/$KIND; mkdir -p $OUT/oracle $BIN
+SS=deps/sqlite-sync
+CF="-O1 -g $SAN -fno-omit-frame-pointer -Isrc -Isrc/crdt -I$SS/sqlite -I$SS/src -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"
+for f in src/*.c src/crdt/*.c; do cc -w $CF -c $f -o $OUT/$(basename $f .c).o; done
+cc -w -O1 -g $SAN -fno-omit-frame-pointer -I$SS/sqlite -DSQLITE_EXTRA_INIT=mw_extra_init -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DSQLITE_CORE -c $SS/sqlite/sqlite3.c -o $OUT/sqlite3.o
+cc -w -O1 -g $SAN -c $SS/src/lz4.c -o $OUT/lz4.o
+OCF="-O1 -g $SAN -w -I$SS/src -I$SS/src/sqlite -I$SS/src/network -I$SS/modules/fractional-indexing -I$SS/sqlite -DSQLITE_CORE -DCLOUDSYNC_OMIT_NETWORK -DCLOUDSYNC_OMIT_PRINT_RESULT"
+NEED_ORACLE=0
+TESTS=${@:-"mw_metastore mw_ddl_meta mw_mpmeta mw_sync mw_capture mw_rowdiff oracle_meta oracle_sync oracle_features"}
+for t in $TESTS; do case $t in oracle_*) NEED_ORACLE=1;; esac; done
+if [ $NEED_ORACLE = 1 ]; then
+  for f in $SS/src/cloudsync.c $SS/src/dbutils.c $SS/src/pk.c $SS/src/utils.c $SS/src/block.c $SS/src/network/network.c \
+           $SS/src/sqlite/cloudsync_changes_sqlite.c $SS/src/sqlite/cloudsync_sqlite.c $SS/src/sqlite/database_sqlite.c $SS/src/sqlite/sql_sqlite.c $SS/modules/fractional-indexing/fractional_indexing.c; do
+    cc $OCF -c $f -o $OUT/oracle/$(basename $f .c).o
+  done
+fi
+LIBS=$(ls $OUT/*.o | grep -v "/t_")
 EXTRA=""; [ "$(uname)" = Darwin ] && EXTRA="-framework Security"
 for t in $TESTS; do
-  src=test/multiwriter/$t.c; b=$(basename $t)
-  gcc -w $CF -c $src -o $OUT/$b.o && gcc $OUT/$b.o $LIBS -o $BIN/$b $EXTRA $SAN -lm
+  b=$(basename $t)
+  cc -w $CF -c test/$t.c -o $OUT/t_$b.o
+  case $t in oracle_*) OBJ="$OUT/oracle/*.o";; *) OBJ="";; esac
+  cc $OUT/t_$b.o $LIBS $OBJ -o $BIN/$b $EXTRA $SAN -lpthread -lm
+  echo "== $KIND: $t"
+  ./$BIN/$b 2>&1 | tail -${TAIL:-6}
 done
-for t in $TESTS; do b=$(basename $t); [ "$b" = mw_bench ] && continue
-  ASAN_OPTIONS=detect_leaks=0 TSAN_OPTIONS=halt_on_error=0:detect_deadlocks=0 UBSAN_OPTIONS=print_stacktrace=1 $BIN/$b > $OUT/$b.log 2>&1 && st=ok || st="exit $?"
-  echo "$b: $st, reports: $(grep -c -E 'ERROR: AddressSanitizer|WARNING: ThreadSanitizer|runtime error' $OUT/$b.log)"
-done
-if [ -x $BIN/mw_bench ]; then for w in bulk independent hot samepage mixed; do
-  TSAN_OPTIONS=halt_on_error=0:detect_deadlocks=0 UBSAN_OPTIONS=print_stacktrace=1 $BIN/mw_bench --mode multiwriter --workload $w --agents 8 --duration 3 --warmup 1 --retry 1000 --sync full > $OUT/bench_$w.log 2>&1 && st=ok || st="exit $?"
-  echo "mw_bench $w: $st, reports: $(grep -c -E 'ERROR: AddressSanitizer|WARNING: ThreadSanitizer|runtime error' $OUT/bench_$w.log)"; done; fi

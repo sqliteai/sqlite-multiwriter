@@ -181,8 +181,11 @@ static void build_ovfl (mw_cdc *c, mw_lane *lane, const mw_cat *cat) {
     ovfl_set(lane->db, c, true); atomic_fetch_add(&c->ovfl_scans, 1);
 }
 
-static uint32_t cookie_of (mw_lane *lane) {
-    uint8_t *p1 = malloc((size_t)lane->db->store->pgsz); uint32_t k = 0;
+static uint32_t cookie_of (mw_lane *lane) {                                 // the schema cookie of the lane's snapshot: 4 bytes of page 1
+    uint8_t b[4]; mw_store *st = lane->db->store;
+    if (lane->cdc_over) { for (int i = 0; i < lane->ws_n; i++) if (lane->ws_pgnos[i] == 1) return be32(lane->cdc_over[i] + 40); }
+    if (lane->dsz_val >= 1 && mw_store_read(st, 1, lane->tx.snapshot_epoch, 40, 4, b)) return be32(b);
+    uint8_t *p1 = malloc((size_t)st->pgsz); uint32_t k = 0;
     if (p1 && mw_rd_snap_page(lane, 1, p1)) k = be32(p1 + 40);
     free(p1); return k;
 }
@@ -253,6 +256,7 @@ static void plan_ddl (const mw_cat *oc, const mw_cat *nc, ddl_plan *pl) {
 void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
     mw_cdc *c = lane->db->cdc; uint64_t t0 = now_ns();
     mw_rd_result_free(&lane->cdc_res); lane->cdc_nfreed = 0;
+    mw_cat_free(lane->cdc_cat); lane->cdc_cat = NULL;                           // (a retried commit prepares again: the catalog of the earlier attempt goes)
     mw_cat *cat = catalog_for(c, lane), *newcat = NULL;
     lane->cdc_ng = 0;
     free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
@@ -265,7 +269,7 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
     }
     free(plan.skip);                                                            // (set below for VACUUM)
     plan.skip = NULL; plan.nskip = 0;
-    if (lane->cdc_vacuum) { lane->cdc_vacuum = false; plan.skip = calloc((size_t)(cat->n + 1), sizeof *plan.skip); if (plan.skip) for (int i = 0; i < cat->n; i++) plan.skip[plan.nskip++] = cat->tabs[i].name; }       // VACUUM: every table is rebuilt with the same rows
+    if (lane->cdc_vacuum && newcat) { plan.skip = calloc((size_t)(cat->n + 1), sizeof *plan.skip); if (plan.skip) for (int i = 0; i < cat->n; i++) plan.skip[plan.nskip++] = cat->tabs[i].name; }       // VACUUM: every table is rebuilt with the same rows
     mw_rd_owner own = { c, old_owner, ovfl_owner, newcat ? newcat : cat, newcat ? cat : NULL, NULL, 0 };
     lane->cdc_skip = plan.skip; lane->cdc_nskip = plan.nskip; lane->cdc_skip_old = plan.skip_old; lane->cdc_nskip_old = plan.nskip_old;
     mw_rowdiff_compute(lane, imgs, &own, &lane->cdc_res);

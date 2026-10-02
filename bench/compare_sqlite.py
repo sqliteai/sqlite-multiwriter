@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """Multi-Writer vs stock SQLite (WAL, synchronous=FULL), bulk inserts of 100 rows per transaction, every run on a fresh database.
 usage: compare_sqlite.py threads|procs <out.jsonl> [duration] [points...]
-Variants: mw (Multi-Writer, the default multi-process mode), sqlite (stock WAL, busy_timeout 60 s: the library waits inside the call, the application sees no
+Variants: mw (Multi-Writer with the CRDT capture on: every table tracked; the shared multi-process mode for processes), mw0 (the same engine without the capture), sqlite (stock WAL, busy_timeout 60 s: the library waits inside the call, the application sees no
 retry), sqlite0 (stock WAL, busy_timeout 0: the application retries a refused transaction with jittered backoff, retries are counted).
 Measures per run: tx/s, retries, transactions that gave up, the time a transaction waits before its write may start (first attempt -> BEGIN IMMEDIATE + first
 read done: for SQLite that is the write lock, for Multi-Writer the admission), latency, memory (per-process RSS; for processes also the system-wide growth of
 anonymous+wired+compressed memory while the run is going, which does not count shared file mappings N times)."""
 import glob, json, os, re, subprocess, sys, tempfile, time
 
-BIN = os.environ.get("BIN", "dist/mw/mw_bench")
+BIN = os.environ.get("BIN", "dist/mw_bench")
 kind, out = sys.argv[1], sys.argv[2]
 DUR = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 points = [int(x) for x in sys.argv[4:]] or ([1, 2, 4, 8, 16, 32, 64] if kind == "threads" else [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000])
-VARIANTS = {"mw": ("multiwriter", []), "sqlite": ("stock-wal", []), "sqlite0": ("stock-wal", ["--busy-ms", "0"])}
+VARIANTS = {"mw": ("multiwriter", ["--tracked", "1"]), "mw0": ("multiwriter", ["--tracked", "0"]), "sqlite": ("stock-wal", []), "sqlite0": ("stock-wal", ["--busy-ms", "0"])}
+ONLY = os.environ.get("VARIANTS", "mw,mw0,sqlite,sqlite0").split(",")
 
 def vm():
     if os.path.exists("/proc/meminfo"):                      # Linux: memory in use that is not reclaimable cache
@@ -71,7 +72,7 @@ def run(variant, n):
 
 with open(out, "a") as fo:
     for n in points:
-        for variant in ("mw", "sqlite", "sqlite0"):
+        for variant in ONLY:
             r = run(variant, n); fo.write(json.dumps(r) + "\n"); fo.flush()
             print(json.dumps({k: (round(v, 1) if isinstance(v, float) else v) for k, v in r.items()}), flush=True)
             time.sleep(4)

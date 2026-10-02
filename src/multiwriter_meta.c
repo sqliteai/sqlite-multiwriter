@@ -239,8 +239,6 @@ static orow *ovl_row (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen, boo
             memcpy(r->c, g->rows[q].c, (size_t)r->n * sizeof(mw_mcell)); found = true;
         }
         if (!found && file_load(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) { free(r->pk); return NULL; }
-        if (getenv("MW_MM_DEBUG2") && pklen == 3 && ((const uint8_t *)pk)[2] == 0x1a) { int ncv = -1; long long dvv = -1; for (int q = 0; q < r->n; q++) if (r->c[q].col != 0xFFFFFFFFu) { ncv = (int)r->c[q].cv; dvv = r->c[q].dv; break; } fprintf(stderr, "row26 load: found_in_head=%d head_epoch=%llu head_rows=%d cells=%d cv=%d dv=%lld flushed=%llu\n", found, (unsigned long long)o->bk[bi].g.epoch, o->bk[bi].g.n, r->n, ncv, dvv, (unsigned long long)atomic_load(&o->m->db->shm->meta_flushed)); }
-        if (getenv("MW_MM_DEBUG") && !found) fprintf(stderr, "ovl_row: tbl %08x pk %02x%02x bucket %u: head rows %d, found in head %d, file cells %d\n", tbl, ((const uint8_t *)pk)[0], pklen > 1 ? ((const uint8_t *)pk)[1] : 0, b, o->bk[bi].g.n, found, r->n);
     } else if (load_row(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) { free(r->pk); return NULL; }
     r->cap = r->n;
     o->hash[j] = o->n++;

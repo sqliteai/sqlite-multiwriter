@@ -404,6 +404,8 @@ int mw_seglog_append (mw_db *db, uint64_t epoch, uint32_t dbsize, int n, const u
         if (!m) return SQLITE_CANTOPEN;
         if (off + size > m->len) { map_release(m); return SQLITE_FULL; }
     }
+    atomic_store_explicit(&sh->pend_seg, seg, memory_order_relaxed); atomic_store_explicit(&sh->pend_off, off, memory_order_relaxed);
+    atomic_store_explicit(&sh->pend_epoch, epoch, memory_order_release);                 // (a publisher that dies from here until it has published is finished or undone by whoever takes the lock after it)
     size_t pgsz = sl->pgsz;
     uint8_t *p = m->base + off + REC_HDR_SIZE;
     for (int i = 0; i < n; i++) {                                                  // body first, header (with the magic) last: an unfinished record does not validate
@@ -534,6 +536,37 @@ bool mw_seglog_read (mw_db *db, uint64_t loc, uint32_t off, uint32_t n, void *ds
     memcpy(dst, m->base + at, n);
     map_release(m);
     return true;
+}
+
+// A record at (seg, off), if it is complete and valid. Used to finish or discard what a publisher that died inside the publication lock left behind.
+int mw_seglog_peek (mw_db *db, uint32_t seg, uint64_t off, uint64_t *epoch, uint32_t *dbsize, int *n, uint32_t **pgnos, uint64_t **locs, uint32_t *ext_len, uint64_t *ext_loc, uint64_t *size) {
+    mw_seglog *sl = db->sl; int rc = SQLITE_NOTFOUND;
+    segmap *m = map_acquire(sl, seg); if (!m) return SQLITE_NOTFOUND;
+    rec_hdr r;
+    if (off + REC_HDR_SIZE > m->len) goto out;
+    memcpy(&r, m->base + off, sizeof r);
+    if (r.magic != REC_MAGIC || r.pgsz != sl->pgsz || r.npages == 0 || r.npages > (1u << 24)) goto out;
+    size_t body = (size_t)r.npages * (4 + (size_t)sl->pgsz) + r.ext_len;
+    if (off + REC_HDR_SIZE + body > m->len) goto out;
+    if (r.cksum != rec_cksum(sl->salt, &r, m->base + off + REC_HDR_SIZE, body)) goto out;
+    uint32_t *pg = malloc((size_t)r.npages * sizeof *pg); uint64_t *lc = malloc((size_t)r.npages * sizeof *lc);
+    if (!pg || !lc) { free(pg); free(lc); rc = SQLITE_NOMEM; goto out; }
+    for (uint32_t k = 0; k < r.npages; k++) {
+        const uint8_t *e = m->base + off + REC_HDR_SIZE + (size_t)k * (4 + sl->pgsz);
+        memcpy(&pg[k], e, 4); lc[k] = MW_LOC(seg, (uint64_t)(e - m->base) + 4);
+    }
+    *epoch = r.epoch; *dbsize = r.dbsize; *n = (int)r.npages; *pgnos = pg; *locs = lc; *ext_len = r.ext_len;
+    *ext_loc = MW_LOC(seg, off + REC_HDR_SIZE + (uint64_t)r.npages * (4 + sl->pgsz)); *size = REC_HDR_SIZE + body;
+    rc = SQLITE_OK;
+out:
+    map_release(m);
+    return rc;
+}
+// Forgets a record that was started and not finished (the header is cleared so that a recovery cannot take it for a commit).
+void mw_seglog_discard (mw_db *db, uint32_t seg, uint64_t off) {
+    segmap *m = map_acquire(db->sl, seg); if (!m) return;
+    if (off + REC_HDR_SIZE <= m->len) memset(m->base + off, 0, REC_HDR_SIZE);
+    map_release(m);
 }
 
 // MARK: - maintenance -

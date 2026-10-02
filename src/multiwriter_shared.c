@@ -145,6 +145,43 @@ void mw_shared_close (mw_db *db, bool sole) {
     if (ixp) { shidx_unlink(ixp); sqlite3_free(ixp); char *rxp = sqlite3_mprintf("%s-mwrow", db->path); if (rxp) { shidx_unlink(rxp); sqlite3_free(rxp); } mw_cdc_shared_unlink(db); }
 }
 
+// MARK: - a publisher died inside the publication lock -
+// The lock is taken from a process that is gone. If it had appended its record and not yet made the commit visible, the record is complete (finish the commit: install its pages, its
+// metadata, publish) or torn (undo: the cursor goes back, the header is cleared). Either way nobody else saw the commit, and the log has exactly one record for every epoch.
+void mw_shared_repair (mw_db *db) {
+    mw_shm *sh = db->shm;
+    uint64_t pe = atomic_load_explicit(&sh->pend_epoch, memory_order_acquire);
+    if (!pe) return;
+    uint64_t committed = atomic_load(&sh->committed_epoch);
+    uint32_t seg = atomic_load(&sh->pend_seg); uint64_t off = atomic_load(&sh->pend_off);
+    if (pe != committed + 1) { atomic_store(&sh->pend_epoch, 0); return; }                         // (it did get visible: nothing to do)
+    uint64_t epoch = 0, size = 0, ext_loc = 0; uint32_t dbsize = 0, ext_len = 0; int n = 0; uint32_t *pgnos = NULL; uint64_t *locs = NULL;
+    int rc = mw_seglog_peek(db, seg, off, &epoch, &dbsize, &n, &pgnos, &locs, &ext_len, &ext_loc, &size);
+    if (rc != SQLITE_OK || epoch != pe) {                                                         // torn or never written: undo
+        mw_seglog_discard(db, seg, off);
+        atomic_store(&sh->sl_seg, seg); atomic_store_explicit(&sh->sl_end, off, memory_order_release);
+        atomic_store(&sh->pend_epoch, 0);
+        return;
+    }
+    // complete: finish it (installing twice what the dead one had already installed only adds equal versions)
+    if (shidx_room(db->ix) >= (uint32_t)n + 2) shidx_install(db->ix, epoch, dbsize, n, pgnos, locs);
+    if (db->rx && ext_len) {
+        uint8_t *ext = malloc(ext_len);
+        if (ext && mw_seglog_read(db, ext_loc, 0, ext_len, ext)) mm_replay(db, epoch, ext, ext_len, ext_loc);
+        free(ext);
+    }
+    if (db->cdc) atomic_store(&sh->own_cookie, 0);                                                // (the owner maps follow commits by their pages: this one's were not applied: rebuilt at the next use)
+    atomic_store(&sh->sl_seg, seg); atomic_store_explicit(&sh->sl_end, off + size, memory_order_release);
+    atomic_store(&db->next_epoch, epoch);
+    atomic_store_explicit(&sh->log_pos, MW_LOG_POS(seg, off + size), memory_order_release);
+    shidx_publish(db->ix, epoch);
+    if (db->rx) shidx_publish(db->rx, epoch);
+    atomic_store_explicit(&sh->committed_epoch, epoch, memory_order_release);
+    atomic_store(&db->epoch, epoch);
+    atomic_store(&sh->pend_epoch, 0);
+    free(pgnos); free(locs);
+}
+
 // MARK: - publishing -
 
 static int cmp_pg (const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
@@ -253,6 +290,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     uint32_t seg = 0; uint64_t end = 0;
     uint64_t ext_loc = 0;
     rc = mw_seglog_append(db, epoch, new_dbsize, n, pgnos, images, lane ? lane->cdc_ext : NULL, lane ? lane->cdc_ext_len : 0, locs, &ext_loc, &seg, &end);
+    mw_fault_hit(MW_CRASH_SHARED_APPENDED);                                           // (the record is complete, nothing is installed)
     MW_T1(MW_ST_APPEND, ta0);
     if (rc != SQLITE_OK) { if (n > 16) free(locs); ADOPT_FREE(); atomic_store(&db->failed, 1); return rc; }
     if (shidx_install(ix, epoch, new_dbsize, n, pgnos, locs) != 0) { if (n > 16) free(locs); ADOPT_FREE(); atomic_store(&db->failed, 1); return SQLITE_FULL; }
@@ -263,6 +301,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     }
     ADOPT_FREE();
     if (lane) { lane->sl_seg = seg; lane->sl_end = end; }
+    mw_fault_hit(MW_CRASH_SHARED_INSTALLED);                                          // (installed, not visible)
     atomic_store(&db->next_epoch, epoch);
     atomic_store_explicit(&sh->log_pos, MW_LOG_POS(seg, end), memory_order_release);
     shidx_publish(ix, epoch);
@@ -270,6 +309,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     if (db->cdc && lane) mw_cdc_apply_cells(db, lane, epoch);
     atomic_store_explicit(&sh->committed_epoch, epoch, memory_order_release);        // (the record is visible to the other processes before it is durable: as in the other mode, an acknowledged commit is never lost)
     atomic_store(&db->epoch, epoch);
+    atomic_store_explicit(&sh->pend_epoch, 0, memory_order_release);                 // (visible: nothing is pending any more)
     mw_fault_hit(MW_CRASH_AFTER_LOG);
     mw_fault_hit(MW_CRASH_AFTER_VISIBLE);
     if (!lane && sync) { int src = mw_seglog_sync(db, seg, end); if (src != SQLITE_OK) { atomic_store(&db->failed, 1); return src; } }

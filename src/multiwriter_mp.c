@@ -209,7 +209,7 @@ void mw_mp_lock (mw_db *db) {
             if (s == t) {
                 int32_t exp = 0;
                 if (atomic_compare_exchange_strong_explicit(&sh->pub_owner, &exp, me, memory_order_acquire, memory_order_relaxed)) { return; }
-                if (exp != me && (polls & 31) == 31 && !pid_alive(db, exp) && atomic_compare_exchange_strong(&sh->pub_owner, &exp, me)) { db->mp_recheck = true; return; }   // the holder died
+                if (exp != me && (polls & 31) == 31 && !pid_alive(db, exp) && atomic_compare_exchange_strong(&sh->pub_owner, &exp, me)) { db->mp_recheck = true; if (db->shared) mw_shared_repair(db); return; }   // the holder died
             } else if (s < t && (polls & 31) == 31) {
                 int32_t pid = atomic_load(&sh->pub_tk_pid[s % 1024]);
                 if (pid > 0 && (pid != me && !pid_alive(db, pid))) { if (getenv("MW_DEBUG")) fprintf(stderr, "pid %d: skipping ticket %llu of pid %d (owner %d)\n", (int)me, (unsigned long long)s, (int)pid, (int)atomic_load(&sh->pub_owner)); if (atomic_compare_exchange_strong(&sh->pub_serving, &s, s + 1)) atomic_store_explicit(&sh->pub_tk_pid[s % 1024], 0, memory_order_relaxed); }   // (slot cleared once its ticket is past: a dead pid left by the ticket 1024 earlier must not get a fresh ticket skipped) a queued process that gave up (-1) or died: skip its ticket
@@ -229,7 +229,7 @@ void mw_mp_lock (mw_db *db) {
         if (atomic_load_explicit(&sh->pub_owner, memory_order_relaxed) == 0 && atomic_compare_exchange_strong_explicit(&sh->pub_owner, &exp, me, memory_order_acquire, memory_order_relaxed)) return;
         if ((spin & 255) == 255) {
             int32_t owner = atomic_load(&sh->pub_owner);
-            if (owner != 0 && owner != me && !pid_alive(db, owner) && atomic_compare_exchange_strong(&sh->pub_owner, &owner, me)) db->mp_recheck = true;     // steal from a dead process
+            if (owner != 0 && owner != me && !pid_alive(db, owner) && atomic_compare_exchange_strong(&sh->pub_owner, &owner, me)) { db->mp_recheck = true; if (db->shared) mw_shared_repair(db); }     // steal from a dead process
             if (atomic_load(&sh->pub_owner) == me) return;
         }
         if (atomic_load_explicit(&sh->committed_epoch, memory_order_acquire) != atomic_load_explicit(&db->epoch, memory_order_acquire) && atomic_load(&db->failed) == 0) mw_mp_catchup_locked(db);

@@ -33,7 +33,7 @@ typedef struct { uint64_t epoch, end; } mw_pend;   // a record that was copied o
 typedef struct mw_lane mw_lane;
 
 // Multi-process shared state ("<db>-mwlock", mmapped MAP_SHARED by every process; see multiwriter_mp.c).
-#define MW_MP_SLOTS 4096
+#define MW_MP_SLOTS 8192                 // lanes of all processes (a process has its connections and the metadata store's: a flusher and up to four readers)
 #define MW_MP_PROCS 1024
 #define MW_MP_NONE  (~0ull)
 typedef struct {
@@ -85,6 +85,7 @@ typedef struct mw_shm {
     uint32_t          sl_pad;
     _Atomic uint64_t  sl_end;             // ... and the offset in it (moved only under the publication lock)
     _Atomic uint64_t  seg_first_epoch[256];   // the epoch segment s was opened for, at [s % 256]
+    _Atomic uint64_t  pend_epoch, pend_off; _Atomic uint32_t pend_seg;       // the record being published (epoch, where it starts): set when it is appended, cleared when it is visible
     _Atomic uint64_t  sy_done;            // everything up to this log position (segment << 40 | offset) is durable: the group commit across processes
     _Atomic uint32_t  sy_wake;            // changed + woken when a sync finishes: the commits waiting for durability sleep on it
     _Atomic int32_t   sy_leader;          // process running the fsync everybody waits for (0 = none)
@@ -584,6 +585,7 @@ void     mw_cdc_apply_owner (mw_db *db, mw_lane *lane, const uint32_t *pgnos, co
 void     mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch);
 struct mw_meta *mw_cdc_meta (mw_db *db);
 void     mw_cdc_quiesce (mw_db *db);
+void     mw_shared_repair (mw_db *db);
 void     mw_cdc_set_cache_mb (mw_db *db, int mb);
 void     mw_cdc_kick_flush (mw_db *db);
 int      mw_cdc_shared_create (mw_db *db);

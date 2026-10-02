@@ -108,6 +108,8 @@ typedef enum {
     MW_CRASH_COMPACT_PAGES,     // compaction: after writing the pages into the real file, before recording the new base
     MW_CRASH_COMPACT_BASE,      // compaction: after the new base epoch was recorded
     MW_CRASH_LOG_RENAME,        // log rewrite: new log file renamed into place, header (log_pos) not yet updated
+    MW_CRASH_SHARED_APPENDED,   // shared mode: the record is in the segment, nothing installed yet
+    MW_CRASH_SHARED_INSTALLED,  // shared mode: pages (and metadata) installed, the commit not yet visible
     MW_FAULT_COUNT
 } mw_fault_t;
 void mw_fault_arm (mw_fault_t f, int nth);

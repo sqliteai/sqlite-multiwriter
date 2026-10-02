@@ -20,8 +20,10 @@ int rs_key_cmp (const rs_key *a, const rs_key *b);                       // tabl
 uint64_t rs_key_hash (const rs_key *k);
 
 // ---- a block ----
-// [format 1][nrows u32][offsets u32 x nrows][rows]; a row: varint table, varint key length, key, varint dv, varint length of the cells, the cells (length 0: the row was deleted)
+// raw form: [format 1][nrows u32][offsets u32 x nrows][rows]; a row: varint table, varint key length, key, varint dv, varint length of the cells, the cells (length 0: the row was deleted)
 typedef struct { const uint8_t *data; size_t len; uint32_t nrows; } rs_blk;
+// A stored block is raw (format 1, as built) or compressed with LZ4 (format 2: [2][raw length u32][LZ4 data]); the builder compresses a block when it gains a tenth or more.
+bool rs_blk_unpack (rs_blk *b, const uint8_t *data, size_t len, uint8_t **owned);                                      // a stored block opened; *owned: a buffer to free when done (NULL: b points into data)
 bool rs_blk_open (rs_blk *b, const uint8_t *data, size_t len);                                                            // false: not a block (nothing is read past its end)
 bool rs_blk_row (const rs_blk *b, uint32_t i, rs_key *k, int64_t *dv, const uint8_t **cells, uint32_t *ncells);           // the i-th row
 int  rs_blk_find (const rs_blk *b, const rs_key *k, int64_t *dv, const uint8_t **cells, uint32_t *ncells);                // 1 found, 0 not, -1 corrupt
@@ -29,21 +31,25 @@ int  rs_blk_find (const rs_blk *b, const rs_key *k, int64_t *dv, const uint8_t *
 // ---- a run (what is kept in memory) ----
 typedef struct rs_run {
     int64_t id, age; int lvl; uint64_t nrows; uint32_t nblk; int64_t dvmax;
-    uint32_t nfence; uint32_t *ftbl, *foff, *flen; int64_t *fdv; uint8_t *farena;     // first key of every block (table, offset and length in farena) and the largest dv in it
+    uint32_t nfence; uint32_t *ftbl, *foff, *flen; int64_t *fdv; uint8_t *farena;
+    uint32_t *slen, *loff, *llen; uint8_t *larena;                                     // per block: its stored length and the locator the store gave it (opaque here), in larena     // first key of every block (table, offset and length in farena) and the largest dv in it
     uint8_t *kmaxk; uint32_t kmaxtbl, kmaxl;                                           // the last key of the run
     uint64_t *bloom; uint64_t nbits;
+    uint8_t *mloc; uint32_t mlocl;                                                      // where the store keeps the meta of the run itself (opaque; set by the store)
     _Atomic int refs;
 } rs_run;
 rs_run *rs_run_decode (int64_t id, int64_t age, int lvl, uint64_t nrows, uint32_t nblk, int64_t dvmax, const uint8_t *meta, size_t len);   // NULL: not a meta
 void rs_run_ref (rs_run *r);
 void rs_run_unref (rs_run *r);
 bool rs_run_maybe (const rs_run *r, const rs_key *k);                    // inside its key range and passes the filter
+void rs_run_block_info (const rs_run *r, uint32_t blk, uint32_t *stored_len, const uint8_t **loc, uint32_t *loclen);   // where the store put the block
 int  rs_run_block_of (const rs_run *r, const rs_key *k);                 // the block that would hold the key (-1: before the first)
 bool rs_run_range (const rs_run *r, rs_key *lo, rs_key *hi);             // first and last key (pointers into the run)
 
 // ---- building ----
 // Rows are added in key order. A finished block goes to emit(); at the end the meta of the run comes out.
-typedef int (*rs_emit_fn)(void *ctx, uint32_t blkno, const uint8_t *data, size_t len);
+// emit stores the block and may return a locator for it (kept in the meta of the run, so that the store can find the block again; loc is read at once, before the next call)
+typedef int (*rs_emit_fn)(void *ctx, uint32_t blkno, const uint8_t *data, size_t len, const uint8_t **loc, size_t *loclen);
 typedef struct rs_builder rs_builder;
 rs_builder *rs_builder_new (uint64_t nrows_hint, rs_emit_fn emit, void *ctx);
 int  rs_builder_add (rs_builder *b, const rs_key *k, int64_t dv, const uint8_t *cells, uint32_t ncells);       // 0, or the error of emit / -1 memory

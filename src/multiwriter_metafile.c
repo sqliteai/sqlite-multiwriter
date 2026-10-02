@@ -15,8 +15,9 @@
 static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS mw_state(k TEXT PRIMARY KEY NOT NULL, v) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS mw_sites(ord INTEGER PRIMARY KEY, id BLOB NOT NULL);"
-    "CREATE TABLE IF NOT EXISTS mw_runs(run INTEGER PRIMARY KEY, age INTEGER NOT NULL, lvl INTEGER NOT NULL, nrows INTEGER NOT NULL, nblk INTEGER NOT NULL, dvmax INTEGER NOT NULL, meta BLOB NOT NULL);"
-    "CREATE TABLE IF NOT EXISTS mw_blocks(run INTEGER NOT NULL, blk INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(run, blk)) WITHOUT ROWID;"
+    "CREATE TABLE IF NOT EXISTS mw_runs(run INTEGER PRIMARY KEY, age INTEGER NOT NULL, lvl INTEGER NOT NULL, nrows INTEGER NOT NULL, nblk INTEGER NOT NULL, dvmax INTEGER NOT NULL, metalen INTEGER NOT NULL, metaloc BLOB NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS mw_slots(slot INTEGER PRIMARY KEY, data BLOB NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS mw_free(slot INTEGER PRIMARY KEY);"
     "CREATE TABLE IF NOT EXISTS mw_drops(tbl INTEGER PRIMARY KEY, dv INTEGER NOT NULL);";
 
 static uint64_t now_ns (void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
@@ -65,9 +66,9 @@ bool mw_meta_row_cells (const void *blob, size_t len, mw_mcell **c, int *n) { in
 
 int mw_meta_schema (sqlite3 *c) {
     sqlite3_stmt *st = NULL; int have = 0;
-    if (sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_runs','mw_blocks','mw_drops')", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) have = sqlite3_column_int(st, 0);
+    if (sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_runs','mw_slots','mw_free','mw_drops')", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) have = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
-    if (have == 5) return SQLITE_OK;
+    if (have == 6) return SQLITE_OK;
     int rc = SQLITE_BUSY;
     for (int i = 0; i < 100 && busyish(rc); i++) {
         rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL);
@@ -334,6 +335,7 @@ static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool l
     int rc;
     if (!atomic_load_explicit(&m->schema_seen, memory_order_relaxed)) { rc = mw_meta_schema(c); if (rc != SQLITE_OK) return rc; atomic_store(&m->schema_seen, true); }
     atomic_store(&m->tables_ok, true);
+    if (i1 > i0 && (rc = rsx_reserve_items(m->rsx, c, v, i0, i1)) != SQLITE_OK) return rc;              // (the slots the blocks will be written to: taken before the transaction)
     rsx_wlock(m->rsx);
     if ((rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL)) != SQLITE_OK) { rsx_wunlock(m->rsx); return rc; }
     rsx_tx *t = rsx_tx_begin(m->rsx, c);
@@ -369,13 +371,14 @@ static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool l
 // the items [i0, n) in transactions of RUN_ROWS rows (the first also does the purges, the last the sites and the points when `last_range`)
 #define RUN_ROWS 32768
 static int write_range (mw_meta *m, sqlite3 *c, fitem *v, int i0, int n, bool last_range, uint64_t V, uint64_t hwm, uint32_t nsites, uint32_t sflushed, const struct mw_purge *purge, int npurge) {
-    int rc = SQLITE_OK;
+    int rc = SQLITE_OK, need_slots_retries = 0;
     for (int a = i0; a <= n && rc == SQLITE_OK; ) {
         int b = a + RUN_ROWS < n ? a + RUN_ROWS : n;
         bool last = last_range && b >= n;
         rc = SQLITE_BUSY;
         for (int attempt = 0; attempt < 200 && busyish(rc); attempt++) {
             rc = write_batch(m, c, v, a, b, last, V, hwm, nsites, sflushed, purge, npurge);
+            if (rc == RSX_NEED_SLOTS) { (void)rsx_reserve_items(m->rsx, c, v, a, b); rc = SQLITE_BUSY; attempt--; if (++need_slots_retries > 20) { rc = SQLITE_FULL; break; } continue; }      // (more incompressible than we thought: more slots, and again)
             if (busyish(rc)) { atomic_fetch_add(&m->flush_retries, 1); usleep(500 * (unsigned)(attempt < 20 ? attempt + 1 : 20)); }
         }
         if (b >= n) break;
@@ -383,7 +386,7 @@ static int write_range (mw_meta *m, sqlite3 *c, fitem *v, int i0, int n, bool la
     }
     return rc;
 }
-void mw_meta_run_stats (mw_meta *m, uint64_t out[9]) { rsx_stats st; rsx_stats_get(m->rsx, &st); out[0] = st.gets; out[1] = st.run_probes; out[2] = st.bloom_skips; out[3] = st.blk_reads; out[4] = st.cache_hits; out[5] = st.merges; out[6] = st.merged_rows; out[7] = st.runs_written; out[8] = (uint64_t)st.nruns; }
+void mw_meta_run_stats (mw_meta *m, uint64_t out[12]) { rsx_stats st; rsx_stats_get(m->rsx, &st); out[11] = st.merge_retries; { int l0, all; rsx_backlog(m->rsx, &l0, &all); out[9] = (uint64_t)l0; out[10] = (uint64_t)all; } out[0] = st.gets; out[1] = st.run_probes; out[2] = st.bloom_skips; out[3] = st.blk_reads; out[4] = st.cache_hits; out[5] = st.merges; out[6] = st.merged_rows; out[7] = st.runs_written; out[8] = (uint64_t)st.nruns; }
 
 // ---- the merger thread (one process) ----
 static void *merger_main (void *arg) {
@@ -399,6 +402,7 @@ static void *merger_main (void *arg) {
         if (m->shared && !mw_mp_meta_lock(m->db, 2, false)) continue;                          // (several processes: one of them merges at a time; the others' flushes go on)
         if (!m->mrd) m->mrd = open_conn(m);
         if (!m->mwr) m->mwr = open_conn(m);
+        if (m->mrd && m->mwr && !m->swept) { if (!m->shared) (void)rsx_sweep(m->rsx, m->mrd, m->mwr); m->swept = true; }
         if (m->mrd && m->mwr) for (;;) {
             pthread_mutex_lock(&m->mth_mu); bool st = m->mth_stop; pthread_mutex_unlock(&m->mth_mu);
             if (st || rsx_merge(m->rsx, m->mrd, m->mwr, m->fanout, m->part_rows) <= 0) break;
@@ -660,4 +664,14 @@ int mw_metafile_export (mw_meta *m, sqlite3 *c, int64_t since, int64_t upto, mw_
     if (rc) { free(xs); free(ks.pool); return -1; }
     *out = xs; *nout = nx; *pkpool = ks.pool;
     return 0;
+}
+
+// back-pressure of the runs: how long (microseconds) a commit waits when the merges are far behind the flushes. Every run is one more place to look in, and the file grows with them: the writers
+// slow down to the pace of the merges, the flush itself is never held (the log can only be compacted up to the flushed point).
+uint32_t mw_meta_run_pressure (mw_meta *m) {
+    static int max_l0 = -1; if (max_l0 < 0) { const char *e = getenv("MW_META_MAX_RUNS"); max_l0 = e && atoi(e) > 0 ? atoi(e) : 48; }
+    int l0, all; rsx_backlog(m->rsx, &l0, &all);
+    int over = l0 - max_l0, over_all = all - max_l0 * 3; if (over_all > over) over = over_all;
+    if (over <= 0) return 0;
+    uint32_t w = (uint32_t)over * 150u; return w > 20000u ? 20000u : w;
 }

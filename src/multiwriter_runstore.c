@@ -11,18 +11,29 @@
 #include "multiwriter_runstore.h"
 
 #define CSTRIPES 32
+#define SLOT_HDR 16                                // every slot starts with who it belongs to: [run id u64][block u32][part u32] (a slot that is read for another run is an error, not a wrong answer)
+static void hdr_put (uint8_t *p, int64_t run, uint32_t blk, uint32_t part) { uint64_t r = (uint64_t)run; memcpy(p, &r, 8); memcpy(p + 8, &blk, 4); memcpy(p + 12, &part, 4); }
 
 typedef struct cblk { _Atomic int refs; size_t len; uint8_t d[]; } cblk;
-typedef struct { int64_t run; uint32_t blk; cblk *b; } cslot;
+typedef struct { int64_t run; uint32_t blk; cblk *b; } cslot;                       // an entry of the cache of blocks
 typedef struct { uint32_t tbl; int64_t dv; } rdrop;
 
 struct mw_rman { _Atomic int refs; int64_t ver; rs_run **runs; int n; rdrop *drops; int nd; };
 
 struct mw_rstore {
     pthread_mutex_t mu, wmu; mw_rman *cur;
-    cslot *slots; size_t nslots; pthread_mutex_t cmu[CSTRIPES];
-    _Atomic uint64_t gets, run_probes, bloom_skips, blk_reads, cache_hits, merges, merged_rows, runs_written;
+    cslot *cs; size_t ncs; pthread_mutex_t cmu[CSTRIPES];
+    pthread_mutex_t pmu; uint32_t *pool; size_t npool, cappool;               // slots taken from the free table (or fresh) and not used yet
+    _Atomic uint32_t slot_bytes;                                             // the size of a slot: the file's, found or decided at the first use
+    _Atomic int bl0, ball;                                                   // age groups at level 0 and in all, of the current list
+    _Atomic uint64_t merge_retries, merge_ns; _Atomic uint64_t gets, run_probes, bloom_skips, blk_reads, cache_hits, merges, merged_rows, runs_written;
 };
+
+// a retry after a conflict: at once the first times (the other commit is over by now), then a little longer, never the tens of milliseconds a bulk writer would sleep
+static void backoff (int attempt) { if (attempt > 2) usleep(100u * (unsigned)(attempt < 30 ? attempt : 30)); }
+
+static size_t sl_put (uint8_t *p, uint64_t v) { size_t n = 0; while (v >= 0x80) { p[n++] = (uint8_t)(v | 0x80); v >>= 7; } p[n++] = (uint8_t)v; return n; }
+static bool sl_get (const uint8_t **p, const uint8_t *end, uint64_t *v) { uint64_t r = 0; int sh = 0; while (*p < end && sh < 64) { uint8_t b = *(*p)++; r |= (uint64_t)(b & 0x7f) << sh; if (!(b & 0x80)) { *v = r; return true; } sh += 7; } return false; }
 
 static bool busyish (int rc) { int p = rc & 0xff; return p == SQLITE_BUSY || p == SQLITE_LOCKED; }
 
@@ -43,7 +54,7 @@ static int state_put (sqlite3 *c, const char *k, int64_t v) {
     rc = sqlite3_step(st); sqlite3_finalize(st);
     return rc == SQLITE_DONE ? SQLITE_OK : (rc == SQLITE_ROW ? SQLITE_ERROR : rc);
 }
-const char *rsx_blk_sql (void) { return "SELECT data FROM mw_blocks WHERE run = ?1 AND blk = ?2"; }
+const char *rsx_blk_sql (void) { return "SELECT data FROM mw_slots WHERE slot = ?1"; }
 
 // ---- the manifest ----
 static void man_ref (mw_rman *m) { atomic_fetch_add(&m->refs, 1); }
@@ -52,23 +63,38 @@ void rsx_man_release (mw_rman *m) {
     for (int i = 0; i < m->n; i++) rs_run_unref(m->runs[i]);
     free(m->runs); free(m->drops); free(m);
 }
+static void backlog_update (mw_rstore *s, const mw_rman *m);
 static int run_newest_first (const void *a, const void *b) { const rs_run *x = *(rs_run *const *)a, *y = *(rs_run *const *)b; if (x->age != y->age) return x->age < y->age ? 1 : -1; return x->id < y->id ? -1 : x->id > y->id; }
 static int64_t drop_of (const mw_rman *m, uint32_t tbl) { int64_t d = 0; for (int i = 0; i < m->nd; i++) if (m->drops[i].tbl == tbl && m->drops[i].dv > d) d = m->drops[i].dv; return d; }
 
-static mw_rman *man_load (sqlite3 *c, const mw_rman *old, int64_t ver) {
+static mw_rman *man_load (sqlite3 *c, const mw_rman *old, int64_t ver, uint32_t sb_in) {
     mw_rman *m = calloc(1, sizeof *m); if (!m) return NULL;
     atomic_init(&m->refs, 1); m->ver = ver;
     sqlite3_stmt *st = NULL, *mt = NULL; int cap = 0;
-    if (sqlite3_prepare_v2(c, "SELECT run, age, lvl, nrows, nblk, dvmax FROM mw_runs ORDER BY age DESC, run", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_prepare_v2(c, "SELECT meta FROM mw_runs WHERE run = ?1", -1, &mt, NULL);
+    sqlite3_stmt *sl = NULL;
+    if (sqlite3_prepare_v2(c, "SELECT run, age, lvl, nrows, nblk, dvmax, metalen, metaloc FROM mw_runs ORDER BY age DESC, run", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_prepare_v2(c, "SELECT data FROM mw_slots WHERE slot = ?1", -1, &sl, NULL); mt = sl;
         int r;
         while ((r = sqlite3_step(st)) == SQLITE_ROW) {
             int64_t id = sqlite3_column_int64(st, 0); rs_run *run = NULL;
             if (old) for (int i = 0; i < old->n; i++) if (old->runs[i]->id == id) { run = old->runs[i]; rs_run_ref(run); break; }
-            if (!run && mt) {
-                sqlite3_bind_int64(mt, 1, id);
-                if (sqlite3_step(mt) == SQLITE_ROW) run = rs_run_decode(id, sqlite3_column_int64(st, 1), (int)sqlite3_column_int64(st, 2), (uint64_t)sqlite3_column_int64(st, 3), (uint32_t)sqlite3_column_int64(st, 4), sqlite3_column_int64(st, 5), sqlite3_column_blob(mt, 0), (size_t)sqlite3_column_bytes(mt, 0));
-                sqlite3_reset(mt);
+            if (!run && mt) {                                                                    // (a run this list has not met: its meta is in slots)
+                int64_t mlen = sqlite3_column_int64(st, 6); const uint8_t *ml = sqlite3_column_blob(st, 7); int mll = sqlite3_column_bytes(st, 7);
+                uint32_t sb = sb_in; uint8_t *meta = (sb && mlen > 0 && mlen < (1 << 28)) ? malloc((size_t)mlen) : NULL;
+                size_t got = 0; const uint8_t *p = ml, *pe = ml + mll; bool ok = meta != NULL;
+                while (ok && got < (size_t)mlen) {
+                    uint64_t slot; if (!sl_get(&p, pe, &slot)) { ok = false; break; }
+                    sqlite3_bind_int64(mt, 1, (int64_t)slot);
+                    if (sqlite3_step(mt) == SQLITE_ROW && (uint32_t)sqlite3_column_bytes(mt, 0) == sb) {
+                        const uint8_t *d = sqlite3_column_blob(mt, 0); uint8_t want[SLOT_HDR]; hdr_put(want, id, 0xFFFFFFFFu, (uint32_t)(got / (sb - SLOT_HDR)));
+                        if (memcmp(d, want, SLOT_HDR)) { ok = false; if (getenv("MW_DBG_HDR")) fprintf(stderr, "STALE META SLOT %llu for run %lld\n", (unsigned long long)slot, (long long)id); }
+                        else { size_t n = (size_t)mlen - got < sb - SLOT_HDR ? (size_t)mlen - got : sb - SLOT_HDR; memcpy(meta + got, d + SLOT_HDR, n); got += n; }
+                    } else ok = false;
+                    sqlite3_reset(mt);
+                }
+                if (ok) { run = rs_run_decode(id, sqlite3_column_int64(st, 1), (int)sqlite3_column_int64(st, 2), (uint64_t)sqlite3_column_int64(st, 3), (uint32_t)sqlite3_column_int64(st, 4), sqlite3_column_int64(st, 5), meta, (size_t)mlen);
+                       if (run) { run->mloc = malloc(mll ? (size_t)mll : 1); if (run->mloc) { memcpy(run->mloc, ml, (size_t)mll); run->mlocl = (uint32_t)mll; } } }
+                free(meta);
             }
             if (!run) { sqlite3_finalize(st); sqlite3_finalize(mt); rsx_man_release(m); return NULL; }
             if (m->n == cap) { int nc = cap ? cap * 2 : 16; rs_run **nr = realloc(m->runs, (size_t)nc * sizeof *nr); if (!nr) { rs_run_unref(run); sqlite3_finalize(st); sqlite3_finalize(mt); rsx_man_release(m); return NULL; } m->runs = nr; cap = nc; }
@@ -89,18 +115,20 @@ static mw_rman *man_load (sqlite3 *c, const mw_rman *old, int64_t ver) {
     return m;
 }
 
+static uint32_t compute_slot_bytes (sqlite3 *c);
 int rsx_man (mw_rstore *s, sqlite3 *c, mw_rman **out) {
     int64_t ver = state_get(c, "runs_ver", 0);
+    if (!atomic_load(&s->slot_bytes)) { int64_t sb = state_get(c, "slot_bytes", 0); if (!sb) sb = compute_slot_bytes(c); atomic_store(&s->slot_bytes, (uint32_t)sb); }
     pthread_mutex_lock(&s->mu);
     mw_rman *cur = s->cur;
     if (cur && cur->ver == ver) { man_ref(cur); pthread_mutex_unlock(&s->mu); *out = cur; return 0; }
     if (cur) man_ref(cur);
     pthread_mutex_unlock(&s->mu);
-    mw_rman *m = man_load(c, cur, ver);
+    mw_rman *m = man_load(c, cur, ver, atomic_load(&s->slot_bytes));
     if (cur) rsx_man_release(cur);
     if (!m) return -1;
     pthread_mutex_lock(&s->mu);
-    if (!s->cur || s->cur->ver < ver) { man_ref(m); mw_rman *o = s->cur; s->cur = m; pthread_mutex_unlock(&s->mu); rsx_man_release(o); }
+    if (!s->cur || s->cur->ver < ver) { man_ref(m); mw_rman *o = s->cur; s->cur = m; backlog_update(s, m); pthread_mutex_unlock(&s->mu); rsx_man_release(o); }
     else pthread_mutex_unlock(&s->mu);
     *out = m;
     return 0;
@@ -111,47 +139,85 @@ mw_rstore *rsx_new (size_t cache_bytes) {
     mw_rstore *s = calloc(1, sizeof *s); if (!s) return NULL;
     pthread_mutex_init(&s->mu, NULL); pthread_mutex_init(&s->wmu, NULL);
     for (int i = 0; i < CSTRIPES; i++) pthread_mutex_init(&s->cmu[i], NULL);
-    s->nslots = cache_bytes / (RS_BLOCK_TARGET + 1024); if (s->nslots < 64) s->nslots = 64;
-    s->slots = calloc(s->nslots, sizeof *s->slots);
-    if (!s->slots) { free(s); return NULL; }
+    pthread_mutex_init(&s->pmu, NULL);
+    s->ncs = cache_bytes / (RS_BLOCK_TARGET + 1024); if (s->ncs < 64) s->ncs = 64;
+    s->cs = calloc(s->ncs, sizeof *s->cs);
+    if (!s->cs) { free(s); return NULL; }
     return s;
 }
 static void cblk_unref (cblk *b) { if (b && atomic_fetch_sub(&b->refs, 1) == 1) free(b); }
 void rsx_free (mw_rstore *s) {
     if (!s) return;
-    for (size_t i = 0; i < s->nslots; i++) cblk_unref(s->slots[i].b);
-    free(s->slots); rsx_man_release(s->cur);
+    for (size_t i = 0; i < s->ncs; i++) cblk_unref(s->cs[i].b);
+    free(s->cs); free(s->pool); pthread_mutex_destroy(&s->pmu); rsx_man_release(s->cur);
     for (int i = 0; i < CSTRIPES; i++) pthread_mutex_destroy(&s->cmu[i]);
     pthread_mutex_destroy(&s->mu); pthread_mutex_destroy(&s->wmu); free(s);
+}
+void rsx_backlog (mw_rstore *s, int *l0, int *total) { *l0 = atomic_load_explicit(&s->bl0, memory_order_relaxed); *total = atomic_load_explicit(&s->ball, memory_order_relaxed); }
+static void backlog_update (mw_rstore *s, const mw_rman *m) {                 // (the caller holds s->mu)
+    int a = 0, t = 0; int64_t last0 = -1, last = -1;
+    for (int i = 0; i < m->n; i++) {                                           // (newest first: equal ages are next to each other)
+        const rs_run *r = m->runs[i];
+        if (r->age != last) { t++; last = r->age; }
+        if (r->lvl == 0 && r->age != last0) { a++; last0 = r->age; }
+    }
+    atomic_store_explicit(&s->bl0, a, memory_order_relaxed); atomic_store_explicit(&s->ball, t, memory_order_relaxed);
 }
 void rsx_wlock (mw_rstore *s) { pthread_mutex_lock(&s->wmu); }
 void rsx_wunlock (mw_rstore *s) { pthread_mutex_unlock(&s->wmu); }
 void rsx_stats_get (mw_rstore *s, rsx_stats *o) {
     o->gets = atomic_load(&s->gets); o->run_probes = atomic_load(&s->run_probes); o->bloom_skips = atomic_load(&s->bloom_skips); o->blk_reads = atomic_load(&s->blk_reads);
     o->cache_hits = atomic_load(&s->cache_hits); o->merges = atomic_load(&s->merges); o->merged_rows = atomic_load(&s->merged_rows); o->runs_written = atomic_load(&s->runs_written);
-    pthread_mutex_lock(&s->mu); o->nruns = s->cur ? s->cur->n : 0; pthread_mutex_unlock(&s->mu);
+    pthread_mutex_lock(&s->mu); o->nruns = s->cur ? s->cur->n : 0; o->merge_retries = atomic_load(&s->merge_retries); pthread_mutex_unlock(&s->mu);
+}
+
+// ---- where the blocks are: slots ----
+// A block lives in a few slots: rows of mw_slots, each of exactly slot_bytes bytes (the last one padded), so that a slot that is written again is overwritten where it is (SQLite does that when the
+// new record has the size of the old one): no page of the file is allocated or given back to the free list, which the writers of the application would meet at every commit. A run that goes
+// gives its slots to mw_free; the next run takes them. The locator of a block (in the meta of its run) is the varints of its slots.
+
+// a whole block, as stored (compressed or not), from its slots; false: a slot is missing
+static bool read_block (mw_rstore *s, sqlite3_stmt *st, const rs_run *r, uint32_t blk, uint8_t **data, size_t *len) {
+    uint32_t stored, loclen; const uint8_t *loc; rs_run_block_info(r, blk, &stored, &loc, &loclen);
+    uint32_t sb = atomic_load(&s->slot_bytes); if (!sb) return false;
+    uint8_t *buf = malloc(stored ? stored : 1); if (!buf) return false;
+    const uint8_t *p = loc, *end = loc + loclen; size_t got = 0; bool ok = true;
+    while (ok && got < stored) {
+        uint64_t slot; if (!sl_get(&p, end, &slot)) { ok = false; break; }
+        sqlite3_bind_int64(st, 1, (int64_t)slot);
+        if (sqlite3_step(st) == SQLITE_ROW && (uint32_t)sqlite3_column_bytes(st, 0) == sb) {
+            const uint8_t *d = sqlite3_column_blob(st, 0); uint8_t want[SLOT_HDR]; hdr_put(want, r->id, blk, (uint32_t)(got / (sb - SLOT_HDR)));
+            if (memcmp(d, want, SLOT_HDR)) { ok = false; if (getenv("MW_DBG_HDR")) { uint64_t rr; uint32_t bb, pp; memcpy(&rr, d, 8); memcpy(&bb, d + 8, 4); memcpy(&pp, d + 12, 4); fprintf(stderr, "STALE SLOT %llu read for run %lld block %u part %zu: it holds run %llu block %u part %u\n", (unsigned long long)slot, (long long)r->id, blk, got / (sb - SLOT_HDR), (unsigned long long)rr, bb, pp); } }
+            else { size_t n = stored - got < sb - SLOT_HDR ? stored - got : sb - SLOT_HDR; memcpy(buf + got, d + SLOT_HDR, n); got += n; }
+        } else ok = false;
+        sqlite3_reset(st); sqlite3_clear_bindings(st);
+    }
+    if (!ok) { free(buf); return false; }
+    *data = buf; *len = stored;
+    return true;
 }
 
 // a block of the cache or of the file (a counted copy; NULL: it is not there)
-static cblk *fetch_block (mw_rstore *s, sqlite3_stmt *st, int64_t run, uint32_t blk) {
-    uint64_t h = ((uint64_t)run * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)blk * 0xC2B2AE3D27D4EB4Full); h ^= h >> 31;
-    size_t idx = (size_t)(h % s->nslots); pthread_mutex_t *mu = &s->cmu[idx % CSTRIPES];
+static cblk *fetch_block (mw_rstore *s, sqlite3_stmt *st, const rs_run *run, uint32_t blk) {
+    uint64_t h = ((uint64_t)run->id * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)blk * 0xC2B2AE3D27D4EB4Full); h ^= h >> 31;
+    size_t idx = (size_t)(h % s->ncs); pthread_mutex_t *mu = &s->cmu[idx % CSTRIPES];
     pthread_mutex_lock(mu);
-    cslot *sl = &s->slots[idx];
-    if (sl->b && sl->run == run && sl->blk == blk) { cblk *b = sl->b; atomic_fetch_add(&b->refs, 1); pthread_mutex_unlock(mu); atomic_fetch_add(&s->cache_hits, 1); return b; }
+    cslot *sl = &s->cs[idx];
+    if (sl->b && sl->run == run->id && sl->blk == blk) { cblk *b = sl->b; atomic_fetch_add(&b->refs, 1); pthread_mutex_unlock(mu); atomic_fetch_add(&s->cache_hits, 1); return b; }
     pthread_mutex_unlock(mu);
-    sqlite3_bind_int64(st, 1, run); sqlite3_bind_int64(st, 2, blk);
-    cblk *b = NULL;
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        size_t len = (size_t)sqlite3_column_bytes(st, 0);
-        b = malloc(sizeof *b + len);
-        if (b) { atomic_init(&b->refs, 2); b->len = len; memcpy(b->d, sqlite3_column_blob(st, 0), len); }                // (one count for the caller, one for the slot)
+    cblk *b = NULL; uint8_t *raw = NULL; size_t rawlen = 0;
+    if (read_block(s, st, run, blk, &raw, &rawlen)) {
+        rs_blk tmp; uint8_t *own = NULL;
+        if (rs_blk_unpack(&tmp, raw, rawlen, &own)) {                                                                    // (the cache holds blocks as they are used: decompressed)
+            b = malloc(sizeof *b + tmp.len);
+            if (b) { atomic_init(&b->refs, 2); b->len = tmp.len; memcpy(b->d, tmp.data, tmp.len); }                    // (one count for the caller, one for the entry)
+        }
+        free(own); free(raw);
     }
-    sqlite3_reset(st); sqlite3_clear_bindings(st);
     atomic_fetch_add(&s->blk_reads, 1);
     if (!b) return NULL;
     pthread_mutex_lock(mu);
-    cblk *old = sl->b; sl->b = b; sl->run = run; sl->blk = blk;
+    cblk *old = sl->b; sl->b = b; sl->run = run->id; sl->blk = blk;
     pthread_mutex_unlock(mu);
     cblk_unref(old);
     return b;
@@ -167,7 +233,7 @@ static int get_one (mw_rstore *s, const mw_rman *m, sqlite3_stmt *st, uint32_t t
         atomic_fetch_add(&s->run_probes, 1);
         if (!rs_run_maybe(r, &k)) { atomic_fetch_add(&s->bloom_skips, 1); continue; }
         int b = rs_run_block_of(r, &k); if (b < 0) continue;
-        cblk *cb = fetch_block(s, st, r->id, (uint32_t)b); if (!cb) return -1;
+        cblk *cb = fetch_block(s, st, r, (uint32_t)b); if (!cb) return -1;
         rs_blk blk; int64_t dv; const uint8_t *c; uint32_t nc; int f = rs_blk_open(&blk, cb->d, cb->len) ? rs_blk_find(&blk, &k, &dv, &c, &nc) : -1;
         if (f < 0) { cblk_unref(cb); return -1; }
         if (f == 0) { cblk_unref(cb); continue; }
@@ -188,16 +254,21 @@ int rsx_get_many (mw_rstore *s, mw_rman *m, sqlite3_stmt *blk, int n, const uint
 }
 
 int rsx_scan_keys (mw_rstore *s, sqlite3 *c, void (*cb)(void *, uint32_t, const uint8_t *, size_t), void *ctx) {
-    (void)s;
-    sqlite3_stmt *st = NULL; if (sqlite3_prepare_v2(c, "SELECT data FROM mw_blocks", -1, &st, NULL) != SQLITE_OK) { sqlite3_finalize(st); return 0; }
-    int r, rc = 0;
-    while ((r = sqlite3_step(st)) == SQLITE_ROW) {
-        rs_blk b; if (!rs_blk_open(&b, sqlite3_column_blob(st, 0), (size_t)sqlite3_column_bytes(st, 0))) { rc = -1; break; }
-        for (uint32_t i = 0; i < b.nrows; i++) { rs_key k; int64_t dv; const uint8_t *cells; uint32_t nc; if (!rs_blk_row(&b, i, &k, &dv, &cells, &nc)) { rc = -1; break; } if (nc) cb(ctx, k.tbl, k.pk, k.pklen); }
-        if (rc) break;
+    bool own = sqlite3_get_autocommit(c) != 0; if (own) sqlite3_exec(c, "BEGIN", NULL, NULL, NULL);            // (the list of runs and their slots from one snapshot)
+    mw_rman *m; if (rsx_man(s, c, &m) != 0) { if (own) sqlite3_exec(c, "COMMIT", NULL, NULL, NULL); return -1; }
+    if (!m->n) { rsx_man_release(m); if (own) sqlite3_exec(c, "COMMIT", NULL, NULL, NULL); return 0; }
+    sqlite3_stmt *st = NULL; if (sqlite3_prepare_v2(c, rsx_blk_sql(), -1, &st, NULL) != SQLITE_OK) { rsx_man_release(m); if (own) sqlite3_exec(c, "COMMIT", NULL, NULL, NULL); return -1; }
+    int rc = 0;
+    for (int ri = 0; ri < m->n && !rc; ri++) {
+        const rs_run *r = m->runs[ri];
+        for (uint32_t bi = 0; bi < r->nblk && !rc; bi++) {
+            uint8_t *raw; size_t rl; if (!read_block(s, st, r, bi, &raw, &rl)) { rc = -1; break; }
+            rs_blk b; uint8_t *own; if (!rs_blk_unpack(&b, raw, rl, &own)) { free(raw); rc = -1; break; }
+            for (uint32_t i = 0; i < b.nrows; i++) { rs_key k; int64_t dv; const uint8_t *cells; uint32_t nc; if (!rs_blk_row(&b, i, &k, &dv, &cells, &nc)) { rc = -1; break; } if (nc) cb(ctx, k.tbl, k.pk, k.pklen); }
+            free(own); free(raw);
+        }
     }
-    if (!rc && r != SQLITE_DONE) rc = -1;
-    sqlite3_finalize(st);
+    sqlite3_finalize(st); rsx_man_release(m); if (own) sqlite3_exec(c, "COMMIT", NULL, NULL, NULL);
     return rc;
 }
 int rsx_scan_since (mw_rstore *s, sqlite3 *c, mw_rman *m, int64_t since, void (*cb)(void *, uint32_t, const uint8_t *, size_t), void *ctx) {
@@ -207,7 +278,7 @@ int rsx_scan_since (mw_rstore *s, sqlite3 *c, mw_rman *m, int64_t since, void (*
         const rs_run *r = m->runs[ri]; if (r->dvmax <= since) continue;
         for (uint32_t bi = 0; bi < r->nfence && !rc; bi++) {
             if (r->fdv[bi] <= since) continue;
-            cblk *cb_ = fetch_block(s, st, r->id, bi); if (!cb_) { rc = -1; break; }
+            cblk *cb_ = fetch_block(s, st, r, bi); if (!cb_) { rc = -1; break; }
             rs_blk b; if (!rs_blk_open(&b, cb_->d, cb_->len)) rc = -1;
             for (uint32_t i = 0; !rc && i < b.nrows; i++) { rs_key k; int64_t dv; const uint8_t *cells; uint32_t nc; if (!rs_blk_row(&b, i, &k, &dv, &cells, &nc)) { rc = -1; break; } if (nc && dv > since) cb(ctx, k.tbl, k.pk, k.pklen); }
             cblk_unref(cb_);
@@ -218,33 +289,44 @@ int rsx_scan_since (mw_rstore *s, sqlite3 *c, mw_rman *m, int64_t since, void (*
 }
 
 // ---- reading blocks outside the cache (merges, full scans) ----
-typedef struct { sqlite3_stmt *st; } plainctx;
+// A block of a run for a merge: read in a transaction that also finds the run in the list (the slots of a run that went are free, and somebody may have written another run into them: the manifest the merge
+// works from is older than this read, and in between, in another process, the run may have been removed)
+typedef struct { mw_rstore *s; sqlite3_stmt *st; sqlite3 *c; sqlite3_stmt *exists; bool own_txn; } plainctx;
 static int plain_read (void *ctx, const rs_run *r, uint32_t blk, uint8_t **data, size_t *len) {
-    plainctx *p = ctx; sqlite3_bind_int64(p->st, 1, r->id); sqlite3_bind_int64(p->st, 2, blk);
-    int rc = -1;
-    if (sqlite3_step(p->st) == SQLITE_ROW) { *len = (size_t)sqlite3_column_bytes(p->st, 0); *data = malloc(*len ? *len : 1); if (*data) { memcpy(*data, sqlite3_column_blob(p->st, 0), *len); rc = 0; } }
-    sqlite3_reset(p->st); sqlite3_clear_bindings(p->st);
+    plainctx *p = ctx; int rc = -1;
+    if (!p->own_txn) return read_block(p->s, p->st, r, blk, data, len) ? 0 : -1;                    // (inside a transaction of the caller: one snapshot already)
+    if (sqlite3_exec(p->c, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) return -1;
+    if (!p->exists) sqlite3_prepare_v2(p->c, "SELECT 1 FROM mw_runs WHERE run = ?1", -1, &p->exists, NULL);
+    if (p->exists) {
+        sqlite3_bind_int64(p->exists, 1, r->id);
+        bool there = sqlite3_step(p->exists) == SQLITE_ROW; sqlite3_reset(p->exists);
+        if (there && read_block(p->s, p->st, r, blk, data, len)) rc = 0;
+    }
+    sqlite3_exec(p->c, "COMMIT", NULL, NULL, NULL);
     return rc;
 }
 static bool keep_alive (void *ctx, const rs_key *k, int64_t dv, const uint8_t *cells, uint32_t nc) { (void)cells; (void)nc; const mw_rman *m = ctx; return dv >= drop_of(m, k->tbl); }
 
 typedef struct { int (*cb)(void *, uint32_t, const uint8_t *, size_t, const mw_mcell *, int); void *ctx; int err; const mw_rman *m; } scanctx;
-static int scan_emit (void *ctx, uint32_t blkno, const uint8_t *data, size_t len) {
-    (void)blkno; scanctx *sc = ctx; rs_blk b; if (!rs_blk_open(&b, data, len)) return -1;
-    for (uint32_t i = 0; i < b.nrows; i++) {
-        rs_key k; int64_t dv; const uint8_t *cells; uint32_t nc; if (!rs_blk_row(&b, i, &k, &dv, &cells, &nc)) return -1;
-        mw_mcell *c; int n; if (!mw_meta_row_cells(cells, nc, &c, &n)) return -1;
+static int scan_emit (void *ctx, uint32_t blkno, const uint8_t *data, size_t len, const uint8_t **loc, size_t *loclen) {
+    *loc = NULL; *loclen = 0;
+    (void)blkno; scanctx *sc = ctx; rs_blk b; uint8_t *own; if (!rs_blk_unpack(&b, data, len, &own)) return -1;
+    int rcx = 0;
+    for (uint32_t i = 0; !rcx && i < b.nrows; i++) {
+        rs_key k; int64_t dv; const uint8_t *cells; uint32_t nc; if (!rs_blk_row(&b, i, &k, &dv, &cells, &nc)) { rcx = -1; break; }
+        mw_mcell *c; int n; if (!mw_meta_row_cells(cells, nc, &c, &n)) { rcx = -1; break; }
         int64_t dd = drop_of(sc->m, k.tbl); if (dd) { int q = 0; for (int x = 0; x < n; x++) if (c[x].dv >= dd) c[q++] = c[x]; n = q; }
-        int rc = n ? sc->cb(sc->ctx, k.tbl, k.pk, k.pklen, c, n) : 0; free(c); if (rc) return rc;
+        rcx = n ? sc->cb(sc->ctx, k.tbl, k.pk, k.pklen, c, n) : 0; free(c);
     }
-    return 0;
+    free(own);
+    return rcx;
 }
 static int scan_begin (void *sctx, uint64_t hint, rs_emit_fn *emit, void **ec) { (void)hint; *emit = scan_emit; *ec = sctx; return 0; }
 static int scan_end (void *sctx, const uint8_t *meta, size_t ml, uint64_t nr, uint32_t nb, int64_t dv) { (void)sctx; (void)meta; (void)ml; (void)nr; (void)nb; (void)dv; return 0; }
 int rsx_scan_all (mw_rstore *s, sqlite3 *c, int (*cb)(void *, uint32_t, const uint8_t *, size_t, const mw_mcell *, int), void *ctx) {
     mw_rman *m; if (rsx_man(s, c, &m) != 0) return -1;
     if (!m->n) { rsx_man_release(m); return 0; }
-    plainctx pc; if (sqlite3_prepare_v2(c, rsx_blk_sql(), -1, &pc.st, NULL) != SQLITE_OK) { rsx_man_release(m); return -1; }
+    plainctx pc = { s, NULL, c, NULL, false }; if (sqlite3_prepare_v2(c, rsx_blk_sql(), -1, &pc.st, NULL) != SQLITE_OK) { rsx_man_release(m); return -1; }
     scanctx sc = { cb, ctx, 0, m };
     rs_merge_opts o = { plain_read, &pc, true, keep_alive, m, 0, scan_begin, scan_end, &sc };
     int rc = rs_merge(m->runs, m->n, &o, NULL);
@@ -252,11 +334,112 @@ int rsx_scan_all (mw_rstore *s, sqlite3 *c, int (*cb)(void *, uint32_t, const ui
     return rc;
 }
 
+// ---- small transactions ----
+// A transaction of the merge that is not the one that changes the list of runs: no transaction of the flush is held up by it, and when it meets a commit of the writers it is small enough to be
+// done again at no cost. The retry loop of a transaction `fn` on `c`; a flush takes turns with it (they write into the same b-trees).
+typedef int (*small_fn)(void *ctx, sqlite3 *c);
+static int small_txn (mw_rstore *s, sqlite3 *c, small_fn fn, void *ctx) {
+    int rc = SQLITE_BUSY;
+    for (int attempt = 0; attempt < 5000 && busyish(rc); attempt++) {
+        if (attempt) atomic_fetch_add(&s->merge_retries, 1);
+        backoff(attempt);
+        rsx_wlock(s);
+        rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL); if (rc) { rsx_wunlock(s); continue; }
+        rc = fn(ctx, c);
+        if (!rc) rc = sqlite3_exec(c, "COMMIT", NULL, NULL, NULL);
+        if (rc) sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL);
+        rsx_wunlock(s);
+    }
+    return rc;
+}
+
+// ---- slots: taking and giving back ----
+#define RSX_NEED_SLOTS 0x7e5e01                       // (inside: a transaction ran out of the slots that were taken for it)
+static uint32_t compute_slot_bytes (sqlite3 *c) {
+    sqlite3_stmt *st = NULL; int pg = 4096;
+    if (sqlite3_prepare_v2(c, "PRAGMA page_size", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) pg = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    uint32_t sb = ((uint32_t)(pg - 8) / 4 - 12) & ~7u;       // four slots fill a leaf page of the file (their cells, pointers and the header of the page): nothing is wasted, and no slot overflows
+    return sb < 64 ? 64 : sb;
+}
+static void pool_put (mw_rstore *s, const uint32_t *sl, int n) {
+    pthread_mutex_lock(&s->pmu);
+    if (s->npool + (size_t)n > s->cappool) { size_t nc = (s->npool + (size_t)n) * 2 + 256; uint32_t *np = realloc(s->pool, nc * sizeof *np); if (!np) { pthread_mutex_unlock(&s->pmu); return; } s->pool = np; s->cappool = nc; }
+    memcpy(s->pool + s->npool, sl, (size_t)n * sizeof *sl); s->npool += (size_t)n;
+    pthread_mutex_unlock(&s->pmu);
+}
+static int pool_take (mw_rstore *s, int n, uint32_t *out) {                  // 0, or -1 when there are not n (none is taken)
+    pthread_mutex_lock(&s->pmu);
+    if (s->npool < (size_t)n) { pthread_mutex_unlock(&s->pmu); return -1; }
+    s->npool -= (size_t)n; memcpy(out, s->pool + s->npool, (size_t)n * sizeof *out);
+    pthread_mutex_unlock(&s->pmu);
+    return 0;
+}
+// the slots of the free table first (the lowest), then fresh ones past the last in use: taken out of the table (or counted) in one small transaction, and then they are ours
+typedef struct { int want; uint32_t *got; int n; } rsvctx;
+static int rsv_fn (void *ctx, sqlite3 *c) {
+    rsvctx *x = ctx; x->n = 0; sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(c, "SELECT slot FROM mw_free ORDER BY slot LIMIT ?1", -1, &st, NULL); if (rc) return rc;
+    sqlite3_bind_int64(st, 1, x->want);
+    while (x->n < x->want && sqlite3_step(st) == SQLITE_ROW) x->got[x->n++] = (uint32_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    if (x->n) {
+        sqlite3_stmt *d = NULL; rc = sqlite3_prepare_v2(c, "DELETE FROM mw_free WHERE slot <= ?1", -1, &d, NULL); if (rc) return rc;
+        sqlite3_bind_int64(d, 1, x->got[x->n - 1]); rc = sqlite3_step(d); sqlite3_finalize(d); if (rc != SQLITE_DONE) return rc;
+    }
+    if (x->n < x->want) {
+        int64_t next = state_get(c, "next_slot", 1);
+        for (int i = x->n; i < x->want; i++) x->got[i] = (uint32_t)(next + (i - x->n));
+        rc = state_put(c, "next_slot", next + (x->want - x->n)); if (rc) return rc;
+        x->n = x->want;
+    }
+    if (!state_get(c, "slot_bytes", 0)) { rc = state_put(c, "slot_bytes", compute_slot_bytes(c)); if (rc) return rc; }
+    return 0;
+}
+static int pool_reserve (mw_rstore *s, sqlite3 *c, int want) {            // (no transaction of c is open; the writers' turn is taken inside)
+    rsvctx x = { want, malloc((size_t)want * sizeof(uint32_t)), 0 }; if (!x.got) return SQLITE_NOMEM;
+    int rc = small_txn(s, c, rsv_fn, &x);
+    if (!rc) pool_put(s, x.got, x.n);
+    free(x.got); return rc;
+}
+static int pool_ensure (mw_rstore *s, sqlite3 *c, size_t need) {
+    pthread_mutex_lock(&s->pmu); size_t have = s->npool; pthread_mutex_unlock(&s->pmu);
+    if (have >= need) return 0;
+    return pool_reserve(s, c, (int)(need - have) + 64);
+}
+
+// writing the slots of a block (in place when the slot exists: the same size)
+typedef struct { sqlite3_stmt *upd, *ins; uint8_t *pad; uint32_t sb; } slotw;
+static int slotw_open (slotw *w, sqlite3 *c, uint32_t sb) {
+    memset(w, 0, sizeof *w); w->sb = sb; w->pad = malloc(sb); if (!w->pad) return SQLITE_NOMEM;
+    if (sqlite3_prepare_v2(c, "UPDATE mw_slots SET data = ?2 WHERE slot = ?1", -1, &w->upd, NULL) != SQLITE_OK) return sqlite3_errcode(c);
+    if (sqlite3_prepare_v2(c, "INSERT INTO mw_slots(slot, data) VALUES(?1, ?2)", -1, &w->ins, NULL) != SQLITE_OK) return sqlite3_errcode(c);
+    return 0;
+}
+static void slotw_close (slotw *w) { sqlite3_finalize(w->upd); sqlite3_finalize(w->ins); free(w->pad); memset(w, 0, sizeof *w); }
+static int slotw_write (slotw *w, sqlite3 *c, uint32_t slot, int64_t run, uint32_t blk, uint32_t part, const uint8_t *chunk, size_t n) {
+    hdr_put(w->pad, run, blk, part); memcpy(w->pad + SLOT_HDR, chunk, n); if (n + SLOT_HDR < w->sb) memset(w->pad + SLOT_HDR + n, 0, w->sb - SLOT_HDR - n);
+    sqlite3_bind_int64(w->upd, 1, slot); sqlite3_bind_blob(w->upd, 2, w->pad, (int)w->sb, SQLITE_STATIC);
+    int rc = sqlite3_step(w->upd); sqlite3_reset(w->upd);
+    if (rc != SQLITE_DONE) return rc ? rc : -1;
+    if (sqlite3_changes(c) > 0) return 0;
+    sqlite3_bind_int64(w->ins, 1, slot); sqlite3_bind_blob(w->ins, 2, w->pad, (int)w->sb, SQLITE_STATIC);
+    rc = sqlite3_step(w->ins); sqlite3_reset(w->ins);
+    return rc == SQLITE_DONE ? 0 : (rc ? rc : -1);
+}
+// the locator of a block: its slots as varints (in `*buf`, grown as needed)
+static int loc_encode (const uint32_t *sl, int n, uint8_t **buf, size_t *cap, size_t *len) {
+    if (*cap < (size_t)n * 5 + 8) { size_t nc = (size_t)n * 5 + 64; uint8_t *nb = realloc(*buf, nc); if (!nb) return -1; *buf = nb; *cap = nc; }
+    size_t w = 0; for (int i = 0; i < n; i++) w += sl_put(*buf + w, sl[i]);
+    *len = w; return 0;
+}
+
 // ---- writing ----
 struct rsx_tx {
     mw_rstore *s; mw_rman *base; int64_t next_run, next_age;
     rs_run **add; int nadd, capadd; int64_t *rem; int nrem, caprem; rdrop *drops; int nd;
-    sqlite3_stmt *ins_blk, *ins_run;
+    sqlite3_stmt *ins_run; slotw sw; bool sw_open;
+    uint32_t *taken; int ntaken, captaken;                                   // slots taken from the pool for this transaction: back to it if the transaction does not commit
 };
 rsx_tx *rsx_tx_begin (mw_rstore *s, sqlite3 *c) {
     rsx_tx *t = calloc(1, sizeof *t); if (!t) return NULL;
@@ -268,46 +451,76 @@ rsx_tx *rsx_tx_begin (mw_rstore *s, sqlite3 *c) {
     return t;
 }
 static int tx_prepare (rsx_tx *t, sqlite3 *c) {
-    if (!t->ins_blk && sqlite3_prepare_v2(c, "INSERT INTO mw_blocks(run, blk, data) VALUES(?1, ?2, ?3)", -1, &t->ins_blk, NULL) != SQLITE_OK) return sqlite3_errcode(c);
-    if (!t->ins_run && sqlite3_prepare_v2(c, "INSERT INTO mw_runs(run, age, lvl, nrows, nblk, dvmax, meta) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)", -1, &t->ins_run, NULL) != SQLITE_OK) return sqlite3_errcode(c);
+    if (!t->ins_run && sqlite3_prepare_v2(c, "INSERT INTO mw_runs(run, age, lvl, nrows, nblk, dvmax, metalen, metaloc) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", -1, &t->ins_run, NULL) != SQLITE_OK) return sqlite3_errcode(c);
+    if (!t->sw_open) { int rc = slotw_open(&t->sw, c, atomic_load(&t->s->slot_bytes)); if (rc) return rc; t->sw_open = true; }
     return SQLITE_OK;
 }
-typedef struct { rsx_tx *t; int64_t run; } wctx;
-static int emit_db (void *ctx, uint32_t blk, const uint8_t *data, size_t len) {
-    wctx *w = ctx; sqlite3_stmt *st = w->t->ins_blk;
-    sqlite3_bind_int64(st, 1, w->run); sqlite3_bind_int64(st, 2, blk); sqlite3_bind_blob(st, 3, data, (int)len, SQLITE_STATIC);
-    int rc = sqlite3_step(st); sqlite3_reset(st);
-    return rc == SQLITE_DONE ? 0 : (rc ? rc : -1);
+// k slots from the pool for this transaction (they go back to the pool if it does not commit)
+static int tx_take (rsx_tx *t, int k, uint32_t *sl) {
+    if (pool_take(t->s, k, sl) != 0) return RSX_NEED_SLOTS;
+    if (t->ntaken + k > t->captaken) { int nc = (t->ntaken + k) * 2 + 64; uint32_t *nt = realloc(t->taken, (size_t)nc * sizeof *nt); if (!nt) { pool_put(t->s, sl, k); return -1; } t->taken = nt; t->captaken = nc; }
+    memcpy(t->taken + t->ntaken, sl, (size_t)k * sizeof *sl); t->ntaken += k;
+    return 0;
+}
+typedef struct { rsx_tx *t; sqlite3 *c; uint8_t *loc; size_t loccap; int64_t run; } wctx;
+static int emit_db (void *ctx, uint32_t blk, const uint8_t *data, size_t len, const uint8_t **loc, size_t *loclen) {
+    wctx *w = ctx; rsx_tx *t = w->t; uint32_t sb = t->sw.sb - SLOT_HDR;
+    int k = (int)((len + sb - 1) / sb); uint32_t small[16]; uint32_t *sl = k <= 16 ? small : malloc((size_t)k * sizeof *sl); if (!sl) return -1;
+    int rc = tx_take(t, k, sl); if (rc) goto out;
+    for (int j = 0; !rc && j < k; j++) { size_t off = (size_t)j * sb, n = len - off < sb ? len - off : sb; rc = slotw_write(&t->sw, w->c, sl[j], w->run, blk, (uint32_t)j, data + off, n); }
+    if (!rc) { size_t ll; rc = loc_encode(sl, k, &w->loc, &w->loccap, &ll); *loc = w->loc; *loclen = ll; }
+out:
+    if (sl != small) free(sl);
+    return rc;
 }
 static int tx_push_run (rsx_tx *t, rs_run *r) {
     if (t->nadd == t->capadd) { int nc = t->capadd ? t->capadd * 2 : 8; rs_run **na = realloc(t->add, (size_t)nc * sizeof *na); if (!na) return -1; t->add = na; t->capadd = nc; }
     t->add[t->nadd++] = r; return 0;
 }
 static int tx_insert_run (rsx_tx *t, sqlite3 *c, int64_t id, int64_t age, int lvl, const uint8_t *meta, size_t ml, uint64_t nr, uint32_t nb, int64_t dvm) {
-    sqlite3_stmt *st = t->ins_run;
-    sqlite3_bind_int64(st, 1, id); sqlite3_bind_int64(st, 2, age); sqlite3_bind_int64(st, 3, lvl); sqlite3_bind_int64(st, 4, (int64_t)nr); sqlite3_bind_int64(st, 5, nb); sqlite3_bind_int64(st, 6, dvm); sqlite3_bind_blob(st, 7, meta, (int)ml, SQLITE_STATIC);
-    int rc = sqlite3_step(st); sqlite3_reset(st);
-    if (rc != SQLITE_DONE) return rc ? rc : -1;
-    rs_run *r = rs_run_decode(id, age, lvl, nr, nb, dvm, meta, ml); if (!r) return -1;
-    if (tx_push_run(t, r)) { rs_run_unref(r); return -1; }
-    atomic_fetch_add(&t->s->runs_written, 1);
-    (void)c;
-    return 0;
+    uint32_t sb = t->sw.sb - SLOT_HDR; int k = (int)((ml + sb - 1) / sb); uint32_t small[32]; uint32_t *sl = k <= 32 ? small : malloc((size_t)k * sizeof *sl); if (!sl) return -1;
+    uint8_t *loc = NULL; size_t loccap = 0, loclen = 0;
+    int rc = tx_take(t, k, sl);                                                                   // (the meta of the run is kept in slots too: a row with a blob of tens of kilobytes would take pages from the free list)
+    for (int j = 0; !rc && j < k; j++) { size_t off = (size_t)j * sb, n = ml - off < sb ? ml - off : sb; rc = slotw_write(&t->sw, c, sl[j], id, 0xFFFFFFFFu, (uint32_t)j, meta + off, n); }
+    if (!rc) rc = loc_encode(sl, k, &loc, &loccap, &loclen);
+    if (!rc) {
+        sqlite3_stmt *st = t->ins_run;
+        sqlite3_bind_int64(st, 1, id); sqlite3_bind_int64(st, 2, age); sqlite3_bind_int64(st, 3, lvl); sqlite3_bind_int64(st, 4, (int64_t)nr); sqlite3_bind_int64(st, 5, nb); sqlite3_bind_int64(st, 6, dvm);
+        sqlite3_bind_int64(st, 7, (int64_t)ml); sqlite3_bind_blob(st, 8, loc, (int)loclen, SQLITE_STATIC);
+        int r2 = sqlite3_step(st); sqlite3_reset(st);
+        if (r2 != SQLITE_DONE) rc = r2 ? r2 : -1;
+    }
+    if (!rc) {
+        rs_run *r = rs_run_decode(id, age, lvl, nr, nb, dvm, meta, ml);
+        if (!r) rc = -1;
+        else { r->mloc = malloc(loclen ? loclen : 1); if (r->mloc) { memcpy(r->mloc, loc, loclen); r->mlocl = (uint32_t)loclen; } if (tx_push_run(t, r)) { rs_run_unref(r); rc = -1; } else atomic_fetch_add(&t->s->runs_written, 1); }
+    }
+    free(loc); if (sl != small) free(sl);
+    return rc;
+}
+// The slots a flush of the items [i0, i1) can need (the rows as they are, uncompressed, and the end of every block), taken before the transaction starts
+int rsx_reserve_items (mw_rstore *s, sqlite3 *c, const fitem *v, int i0, int i1) {
+    uint32_t sb = atomic_load(&s->slot_bytes);
+    if (!sb) { sb = compute_slot_bytes(c); atomic_store(&s->slot_bytes, sb); }
+    size_t bytes = 0; for (int i = i0; i < i1; i++) bytes += v[i].pklen + v[i].bloblen + 16;
+    size_t rows = (size_t)(i1 - i0), meta = rows * 2 + (bytes / RS_BLOCK_TARGET + 1) * 64 + 4096;       // (the meta of the run: a Bloom filter of 10 bits a row and the fence keys)
+    size_t need = (bytes + meta) / (sb - SLOT_HDR) + bytes / RS_BLOCK_TARGET + 24;
+    return pool_ensure(s, c, need);
 }
 int rsx_tx_add_items (rsx_tx *t, sqlite3 *c, const fitem *v, int i0, int i1) {
     if (i1 <= i0) return 0;
     int rc = tx_prepare(t, c); if (rc) return rc;
-    wctx w = { t, t->next_run++ };
+    int64_t run = t->next_run++; wctx w = { t, c, NULL, 0, run };
     rs_builder *b = rs_builder_new((uint64_t)(i1 - i0), emit_db, &w); if (!b) return SQLITE_NOMEM;
     for (int i = i0; i < i1; i++) {
         if (i + 1 < i1 && v[i].tbl == v[i + 1].tbl && v[i].pklen == v[i + 1].pklen && !memcmp(v[i].pk, v[i + 1].pk, v[i].pklen)) continue;           // (the same key twice: the later one stands)
         rs_key k = { v[i].tbl, v[i].pk, v[i].pklen };
         rc = rs_builder_add(b, &k, v[i].n ? v[i].dv : 0, v[i].n ? v[i].blob : NULL, v[i].n ? v[i].bloblen : 0);
-        if (rc) { rs_builder_free(b); return rc; }
+        if (rc) { rs_builder_free(b); free(w.loc); return rc; }
     }
     uint8_t *meta; size_t ml; uint64_t nr; uint32_t nb; int64_t dvm;
-    rc = rs_builder_finish(b, &meta, &ml, &nr, &nb, &dvm); if (rc) return rc;
-    rc = tx_insert_run(t, c, w.run, t->next_age++, 0, meta, ml, nr, nb, dvm); free(meta);
+    rc = rs_builder_finish(b, &meta, &ml, &nr, &nb, &dvm); free(w.loc); if (rc) return rc;
+    rc = tx_insert_run(t, c, run, t->next_age++, 0, meta, ml, nr, nb, dvm); free(meta);
     return rc;
 }
 int rsx_tx_drop_table (rsx_tx *t, sqlite3 *c, uint32_t tbl, int64_t dv) {
@@ -321,15 +534,23 @@ int rsx_tx_drop_table (rsx_tx *t, sqlite3 *c, uint32_t tbl, int64_t dv) {
     t->drops = nd; t->drops[t->nd++] = (rdrop){ tbl, dv };
     return SQLITE_OK;
 }
-static int tx_remove_run (rsx_tx *t, sqlite3 *c, int64_t id) {
-    sqlite3_stmt *st = NULL; int rc = sqlite3_prepare_v2(c, "DELETE FROM mw_blocks WHERE run = ?1", -1, &st, NULL);
-    if (rc == SQLITE_OK) { sqlite3_bind_int64(st, 1, id); rc = sqlite3_step(st); sqlite3_finalize(st); if (rc != SQLITE_DONE) return rc ? rc : -1; }
-    else return rc;
-    st = NULL; rc = sqlite3_prepare_v2(c, "DELETE FROM mw_runs WHERE run = ?1", -1, &st, NULL);
-    if (rc == SQLITE_OK) { sqlite3_bind_int64(st, 1, id); rc = sqlite3_step(st); sqlite3_finalize(st); if (rc != SQLITE_DONE) return rc ? rc : -1; }
-    else return rc;
+// the run stops existing here, and its slots are free: the next run takes them
+static int tx_remove_run (rsx_tx *t, sqlite3 *c, const rs_run *r) {
+    sqlite3_stmt *st = NULL; int rc = sqlite3_prepare_v2(c, "DELETE FROM mw_runs WHERE run = ?1", -1, &st, NULL);
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_int64(st, 1, r->id); rc = sqlite3_step(st); sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return rc ? rc : -1;
+    st = NULL; rc = sqlite3_prepare_v2(c, "INSERT OR IGNORE INTO mw_free(slot) VALUES(?1)", -1, &st, NULL); if (rc) return rc;
+    for (uint32_t b = 0; b < r->nblk && !rc; b++) {
+        uint32_t stored, loclen; const uint8_t *loc; rs_run_block_info(r, b, &stored, &loc, &loclen);
+        const uint8_t *p = loc, *end = loc + loclen; uint64_t slot;
+        while (!rc && sl_get(&p, end, &slot)) { sqlite3_bind_int64(st, 1, (int64_t)slot); rc = sqlite3_step(st); sqlite3_reset(st); if (rc == SQLITE_DONE) rc = 0; }
+    }
+    if (!rc && r->mloc) { const uint8_t *p = r->mloc, *end = r->mloc + r->mlocl; uint64_t slot; while (!rc && sl_get(&p, end, &slot)) { sqlite3_bind_int64(st, 1, (int64_t)slot); rc = sqlite3_step(st); sqlite3_reset(st); if (rc == SQLITE_DONE) rc = 0; } }
+    sqlite3_finalize(st);
+    if (rc) return rc;
     if (t->nrem == t->caprem) { int nc = t->caprem ? t->caprem * 2 : 8; int64_t *nr = realloc(t->rem, (size_t)nc * sizeof *nr); if (!nr) return SQLITE_NOMEM; t->rem = nr; t->caprem = nc; }
-    t->rem[t->nrem++] = id;
+    t->rem[t->nrem++] = r->id;
     return SQLITE_OK;
 }
 int rsx_tx_finish (rsx_tx *t, sqlite3 *c) {
@@ -340,7 +561,8 @@ int rsx_tx_finish (rsx_tx *t, sqlite3 *c) {
 }
 void rsx_tx_end (rsx_tx *t, bool committed) {
     if (!t) return;
-    sqlite3_finalize(t->ins_blk); sqlite3_finalize(t->ins_run);
+    sqlite3_finalize(t->ins_run); if (t->sw_open) slotw_close(&t->sw);
+    if (!committed && t->ntaken) pool_put(t->s, t->taken, t->ntaken);                      // (the slots were not used: they stay ours)
     if (committed && (t->nadd || t->nrem || t->nd)) {
         mw_rman *nm = calloc(1, sizeof *nm); mw_rman *b = t->base;
         if (nm) {
@@ -353,52 +575,123 @@ void rsx_tx_end (rsx_tx *t, bool committed) {
                 for (int i = 0; i < t->nd; i++) nm->drops[nm->nd++] = t->drops[i];
                 qsort(nm->runs, (size_t)nm->n, sizeof *nm->runs, run_newest_first);
                 pthread_mutex_lock(&t->s->mu);
-                if (!t->s->cur || t->s->cur->ver < nm->ver) { mw_rman *o = t->s->cur; t->s->cur = nm; pthread_mutex_unlock(&t->s->mu); rsx_man_release(o); nm = NULL; }
+                if (!t->s->cur || t->s->cur->ver < nm->ver) { mw_rman *o = t->s->cur; t->s->cur = nm; backlog_update(t->s, nm); pthread_mutex_unlock(&t->s->mu); rsx_man_release(o); nm = NULL; }
                 else pthread_mutex_unlock(&t->s->mu);
             }
             if (nm) rsx_man_release(nm);
         }
     }
     for (int i = 0; i < t->nadd; i++) rs_run_unref(t->add[i]);
-    free(t->add); free(t->rem); free(t->drops); rsx_man_release(t->base); free(t);
+    free(t->add); free(t->rem); free(t->drops); free(t->taken); rsx_man_release(t->base); free(t);
 }
 
 // ---- merging ----
-typedef struct { uint32_t blk; uint8_t *d; size_t len; } oblk;
+typedef struct { uint32_t blk; uint8_t *d; size_t len; uint32_t *sl; int nsl; } oblk;
+static int id_fn (void *ctx, sqlite3 *c);
 typedef struct {
     mw_rstore *s; sqlite3 *wr; int out_lvl; int64_t out_age; const mw_rman *man;
-    oblk *blks; int nblks, capblks; int err;
+    oblk *blks; int nblks, capblks; uint8_t *loc; size_t loccap; int64_t part_id;      // part_id: the number of the run being written (taken before its first block)
 } mctx;
-static void mctx_clear (mctx *m) { for (int i = 0; i < m->nblks; i++) free(m->blks[i].d); m->nblks = 0; }
-static int m_emit (void *ctx, uint32_t blk, const uint8_t *d, size_t len) {
-    mctx *m = ctx;
+static void mctx_clear (mctx *m) { for (int i = 0; i < m->nblks; i++) { free(m->blks[i].d); free(m->blks[i].sl); } m->nblks = 0; }
+// a block of the output: its slots are chosen now (the locator goes into the meta), the data is written later, a few blocks to a transaction
+static int m_emit (void *ctx, uint32_t blk, const uint8_t *d, size_t len, const uint8_t **loc, size_t *loclen) {
+    mctx *m = ctx; uint32_t sb = atomic_load(&m->s->slot_bytes) - SLOT_HDR; int k = (int)((len + sb - 1) / sb);
     if (m->nblks == m->capblks) { int nc = m->capblks ? m->capblks * 2 : 64; oblk *nb = realloc(m->blks, (size_t)nc * sizeof *nb); if (!nb) return -1; m->blks = nb; m->capblks = nc; }
-    uint8_t *cp = malloc(len); if (!cp) return -1; memcpy(cp, d, len);
-    m->blks[m->nblks++] = (oblk){ blk, cp, len };
+    if (pool_ensure(m->s, m->wr, (size_t)k + 16) != 0) return -1;
+    uint32_t *sl = malloc((size_t)k * sizeof *sl); uint8_t *cp = malloc(len); if (!sl || !cp) { free(sl); free(cp); return -1; }
+    if (pool_take(m->s, k, sl) != 0) { free(sl); free(cp); return -1; }
+    memcpy(cp, d, len);
+    m->blks[m->nblks++] = (oblk){ blk, cp, len, sl, k };
+    size_t ll; if (loc_encode(sl, k, &m->loc, &m->loccap, &ll) != 0) return -1;
+    *loc = m->loc; *loclen = ll;
     return 0;
 }
-static int m_begin (void *sctx, uint64_t hint, rs_emit_fn *emit, void **ec) { (void)hint; mctx_clear(sctx); *emit = m_emit; *ec = sctx; return 0; }
+typedef struct { mw_rstore *s; int64_t id; } idctx;
+static int m_begin (void *sctx, uint64_t hint, rs_emit_fn *emit, void **ec) {
+    (void)hint; mctx *m = sctx; mctx_clear(m);
+    idctx ic = { m->s, 0 }; int rc = small_txn(m->s, m->wr, id_fn, &ic); if (rc) return rc;
+    m->part_id = ic.id; *emit = m_emit; *ec = sctx; return 0;
+}
+// the number of a new run is taken (and recorded) before anything is written under it: whoever flushes meanwhile gets another one
+static int id_fn (void *ctx, sqlite3 *c) {
+    idctx *x = ctx; mw_rman *man = NULL; int rc = rsx_man(x->s, c, &man); if (rc) return -1;
+    int64_t maxid = 0; for (int i = 0; i < man->n; i++) if (man->runs[i]->id > maxid) maxid = man->runs[i]->id;
+    rsx_man_release(man);
+    int64_t next = state_get(c, "next_run", 1); if (next <= maxid) next = maxid + 1;
+    x->id = next;
+    return state_put(c, "next_run", next + 1);
+}
+// the slots of blocks [i0, i1) of the part
+typedef struct { const oblk *b; int i0, i1; uint32_t sb; int64_t run; } bctx;
+static int blocks_fn (void *ctx, sqlite3 *c) {
+    bctx *x = ctx; slotw w; int rc = slotw_open(&w, c, x->sb);
+    uint32_t pl = x->sb - SLOT_HDR;
+    for (int i = x->i0; !rc && i < x->i1; i++)
+        for (int j = 0; !rc && j < x->b[i].nsl; j++) { size_t off = (size_t)j * pl, n = x->b[i].len - off < pl ? x->b[i].len - off : pl; rc = slotw_write(&w, c, x->b[i].sl[j], x->run, x->b[i].blk, (uint32_t)j, x->b[i].d + off, n); }
+    slotw_close(&w); return rc;
+}
+static void part_slots_back (mctx *m) { for (int i = 0; i < m->nblks; i++) pool_put(m->s, m->blks[i].sl, m->blks[i].nsl); }
+
 static int m_end (void *sctx, const uint8_t *meta, size_t ml, uint64_t nr, uint32_t nb, int64_t dvm) {
-    mctx *m = sctx; sqlite3 *c = m->wr; int rc = SQLITE_BUSY;
-    for (int attempt = 0; attempt < 400 && busyish(rc); attempt++) {
-        if (attempt) usleep(1000u * (unsigned)(attempt < 20 ? attempt : 20));
+    mctx *m = sctx; sqlite3 *c = m->wr; int rc;
+    idctx ic = { m->s, m->part_id }; rc = 0;
+    uint32_t sb = atomic_load(&m->s->slot_bytes);
+    for (int i = 0; i < m->nblks && !rc; i += 24) {                                              // the slots, a few blocks to a transaction: nobody can see them until the run has a row
+        bctx b = { m->blks, i, i + 24 < m->nblks ? i + 24 : m->nblks, sb, ic.id };
+        rc = small_txn(m->s, c, blocks_fn, &b);
+    }
+    if (!rc) rc = pool_ensure(m->s, c, ml / (sb - SLOT_HDR) + 16);
+    for (int attempt = 0; !rc && attempt < 5000 && (attempt == 0 || busyish(rc)); attempt++) {     // the row of the run and the version of the list: one small transaction
+        if (attempt) atomic_fetch_add(&m->s->merge_retries, 1);
+        backoff(attempt);
         rsx_wlock(m->s);
         rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL); if (rc) { rsx_wunlock(m->s); continue; }
         rsx_tx *t = rsx_tx_begin(m->s, c);
         if (!t) { sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL); rsx_wunlock(m->s); rc = SQLITE_NOMEM; break; }
         rc = tx_prepare(t, c);
-        int64_t id = t->next_run++;
-        wctx w = { t, id };
-        for (int i = 0; !rc && i < m->nblks; i++) rc = emit_db(&w, m->blks[i].blk, m->blks[i].d, m->blks[i].len);
-        if (!rc) rc = tx_insert_run(t, c, id, m->out_age, m->out_lvl, meta, ml, nr, nb, dvm);
+        if (!rc) rc = tx_insert_run(t, c, ic.id, m->out_age, m->out_lvl, meta, ml, nr, nb, dvm);
         if (!rc) rc = rsx_tx_finish(t, c);
         if (!rc) rc = sqlite3_exec(c, "COMMIT", NULL, NULL, NULL);
         if (rc) sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL);
         rsx_tx_end(t, rc == SQLITE_OK);
         rsx_wunlock(m->s);
+        if (rc == RSX_NEED_SLOTS) { rc = pool_ensure(m->s, c, ml / (sb - SLOT_HDR) + 64) ? -1 : SQLITE_BUSY; }
     }
+    if (rc) part_slots_back(m);                                                                   // (no run came of it: its slots stay ours)
     mctx_clear(m);
     return rc;
+}
+// Slots that nobody has (a process that died between taking slots and writing the run, a merge that failed): in the table, in no run, not free, not in our hands. Found by comparing, and given
+// to the free table. Several processes hold slots in memory that look the same: only for a database that this process alone uses.
+int rsx_sweep (mw_rstore *s, sqlite3 *rd, sqlite3 *wr) {
+    (void)rd;
+    rsx_wlock(s);
+    int rc = sqlite3_exec(wr, "BEGIN", NULL, NULL, NULL); int leaked = 0;
+    mw_rman *man = NULL; uint8_t *mark = NULL; int64_t maxslot = 0;
+    if (!rc) rc = rsx_man(s, wr, &man);
+    if (!rc) { sqlite3_stmt *q = NULL; if (sqlite3_prepare_v2(wr, "SELECT coalesce(max(slot), 0) FROM mw_slots", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) maxslot = sqlite3_column_int64(q, 0); sqlite3_finalize(q); }
+    if (!rc && maxslot > 0) {
+        mark = calloc((size_t)maxslot + 2, 1); if (!mark) rc = SQLITE_NOMEM;
+        for (int ri = 0; !rc && ri < man->n; ri++) for (uint32_t b = 0; b < man->runs[ri]->nblk; b++) {
+            uint32_t stored, ll; const uint8_t *loc; rs_run_block_info(man->runs[ri], b, &stored, &loc, &ll);
+            const uint8_t *p = loc, *end = loc + ll; uint64_t sl; while (sl_get(&p, end, &sl)) if ((int64_t)sl <= maxslot) mark[sl] = 1;
+        }
+        for (int ri = 0; !rc && ri < man->n; ri++) if (man->runs[ri]->mloc) { const uint8_t *p = man->runs[ri]->mloc, *end = p + man->runs[ri]->mlocl; uint64_t sl; while (sl_get(&p, end, &sl)) if ((int64_t)sl <= maxslot) mark[sl] = 1; }
+        sqlite3_stmt *q = NULL;
+        if (!rc && sqlite3_prepare_v2(wr, "SELECT slot FROM mw_free", -1, &q, NULL) == SQLITE_OK) { while (sqlite3_step(q) == SQLITE_ROW) { int64_t sl = sqlite3_column_int64(q, 0); if (sl > 0 && sl <= maxslot) mark[sl] = 1; } }
+        sqlite3_finalize(q);
+        pthread_mutex_lock(&s->pmu); for (size_t i = 0; i < s->npool; i++) if (s->pool[i] <= (uint64_t)maxslot) mark[s->pool[i]] = 1; pthread_mutex_unlock(&s->pmu);
+        q = NULL; sqlite3_stmt *ins = NULL;
+        if (!rc && sqlite3_prepare_v2(wr, "SELECT slot FROM mw_slots", -1, &q, NULL) == SQLITE_OK && sqlite3_prepare_v2(wr, "INSERT OR IGNORE INTO mw_free(slot) VALUES(?1)", -1, &ins, NULL) == SQLITE_OK) {
+            while (!rc && sqlite3_step(q) == SQLITE_ROW) { int64_t sl = sqlite3_column_int64(q, 0); if (sl > 0 && sl <= maxslot && !mark[sl]) { sqlite3_bind_int64(ins, 1, sl); int r2 = sqlite3_step(ins); sqlite3_reset(ins); if (r2 != SQLITE_DONE) rc = r2; else leaked++; } }
+        }
+        sqlite3_finalize(q); sqlite3_finalize(ins);
+    }
+    free(mark); rsx_man_release(man);
+    if (!rc) rc = sqlite3_exec(wr, "COMMIT", NULL, NULL, NULL);
+    if (rc) sqlite3_exec(wr, "ROLLBACK", NULL, NULL, NULL);
+    rsx_wunlock(s);
+    return rc ? -1 : leaked;
 }
 int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, int fanout, uint64_t part_rows) {
     mw_rman *man = NULL;
@@ -421,22 +714,30 @@ int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, int fanout, uint64_t part
       }
       // (collected oldest first: the merge wants the newest first)
       for (int a = 0, b = nin - 1; a < b; a++, b--) { rs_run *t = in[a]; in[a] = in[b]; in[b] = t; } }
-    bool bottom = true; for (int i = 0; i < man->n; i++) if (man->runs[i]->age < minage) bottom = false;
-    plainctx pc; if (sqlite3_prepare_v2(rd, rsx_blk_sql(), -1, &pc.st, NULL) != SQLITE_OK) { free(in); rsx_man_release(man); return -1; }
-    mctx mc = { s, wr, lvl + 1, in[0]->age, man, NULL, 0, 0, 0 };
+    // The output is the oldest data (it may drop what shows that a row is gone) only when no run outside the merge could hold an older version: none with an age up to the output's. (After a merge that
+    // was interrupted a run of the same age as an input, or in between, can exist: comparing with the oldest input would drop a mark that still hides something.)
+    bool bottom = true;
+    for (int i = 0; i < man->n; i++) { bool is_in = false; for (int j = 0; j < nin; j++) if (in[j] == man->runs[i]) is_in = true; if (!is_in && man->runs[i]->age <= in[0]->age) bottom = false; }
+    (void)minage;
+    plainctx pc = { s, NULL, rd, NULL, true }; if (sqlite3_prepare_v2(rd, rsx_blk_sql(), -1, &pc.st, NULL) != SQLITE_OK) { free(in); rsx_man_release(man); return -1; }
+    mctx mc = { s, wr, lvl + 1, in[0]->age, man, NULL, 0, 0, NULL, 0, 0 };
     rs_merge_opts o = { plain_read, &pc, bottom, keep_alive, man, part_rows, m_begin, m_end, &mc };
     uint64_t rows = 0;
     rc = rs_merge(in, nin, &o, &rows);
-    mctx_clear(&mc); free(mc.blks); sqlite3_finalize(pc.st);
-    if (!rc) {                                                                                  // the inputs go last: until then the rows are in both
+    mctx_clear(&mc); free(mc.blks); free(mc.loc); sqlite3_finalize(pc.st); sqlite3_finalize(pc.exists);
+    // The inputs go last, one run to a transaction (its row goes and its slots are free), the OLDEST first: if the merge is interrupted what is left of the inputs is always the newest of them. The output
+    // has the age of the newest input, so it still hides what is left (which it holds); a later merge of what is left with newer runs makes an output that is not older than anything it is missing.
+    // (Newest first, the oldest would be left: merged with newer runs they would give an output that hides the newer versions that the first output holds.)
+    for (int i = nin - 1; !rc && i >= 0; i--) {
         rc = SQLITE_BUSY;
-        for (int attempt = 0; attempt < 400 && busyish(rc); attempt++) {
-            if (attempt) usleep(1000u * (unsigned)(attempt < 20 ? attempt : 20));
+        for (int attempt = 0; attempt < 5000 && busyish(rc); attempt++) {
+            if (attempt) atomic_fetch_add(&s->merge_retries, 1);
+            backoff(attempt);
             rsx_wlock(s);
             rc = sqlite3_exec(wr, "BEGIN", NULL, NULL, NULL); if (rc) { rsx_wunlock(s); continue; }
             rsx_tx *t = rsx_tx_begin(s, wr);
             if (!t) { sqlite3_exec(wr, "ROLLBACK", NULL, NULL, NULL); rsx_wunlock(s); rc = SQLITE_NOMEM; break; }
-            for (int i = 0; !rc && i < nin; i++) rc = tx_remove_run(t, wr, in[i]->id);
+            rc = tx_remove_run(t, wr, in[i]);
             if (!rc) rc = rsx_tx_finish(t, wr);
             if (!rc) rc = sqlite3_exec(wr, "COMMIT", NULL, NULL, NULL);
             if (rc) sqlite3_exec(wr, "ROLLBACK", NULL, NULL, NULL);
@@ -449,3 +750,6 @@ int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, int fanout, uint64_t part
     atomic_fetch_add(&s->merges, 1); atomic_fetch_add(&s->merged_rows, rows);
     return 1;
 }
+
+
+

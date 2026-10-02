@@ -22,7 +22,7 @@ static int store_read (void *ctx, const rs_run *r, uint32_t blk, uint8_t **data,
 // ---- the runs ----
 static rs_run *runs[4096]; static int nruns; static int64_t next_id = 1, next_age = 1;
 static int64_t cur_run;
-static int emit_blk (void *ctx, uint32_t blk, const uint8_t *d, size_t len) { (void)ctx; store_put(cur_run, blk, d, len); return 0; }
+static int emit_blk (void *ctx, uint32_t blk, const uint8_t *d, size_t len, const uint8_t **loc, size_t *loclen) { (void)ctx; store_put(cur_run, blk, d, len); static uint8_t lc[3]; lc[0] = (uint8_t)blk; lc[1] = (uint8_t)(cur_run & 0x7f); *loc = lc; *loclen = 2; return 0; }
 
 // ---- the model ----
 #define NKEYS 6000
@@ -38,10 +38,10 @@ static int lookup (const rs_key *k, int64_t *dv, uint8_t *out, uint32_t *nc) {
         if (!rs_run_maybe(runs[i], k)) continue;
         int b = rs_run_block_of(runs[i], k); if (b < 0) continue;
         uint8_t *d; size_t l; if (store_read(NULL, runs[i], (uint32_t)b, &d, &l)) return -2;
-        rs_blk blk; if (!rs_blk_open(&blk, d, l)) { free(d); return -3; }
+        rs_blk blk; uint8_t *own; if (!rs_blk_unpack(&blk, d, l, &own)) { free(d); return -3; }
         const uint8_t *c; uint32_t n; int64_t v; int f = rs_blk_find(&blk, k, &v, &c, &n);
-        if (f == 1) { *dv = v; *nc = n; if (n) memcpy(out, c, n); free(d); return n ? 1 : 0; }
-        free(d); if (f < 0) return -4;
+        if (f == 1) { *dv = v; *nc = n; if (n) memcpy(out, c, n); free(own); free(d); return n ? 1 : 0; }
+        free(own); free(d); if (f < 0) return -4;
     }
     return 0;
 }
@@ -136,11 +136,11 @@ int main (void) {
         for (int t = 0; t < 3000; t++) {
             sblk *s = &blks[rnd() % nblks]; uint8_t *d = malloc(s->len); memcpy(d, s->d, s->len);
             size_t len = s->len; if (rnd() & 1) len = rnd() % s->len; else d[rnd() % s->len] ^= (uint8_t)(1 + rnd() % 255);
-            rs_blk b; tried++;
-            if (!rs_blk_open(&b, d, len)) { refused++; free(d); continue; }
+            rs_blk b; uint8_t *own; tried++;
+            if (!rs_blk_unpack(&b, d, len, &own)) { refused++; free(d); continue; }
             for (uint32_t i = 0; i < b.nrows; i++) { rs_key k; int64_t v; const uint8_t *c; uint32_t nc; (void)rs_blk_row(&b, i, &k, &v, &c, &nc); }       // (never reads outside the block: ASan checks)
             rs_key probe = { 1, (const uint8_t *)"zz", 2 }; int64_t v; const uint8_t *c; uint32_t nc; (void)rs_blk_find(&b, &probe, &v, &c, &nc);
-            free(d);
+            free(own); free(d);
         }
         printf("%d damaged blocks: %d refused at once, the others read without leaving their bytes\n", tried, refused);
     }

@@ -91,5 +91,10 @@ oracle-test: $(ORACLE_TEST_BIN)
 
 # the metadata tests again with the shared multi-process mode (mw_mp=1) in place of the thread mode
 .PHONY: test-mp
+# the metadata tests with the store under pressure: a cache of one megabyte (rows are read from the runs), a flush after every row, merges of two runs in parts of 40 rows
+STRESS_TESTS := mw_runstore mw_metastore mw_ddl_meta mw_sync mw_mpmeta oracle_meta oracle_sync
+test-stress: $(addprefix $(DIST)/,$(STRESS_TESTS))
+	@set -e; for t in $(STRESS_TESTS); do echo "== $$t (under pressure)"; MW_META_CACHE_MB=1 MW_META_FANOUT=2 MW_META_PART_ROWS=40 MW_META_FLUSH_ROWS=1 MW_META_FLUSH_MS=1 ./$(DIST)/$$t; done
+
 test-mp: $(DIST)/mw_metastore $(DIST)/mw_ddl_meta $(DIST)/mw_sync $(DIST)/oracle_meta $(DIST)/oracle_sync $(DIST)/mw_mpmeta $(DIST)/mw_runstore
 	@set -e; for t in mw_metastore mw_ddl_meta mw_sync oracle_meta oracle_sync mw_mpmeta mw_runstore; do echo "== $$t (mw_mp=1)"; MW_TEST_MP=1 ./$(DIST)/$$t; done

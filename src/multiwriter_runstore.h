@@ -3,7 +3,7 @@
 //
 //  The CRDT metadata of the database file as sorted runs (multiwriter_runs.h) kept in ordinary tables of the file itself:
 //    mw_runs(run, age, lvl, nrows, nblk, dvmax, meta)   one row per run: its meta (fence keys, Bloom filter) is loaded into memory
-//    mw_blocks(run, blk, data)                          the blocks of the runs (about 16 KB each)
+//    mw_slots(slot, data), mw_free(slot)                the blocks of the runs (about 16 KB, compressed), in rows of a fixed size that are reused in place; the slots nobody uses
 //    mw_drops(tbl, dv)                                  tables that were dropped: their cells older than dv are dead
 //    mw_state: runs_ver (changes with every transaction that adds or removes runs), next_run, next_age
 //  A flush writes one run for every chunk of rows; runs of one level are merged into the next one (every merge is a few ordinary transactions: the new parts first, the inputs removed last,
@@ -40,6 +40,8 @@ int rsx_scan_all (mw_rstore *s, sqlite3 *c, int (*cb)(void *ctx, uint32_t tbl, c
 // ---- writing (the flusher; one thread at a time) ----
 void rsx_wlock (mw_rstore *s);                                              // one write transaction on the runs at a time (a flush's, a merge's): held from BEGIN to COMMIT
 void rsx_wunlock (mw_rstore *s);
+#define RSX_NEED_SLOTS 0x7e5e01                       // returned by rsx_tx_add_items when the slots taken for it ran out: roll back, reserve more, try again
+int rsx_reserve_items (mw_rstore *s, sqlite3 *c, const fitem *v, int i0, int i1);   // slots for a flush of the items, taken before its transaction starts (outside any transaction of c)
 typedef struct rsx_tx rsx_tx;
 rsx_tx *rsx_tx_begin (mw_rstore *s, sqlite3 *c);                           // in an open transaction of c; NULL: error
 // a run of level 0 from the items [i0, i1) of a batch in key order
@@ -50,7 +52,12 @@ void rsx_tx_end (rsx_tx *t, bool committed);                                // a
 // one round of merging: the runs of the lowest level that has `fanout` or more age groups into the next level. Returns 1 if it merged, 0 if there was nothing to do, <0 an error.
 int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, int fanout, uint64_t part_rows);
 
-typedef struct { uint64_t gets, run_probes, bloom_skips, blk_reads, cache_hits, merges, merged_rows, runs_written; int nruns; } rsx_stats;
+// how far the merges are behind: the age groups at level 0 and in all
+void rsx_backlog (mw_rstore *s, int *l0, int *total);
+
+int rsx_sweep (mw_rstore *s, sqlite3 *rd, sqlite3 *wr);   // removes the blocks of runs that have no row (what a dead merge left); returns how many runs it found
+
+typedef struct { uint64_t gets, run_probes, bloom_skips, blk_reads, cache_hits, merges, merged_rows, runs_written, merge_retries; int nruns; } rsx_stats;
 void rsx_stats_get (mw_rstore *s, rsx_stats *out);
 
 #endif

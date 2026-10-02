@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "multiwriter_runs.h"
+#include "lz4.h"
 
 // ---- varints ----
 static size_t put_var (uint8_t *p, uint64_t v) { size_t n = 0; while (v >= 0x80) { p[n++] = (uint8_t)(v | 0x80); v >>= 7; } p[n++] = (uint8_t)v; return n; }
@@ -46,6 +47,19 @@ static bool bloom_test (const uint64_t *bits, uint64_t nbits, uint64_t h) {
 }
 
 // ---- a block ----
+bool rs_blk_unpack (rs_blk *b, const uint8_t *data, size_t len, uint8_t **owned) {
+    *owned = NULL;
+    if (len < 1) return false;
+    if (data[0] == 1) return rs_blk_open(b, data, len);
+    if (data[0] != 2 || len < 6) return false;
+    uint32_t raw = rd32(data + 1);
+    if (raw < 5 || raw > (64u << 20)) return false;
+    uint8_t *buf = malloc(raw); if (!buf) return false;
+    int n = LZ4_decompress_safe((const char *)data + 5, (char *)buf, (int)(len - 5), (int)raw);
+    if (n != (int)raw || !rs_blk_open(b, buf, raw)) { free(buf); return false; }
+    *owned = buf;
+    return true;
+}
 bool rs_blk_open (rs_blk *b, const uint8_t *data, size_t len) {
     if (len < 5 || data[0] != 1) return false;
     uint32_t n = rd32(data + 1);
@@ -80,17 +94,19 @@ int rs_blk_find (const rs_blk *b, const rs_key *k, int64_t *dv, const uint8_t **
 // ---- a run ----
 rs_run *rs_run_decode (int64_t id, int64_t age, int lvl, uint64_t nrows, uint32_t nblk, int64_t dvmax, const uint8_t *meta, size_t len) {
     const uint8_t *p = meta, *end = meta + len; uint64_t v, nf;
-    if (len < 2 || *p++ != 1 || !get_var(&p, end, &nf) || nf == 0 || nf > (1u << 26) || nf != nblk) return NULL;
+    if (len < 2 || *p++ != 2 || !get_var(&p, end, &nf) || nf == 0 || nf > (1u << 26) || nf != nblk) return NULL;
     rs_run *r = calloc(1, sizeof *r); if (!r) return NULL;
     r->id = id; r->age = age; r->lvl = lvl; r->nrows = nrows; r->nblk = nblk; r->dvmax = dvmax; r->nfence = (uint32_t)nf; atomic_init(&r->refs, 1);
     r->ftbl = malloc(nf * 4); r->foff = malloc(nf * 4); r->flen = malloc(nf * 4); r->fdv = malloc(nf * 8); r->farena = malloc((size_t)(end - p) + 1);
-    if (!r->ftbl || !r->foff || !r->flen || !r->fdv || !r->farena) goto bad;
-    size_t fa = 0;
+    r->slen = malloc(nf * 4); r->loff = malloc(nf * 4); r->llen = malloc(nf * 4); r->larena = malloc((size_t)(end - p) + 1);
+    if (!r->ftbl || !r->foff || !r->flen || !r->fdv || !r->farena || !r->slen || !r->loff || !r->llen || !r->larena) goto bad;
+    size_t fa = 0, la = 0;
     for (uint64_t i = 0; i < nf; i++) {
-        uint64_t t, l, d;
+        uint64_t t, l, d, sl, ll;
         if (!get_var(&p, end, &t) || !get_var(&p, end, &l) || l > (uint64_t)(end - p)) goto bad;
         memcpy(r->farena + fa, p, l); p += l;
-        if (!get_var(&p, end, &d)) goto bad;
+        if (!get_var(&p, end, &d) || !get_var(&p, end, &sl) || !get_var(&p, end, &ll) || ll > (uint64_t)(end - p) || sl > (1u << 30)) goto bad;
+        memcpy(r->larena + la, p, ll); p += ll; r->slen[i] = (uint32_t)sl; r->loff[i] = (uint32_t)la; r->llen[i] = (uint32_t)ll; la += ll;
         r->ftbl[i] = (uint32_t)t; r->foff[i] = (uint32_t)fa; r->flen[i] = (uint32_t)l; r->fdv[i] = (int64_t)d; fa += l;
     }
     uint64_t kt, kl;
@@ -110,8 +126,9 @@ bad:
 void rs_run_ref (rs_run *r) { atomic_fetch_add(&r->refs, 1); }
 void rs_run_unref (rs_run *r) {
     if (!r || atomic_fetch_sub(&r->refs, 1) != 1) return;
-    free(r->ftbl); free(r->foff); free(r->flen); free(r->fdv); free(r->farena); free(r->kmaxk); free(r->bloom); free(r);
+    free(r->mloc); free(r->ftbl); free(r->foff); free(r->flen); free(r->fdv); free(r->farena); free(r->slen); free(r->loff); free(r->llen); free(r->larena); free(r->kmaxk); free(r->bloom); free(r);
 }
+void rs_run_block_info (const rs_run *r, uint32_t blk, uint32_t *stored_len, const uint8_t **loc, uint32_t *loclen) { *stored_len = r->slen[blk]; *loc = r->larena + r->loff[blk]; *loclen = r->llen[blk]; }
 static rs_key fence_key (const rs_run *r, uint32_t i) { return (rs_key){ r->ftbl[i], r->farena + r->foff[i], r->flen[i] }; }
 bool rs_run_range (const rs_run *r, rs_key *lo, rs_key *hi) { *lo = fence_key(r, 0); *hi = (rs_key){ r->kmaxtbl, r->kmaxk, r->kmaxl }; return true; }
 int rs_run_block_of (const rs_run *r, const rs_key *k) {
@@ -133,6 +150,7 @@ struct rs_builder {
     uint8_t *first; size_t firstcap; uint32_t firsttbl, firstl; int64_t bdv;
     uint32_t blkno; uint64_t total; int64_t dvmax;
     uint32_t nf, capf; uint32_t *ftbl, *foff, *flen; int64_t *fdv; uint8_t *farena; size_t farn, farcap;
+    uint32_t *slen, *loff, *llen; uint8_t *larena; size_t larn, larcap;
     uint8_t *last; size_t lastcap; uint32_t lasttbl, lastl;
     uint64_t *bloom; uint64_t nbits;
 };
@@ -146,7 +164,7 @@ rs_builder *rs_builder_new (uint64_t nrows_hint, rs_emit_fn emit, void *ctx) {
 }
 void rs_builder_free (rs_builder *b) {
     if (!b) return;
-    free(b->rows); free(b->offs); free(b->first); free(b->ftbl); free(b->foff); free(b->flen); free(b->fdv); free(b->farena); free(b->last); free(b->bloom); free(b);
+    free(b->rows); free(b->offs); free(b->first); free(b->ftbl); free(b->foff); free(b->flen); free(b->fdv); free(b->farena); free(b->slen); free(b->loff); free(b->llen); free(b->larena); free(b->last); free(b->bloom); free(b);
 }
 uint64_t rs_builder_rows (const rs_builder *b) { return b->total; }
 static int flush_block (rs_builder *b) {
@@ -156,20 +174,38 @@ static int flush_block (rs_builder *b) {
     buf[0] = 1; uint32_t n = b->noffs; memcpy(buf + 1, &n, 4);
     for (uint32_t i = 0; i < n; i++) { uint32_t o = b->offs[i] + (uint32_t)base; memcpy(buf + 5 + (size_t)i * 4, &o, 4); }
     memcpy(buf + base, b->rows, b->nbytes);
-    int rc = b->emit(b->ctx, b->blkno, buf, len); free(buf);
-    if (rc) return rc;
-    if (b->nf == b->capf) {
-        uint32_t nc = b->capf ? b->capf * 2 : 64;
-        uint32_t *a = realloc(b->ftbl, nc * 4), *c = realloc(b->foff, nc * 4), *d = realloc(b->flen, nc * 4); int64_t *e = realloc(b->fdv, nc * 8);
-        if (a) b->ftbl = a; if (c) b->foff = c; if (d) b->flen = d; if (e) b->fdv = e;
-        if (!a || !c || !d || !e) return -1;
-        b->capf = nc;
+    static int nocomp = -1; if (nocomp < 0) nocomp = getenv("MW_META_NOCOMPRESS") != NULL;
+    const uint8_t *stored = buf; size_t slen = len; uint8_t *cmp = NULL;
+    if (!nocomp && len >= 512 && len < (1u << 26)) {                                 // compressed when that gains a tenth or more
+        int bound = LZ4_compressBound((int)len); cmp = malloc((size_t)bound + 5);
+        if (cmp) {
+            int cl = LZ4_compress_default((const char *)buf, (char *)cmp + 5, (int)len, bound);
+            if (cl > 0 && (size_t)cl + 5 <= len - len / 10) { cmp[0] = 2; uint32_t rl = (uint32_t)len; memcpy(cmp + 1, &rl, 4); stored = cmp; slen = (size_t)cl + 5; }
+        }
     }
-    if (b->farn + b->firstl > b->farcap) { size_t nc = (b->farn + b->firstl) * 2 + 4096; uint8_t *na = realloc(b->farena, nc); if (!na) return -1; b->farena = na; b->farcap = nc; }
-    memcpy(b->farena + b->farn, b->first, b->firstl);
-    b->ftbl[b->nf] = b->firsttbl; b->foff[b->nf] = (uint32_t)b->farn; b->flen[b->nf] = b->firstl; b->fdv[b->nf] = b->bdv; b->nf++; b->farn += b->firstl;
-    b->blkno++; b->noffs = 0; b->nbytes = 0; b->bdv = 0;
-    return 0;
+    const uint8_t *loc = NULL; size_t loclen = 0;
+    int rc = b->emit(b->ctx, b->blkno, stored, slen, &loc, &loclen);
+    if (!rc) {
+        if (b->nf == b->capf) {
+            uint32_t nc = b->capf ? b->capf * 2 : 64;
+            uint32_t *a1 = realloc(b->ftbl, nc * 4), *c1 = realloc(b->foff, nc * 4), *d1 = realloc(b->flen, nc * 4); int64_t *e1 = realloc(b->fdv, nc * 8);
+            uint32_t *s1 = realloc(b->slen, nc * 4), *o1 = realloc(b->loff, nc * 4), *l1 = realloc(b->llen, nc * 4);
+            if (a1) b->ftbl = a1; if (c1) b->foff = c1; if (d1) b->flen = d1; if (e1) b->fdv = e1; if (s1) b->slen = s1; if (o1) b->loff = o1; if (l1) b->llen = l1;
+            if (!a1 || !c1 || !d1 || !e1 || !s1 || !o1 || !l1) rc = -1; else b->capf = nc;
+        }
+        if (!rc && b->farn + b->firstl > b->farcap) { size_t nc = (b->farn + b->firstl) * 2 + 4096; uint8_t *na = realloc(b->farena, nc); if (!na) rc = -1; else { b->farena = na; b->farcap = nc; } }
+        if (!rc && b->larn + loclen > b->larcap) { size_t nc = (b->larn + loclen) * 2 + 4096; uint8_t *na = realloc(b->larena, nc); if (!na) rc = -1; else { b->larena = na; b->larcap = nc; } }
+        if (!rc) {
+            memcpy(b->farena + b->farn, b->first, b->firstl);
+            if (loclen) memcpy(b->larena + b->larn, loc, loclen);
+            b->ftbl[b->nf] = b->firsttbl; b->foff[b->nf] = (uint32_t)b->farn; b->flen[b->nf] = b->firstl; b->fdv[b->nf] = b->bdv;
+            b->slen[b->nf] = (uint32_t)slen; b->loff[b->nf] = (uint32_t)b->larn; b->llen[b->nf] = (uint32_t)loclen;
+            b->nf++; b->farn += b->firstl; b->larn += loclen;
+            b->blkno++; b->noffs = 0; b->nbytes = 0; b->bdv = 0;
+        }
+    }
+    free(cmp); free(buf);
+    return rc;
 }
 int rs_builder_add (rs_builder *b, const rs_key *k, int64_t dv, const uint8_t *cells, uint32_t ncells) {
     size_t need = b->nbytes + 40 + k->pklen + ncells;
@@ -195,11 +231,12 @@ int rs_builder_add (rs_builder *b, const rs_key *k, int64_t dv, const uint8_t *c
 int rs_builder_finish (rs_builder *b, uint8_t **meta, size_t *metalen, uint64_t *nrows, uint32_t *nblk, int64_t *dvmax) {
     int rc = flush_block(b);
     if (rc || !b->nf) { rs_builder_free(b); return rc ? rc : -1; }
-    size_t cap = 16 + (size_t)b->nf * 24 + b->farn + b->lastl + 24 + (size_t)(b->nbits / 8);
+    size_t cap = 16 + (size_t)b->nf * 40 + b->farn + b->larn + b->lastl + 24 + (size_t)(b->nbits / 8);
     uint8_t *m = malloc(cap); if (!m) { rs_builder_free(b); return -1; }
-    size_t w = 0; m[w++] = 1; w += put_var(m + w, b->nf);
+    size_t w = 0; m[w++] = 2; w += put_var(m + w, b->nf);
     for (uint32_t i = 0; i < b->nf; i++) {
         w += put_var(m + w, b->ftbl[i]); w += put_var(m + w, b->flen[i]); memcpy(m + w, b->farena + b->foff[i], b->flen[i]); w += b->flen[i]; w += put_var(m + w, (uint64_t)b->fdv[i]);
+        w += put_var(m + w, b->slen[i]); w += put_var(m + w, b->llen[i]); memcpy(m + w, b->larena + b->loff[i], b->llen[i]); w += b->llen[i];
     }
     w += put_var(m + w, b->lasttbl); w += put_var(m + w, b->lastl); memcpy(m + w, b->last, b->lastl); w += b->lastl;
     w += put_var(m + w, b->nbits); memcpy(m + w, b->bloom, (size_t)(b->nbits / 8)); w += (size_t)(b->nbits / 8);
@@ -209,17 +246,17 @@ int rs_builder_finish (rs_builder *b, uint8_t **meta, size_t *metalen, uint64_t 
 }
 
 // ---- merging ----
-typedef struct { const rs_run *run; uint32_t blk; uint8_t *buf; size_t buflen; rs_blk b; uint32_t i; bool done; rs_key k; int64_t dv; const uint8_t *cells; uint32_t nc; } mit;
+typedef struct { const rs_run *run; uint32_t blk; uint8_t *buf; size_t buflen; uint8_t *raw; rs_blk b; uint32_t i; bool done; rs_key k; int64_t dv; const uint8_t *cells; uint32_t nc; } mit;
 static int mit_advance (mit *it, const rs_merge_opts *o) {
     for (;;) {
         if (it->buf && it->i < it->b.nrows) {
             if (!rs_blk_row(&it->b, it->i, &it->k, &it->dv, &it->cells, &it->nc)) return -2;
             it->i++; return 0;
         }
-        if (it->buf) { free(it->buf); it->buf = NULL; it->blk++; }
+        if (it->buf) { free(it->buf); free(it->raw); it->buf = NULL; it->raw = NULL; it->blk++; }
         if (it->blk >= it->run->nblk) { it->done = true; return 0; }
         int rc = o->read(o->rctx, it->run, it->blk, &it->buf, &it->buflen); if (rc) return rc;
-        if (!rs_blk_open(&it->b, it->buf, it->buflen)) return -2;
+        if (!rs_blk_unpack(&it->b, it->buf, it->buflen, &it->raw)) return -2;
         it->i = 0;
     }
 }
@@ -263,7 +300,7 @@ int rs_merge (rs_run *const *runs, int nruns, const rs_merge_opts *o, uint64_t *
     }
     (void)inside;
     if (b) rs_builder_free(b);
-    for (int i = 0; i < nruns; i++) free(its[i].buf);
+    for (int i = 0; i < nruns; i++) { free(its[i].buf); free(its[i].raw); }
     free(its);
     if (rows_out) *rows_out = out;
     return rc;

@@ -54,7 +54,7 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
     // because lanes that are not contending keep running instead of being woken in lock-step.
     if (db->mp && lane->recent_writer && lane->adm_slot < 0 && lane->tx_long_run < 3 && !lane->forced_snapshot) mw_mp_admit(lane);      // (a writer of the previous transaction waits for a slot when there are many processes)
     uint64_t tturn0 = MW_T0();
-    if (lane->retry_credit > 0 && lane->private_mode && !lane->holds_hot) {
+    if (lane->retry_credit > 0 && lane->private_mode && !lane->holds_hot && !lane->sys) {      // (the metadata store's connections never queue for a turn behind the writers: the writers wait for them)
         if (lane->tx_long_run >= 3) {
             // Long transaction (a retry costs the whole body): wait in a FIFO queue, so the wait is bounded by the queue length and nobody starves. A waiter that
             // gives up after 1 s (a holder that never released) marks its ticket abandoned and goes optimistic; the queue skips the mark. With several processes the

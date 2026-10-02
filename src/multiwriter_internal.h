@@ -645,6 +645,7 @@ static inline uint64_t mw_db_visible_epoch (mw_db *db) { return db->shared ? mw_
 
 // The log size at which compaction is requested. Many processes (> 16): 8 MB instead of the configured size: measured 8 MB vs 32 MB, 32 processes 10.2k -> 11.2k,
 // 64: 7.3k -> 8.2k tx/s (the mapping's working set stays in the caches), but 8 processes -8%.
+#define MW_LOG_HARD_BYTES (768ull << 20)         // the log (one mapping of 1 GB) is not allowed to grow past this: commits wait for the compaction
 static inline uint64_t mw_log_limit (const mw_db *db) {
     static _Atomic int ovr = MW_KNOB_UNSET;                         // (MW_LOG_LIMIT_MB: experiments)
     int mb = mw_knob_int(&ovr, "MW_LOG_LIMIT_MB", 0);

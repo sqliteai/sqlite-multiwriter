@@ -161,6 +161,7 @@ static int lane_publish (mw_lane *lane) {
 #define MP_RELEASE() do { if (mp_hold) { mp_hold = false; lane->mp_held = false; MW_T1(MW_ST_MP_HELD, lane->mp_t0); mw_mp_unlock(db); mw_gate_exit(db); mw_log_prefill_bg(db); \
                           if (rc == SQLITE_OK) rc = mw_db_publish_finish(db, lane, rc, epoch, lane->sync_level >= 2); } } while (0)
     if (rc != MW_CONFLICT) MP_RELEASE();
+    if (lane->bp_wait_us && !mp_hold) { struct timespec bp = { 0, (long)lane->bp_wait_us * 1000L }; lane->bp_wait_us = 0; nanosleep(&bp, NULL); }       // back-pressure that the publish itself did not serve (a commit through the relocation path never reaches its finish): nothing is held here
 
     if (rc == SQLITE_OK) {
         lane->tx.commit_epoch = epoch;

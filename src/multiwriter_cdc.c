@@ -26,7 +26,7 @@ typedef struct {
     _Atomic uint32_t *ovo;                               // overflow page -> the leaf (or index) page holding the cell whose record spills into it
     bool ovfl_complete;                                  // ovo covers every record with overflow of the database (built by a scan on the first overflow page written without its cell)
     mw_cat *cat; uint32_t cookie; bool built;
-    mw_meta *meta; pthread_mutex_t ready_mu; bool ready;  // the CRDT metadata; ready once the extensions found in the log at recovery are applied
+    mw_meta *meta; bool ready;  // the CRDT metadata; ready once the extensions found in the log at recovery are applied
     mw_cdc_sink_fn sink; void *sink_arg;                  // tests: every commit's changes
     _Atomic uint64_t commits, changes, unowned, builds, ovfl_scans, ovfl_unattributed, ns_prepare, ns_build;
 } mw_cdc;
@@ -41,9 +41,10 @@ int mw_cdc_open (mw_db *db) {
     c->owner = mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     c->ovo = mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (c->owner == MAP_FAILED || c->ovo == MAP_FAILED) { free(c); return SQLITE_NOMEM; }
-    pthread_mutex_init(&c->mu, NULL); pthread_mutex_init(&c->ready_mu, NULL);
+    pthread_mutex_init(&c->mu, NULL);
     c->meta = mw_meta_new(db);
     if (!c->meta) { free(c); return SQLITE_NOMEM; }
+    mw_meta_attach(c->meta, db->path, db->mode, db->shared ? 2 : db->mp_req ? 3 : 0);
     db->cdc = c;
     return SQLITE_OK;
 }
@@ -198,16 +199,7 @@ void mw_cdc_apply_owner (mw_db *db, mw_lane *lane, const uint32_t *pgnos, const 
 }
 
 // ---- the CRDT metadata of the commit ----
-// the extensions the log held at recovery, applied once before the first use of the store (the file part of it comes in the next step)
-static void ensure_ready (mw_db *db, mw_cdc *c) {
-    if (c->ready) return;
-    pthread_mutex_lock(&c->ready_mu);
-    if (!c->ready) {
-        for (int i = 0; i < db->nrext; i++) (void)mw_meta_replay(c->meta, db->rext[i].epoch, db->rext[i].data, db->rext[i].len);
-        c->ready = true;
-    }
-    pthread_mutex_unlock(&c->ready_mu);
-}
+static void ensure_ready (mw_db *db, mw_cdc *c) { (void)db; if (!c->ready) { mw_meta_ready(c->meta); c->ready = true; } }
 
 // the changes of the commit as local changes of the CRDT, into the lane's overlay; the overlay is then encoded as the record extension
 static void build_delta (mw_lane *lane, mw_cdc *c) {
@@ -236,7 +228,7 @@ static void build_delta (mw_lane *lane, mw_cdc *c) {
 
 void mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch) {
     mw_cdc *c = db->cdc;
-    if (lane->cdc_ovl && lane->cdc_ext_len) mw_meta_apply(c->meta, lane->cdc_ovl, epoch);
+    if (lane->cdc_ovl && lane->cdc_ext_len) { mw_meta_apply(c->meta, lane->cdc_ovl, epoch); if (mw_meta_dirty(c->meta) >= 2048) mw_meta_kick(c->meta); }
     if (lane->cdc_ovl) mw_ovl_clear(lane->cdc_ovl);
     free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
     mw_cat_free(lane->cdc_cat); lane->cdc_cat = NULL;
@@ -250,3 +242,9 @@ void mw_cdc_lane_free (mw_lane *lane) {
 }
 
 mw_meta *mw_cdc_meta (mw_db *db) { mw_cdc *c = db->cdc; return c ? c->meta : NULL; }
+
+// the last user connection is closing: the metadata goes to the file now (the log is about to be dropped), and the store's own connections close
+void mw_cdc_quiesce (mw_db *db) { mw_cdc *c = db->cdc; if (c) { if (!c->ready) { mw_meta_ready(c->meta); c->ready = true; } mw_meta_quiesce(c->meta); } }
+// the point up to which the log may be compacted without losing metadata
+uint64_t mw_cdc_safe_epoch (mw_db *db) { mw_cdc *c = db->cdc; if (!c || !c->ready) return c ? 0 : UINT64_MAX; uint64_t e = mw_meta_safe_epoch(c->meta); if (e != UINT64_MAX) mw_meta_kick(c->meta); return e; }
+void mw_cdc_ensure_schema (sqlite3 *conn, mw_db *db) { if (db->cdc) (void)mw_meta_schema(conn); }

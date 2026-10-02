@@ -9,32 +9,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <stdatomic.h>
-#include "multiwriter_meta.h"
-
-#define STRIPES 64
-#define SEN CRDT_COL_SENTINEL
-#define OV_CHG INT64_MIN                 // in an overlay cell: written by this commit (its db_version is the commit's epoch, not known yet)
-#define F_DROP 1                         // the non-sentinel cells of the row are removed
-#define F_ZERO 2                         // the non-sentinel cells get version 0 and the db_version of the commit
-
-typedef struct mentry {
-    struct mentry *next, *dnext;
-    uint64_t h, ver, drop_ver;           // ver: epoch of the last change; drop_ver: epoch of the last DROP (the file must lose the old cells too)
-    uint32_t tbl, pklen; int n, cap; bool in_dirty;
-    mw_mcell *cells;
-    uint8_t pk[];
-} mentry;
-
-typedef struct { pthread_mutex_t mu; mentry **b; size_t nb, n; mentry *dirty; size_t bytes; size_t hand; uint64_t gen; } stripe;
-
-struct mw_meta {
-    struct mw_db *db;
-    stripe st[STRIPES];
-    size_t cap_rows;                                            // the cache budget (rows) before clean entries are dropped
-    pthread_mutex_t site_mu; uint8_t (*sites)[16]; uint32_t nsites, capsites;     // ord -> site id (0 = this database)
-    _Atomic uint64_t flushed;                                    // epoch up to which the cells are in the file
-    _Atomic uint64_t hits, misses, rows, bytes;
-};
+#include "multiwriter_meta_priv.h"
 
 typedef struct { mw_mcell *c; int n, cap; } cellvec;
 typedef struct {
@@ -46,7 +21,7 @@ struct mw_ovl {
     uint32_t new_sites_lo;                                       // ords >= this are not in the file yet: the extension names them
 };
 
-static uint64_t hash_row (uint32_t tbl, const void *pk, size_t n) {
+uint64_t mw_meta_hash (uint32_t tbl, const void *pk, size_t n) {
     uint64_t h = 1469598103934665603ull ^ tbl;
     h *= 1099511628211ull;
     const uint8_t *p = pk;
@@ -55,7 +30,7 @@ static uint64_t hash_row (uint32_t tbl, const void *pk, size_t n) {
 }
 
 // ---- file (the tables of the database): not there yet ----
-static int file_load (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n) { (void)m; (void)tbl; (void)pk; (void)pklen; *cells = NULL; *n = 0; return 0; }
+#define file_load mw_metafile_load
 
 // ---- the table ----
 mw_meta *mw_meta_new (struct mw_db *db) {
@@ -68,7 +43,8 @@ mw_meta *mw_meta_new (struct mw_db *db) {
         m->st[i].nb = 64; m->st[i].b = calloc(m->st[i].nb, sizeof(mentry *));
         if (!m->st[i].b) { mw_meta_free(m); return NULL; }
     }
-    pthread_mutex_init(&m->site_mu, NULL);
+    pthread_mutex_init(&m->site_mu, NULL); pthread_mutex_init(&m->file_mu, NULL); pthread_mutex_init(&m->th_mu, NULL); pthread_cond_init(&m->th_cv, NULL);
+    for (int i = 0; i < MW_RDN; i++) pthread_mutex_init(&m->rdmu[i], NULL);
     m->capsites = 16; m->sites = calloc(m->capsites, 16); m->nsites = 1;
     if (!m->sites) { mw_meta_free(m); return NULL; }
     arc4random_buf(m->sites[0], 16);                             // this database's own id: replaced by the one in the file when it has one
@@ -81,6 +57,7 @@ void mw_meta_free (mw_meta *m) {
         for (size_t k = 0; m->st[i].b && k < m->st[i].nb; k++) for (mentry *e = m->st[i].b[k], *nx; e; e = nx) { nx = e->next; free(e->cells); free(e); }
         free(m->st[i].b); pthread_mutex_destroy(&m->st[i].mu);
     }
+    mw_metafile_free(m);
     pthread_mutex_destroy(&m->site_mu); free(m->sites); free(m);
 }
 
@@ -130,7 +107,7 @@ static void insert_entry (mw_meta *m, stripe *s, mentry *e) {
 
 // a copy of the cells of a row: the table first, the file on a miss (and the row is cached)
 static int load_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **out, int *n) {
-    uint64_t h = hash_row(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
+    uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
     pthread_mutex_lock(&s->mu);
     mentry *e = find(s, h, tbl, pk, pklen);
     if (e) {
@@ -154,7 +131,7 @@ static int load_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_
     return 0;
 }
 
-int mw_meta_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n) { return load_row(m, tbl, pk, pklen, cells, n); }
+int mw_meta_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n) { if (!atomic_load(&m->ready)) mw_meta_ready(m); return load_row(m, tbl, pk, pklen, cells, n); }
 
 // ---- sites ----
 uint32_t mw_meta_site_ord (mw_meta *m, const uint8_t id[16]) {
@@ -173,7 +150,7 @@ bool mw_meta_site_id (mw_meta *m, uint32_t ord, uint8_t out[16]) {
     pthread_mutex_unlock(&m->site_mu);
     return ok;
 }
-static void site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]) {          // replay: the ord is the one the commit used
+void mw_meta_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]) {          // replay: the ord is the one the commit used
     pthread_mutex_lock(&m->site_mu);
     while (ord >= m->capsites) { uint8_t (*ns)[16] = realloc(m->sites, (size_t)m->capsites * 2 * 16); if (!ns) { pthread_mutex_unlock(&m->site_mu); return; } m->sites = ns; m->capsites *= 2; }
     while (m->nsites <= ord) { memset(m->sites[m->nsites], 0, 16); m->nsites++; }
@@ -195,7 +172,7 @@ bool mw_ovl_empty (const mw_ovl *o) { return o->n == 0; }
 static void ovl_rehash (mw_ovl *o, int ncap) {
     int *nh = malloc((size_t)ncap * sizeof(int)); if (!nh) return;
     memset(nh, 0xff, (size_t)ncap * sizeof(int));
-    for (int i = 0; i < o->n; i++) { uint64_t h = hash_row(o->rows[i].tbl, o->rows[i].pk, o->rows[i].pklen); size_t j = h & (size_t)(ncap - 1); while (nh[j] >= 0) j = (j + 1) & (size_t)(ncap - 1); nh[j] = i; }
+    for (int i = 0; i < o->n; i++) { uint64_t h = mw_meta_hash(o->rows[i].tbl, o->rows[i].pk, o->rows[i].pklen); size_t j = h & (size_t)(ncap - 1); while (nh[j] >= 0) j = (j + 1) & (size_t)(ncap - 1); nh[j] = i; }
     free(o->hash); o->hash = nh; o->hcap = ncap;
 }
 
@@ -203,7 +180,7 @@ static void ovl_rehash (mw_ovl *o, int ncap) {
 static orow *ovl_row (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen, bool create) {
     if (o->hcap == 0 || (o->n + 1) * 2 > o->hcap) ovl_rehash(o, o->hcap ? o->hcap * 2 : 64);
     if (!o->hash) return NULL;
-    uint64_t h = hash_row(tbl, pk, pklen); size_t j = h & (size_t)(o->hcap - 1);
+    uint64_t h = mw_meta_hash(tbl, pk, pklen); size_t j = h & (size_t)(o->hcap - 1);
     while (o->hash[j] >= 0) { orow *r = &o->rows[o->hash[j]]; if (r->tbl == tbl && r->pklen == pklen && !memcmp(r->pk, pk, pklen)) return r; j = (j + 1) & (size_t)(o->hcap - 1); }
     (void)create;
     if (o->n == o->cap) { int nc = o->cap ? o->cap * 2 : 64; orow *nr = realloc(o->rows, (size_t)nc * sizeof *nr); if (!nr) return NULL; o->rows = nr; o->cap = nc; }
@@ -301,7 +278,7 @@ int mw_ovl_encode (mw_ovl *o, uint8_t **ext, uint32_t *len) {
 typedef struct { uint32_t col, site, seq; int64_t cv; } put;
 
 static int apply_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pklen, uint8_t flags, const put *puts, int np, uint64_t epoch) {
-    uint64_t h = hash_row(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
+    uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
     {
         pthread_mutex_lock(&s->mu);
         mentry *e = find(s, h, tbl, pk, pklen);
@@ -326,7 +303,7 @@ static int apply_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pklen,
             *c = (mw_mcell){ puts[q].cv, (int64_t)epoch, puts[q].col, puts[q].site, puts[q].seq };
         }
         e->ver = epoch;
-        if (!e->in_dirty) { e->in_dirty = true; e->dnext = s->dirty; s->dirty = e; }
+        if (!e->in_dirty) { e->in_dirty = true; e->dnext = s->dirty; s->dirty = e; atomic_fetch_add(&m->ndirty, 1); }
         size_t after = entry_bytes(e); s->bytes += after - before; atomic_fetch_add(&m->bytes, after - before);
         evict(m, s);
         pthread_mutex_unlock(&s->mu);
@@ -350,7 +327,7 @@ int mw_meta_replay (mw_meta *m, uint64_t epoch, const uint8_t *ext, uint32_t len
     const uint8_t *p = ext, *end = ext + len; uint64_t v;
     if (len < 1 || *p++ != 0x4d) return -1;
     if (r_var(&p, end, &v)) return -1;
-    for (uint64_t i = 0; i < v; i++) { uint64_t ord; if (r_var(&p, end, &ord) || p + 16 > end) return -1; site_install(m, (uint32_t)ord, p); p += 16; }
+    for (uint64_t i = 0; i < v; i++) { uint64_t ord; if (r_var(&p, end, &ord) || p + 16 > end) return -1; mw_meta_site_install(m, (uint32_t)ord, p); p += 16; }
     uint64_t nrows; if (r_var(&p, end, &nrows)) return -1;
     put *puts = NULL; int pcap = 0;
     for (uint64_t i = 0; i < nrows; i++) {

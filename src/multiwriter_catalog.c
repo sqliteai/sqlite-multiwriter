@@ -130,6 +130,7 @@ static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
     t->cell_id = malloc((size_t)(t->ncells ? t->ncells : 1) * sizeof(uint32_t));
     bool ok = t->cell_id != NULL;
     for (int i = 0; ok && i < t->ncells; i++) { t->cell_id[i] = mw_name_id(t->cell_name[i]); for (int j = 0; j < i; j++) if (t->cell_id[j] == t->cell_id[i]) ok = false; }
+    if (strncasecmp(t->name, "mw_", 3) == 0 || strncasecmp(t->name, "sqlite_", 7) == 0) t->tracked = false;      // (the store's own tables)
     t->synced = ok && t->has_pk && t->npk > 0 && strncasecmp(t->name, "mw_", 3) != 0 && strncasecmp(t->name, "sqlite_", 7) != 0;
 }
 

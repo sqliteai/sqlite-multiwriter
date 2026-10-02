@@ -181,6 +181,7 @@ struct mw_lane {
     uint32_t   *rs_list;
     int         rs_n, rs_cap;
     bool        rebasable;      // no write without a logical representation (DDL, untracked tables, remote apply)
+    bool        sys;            // URI mw_sys=1: a connection of the metadata store itself (not counted as a user of the database)
     bool        norebase;       // this connection is itself a rebase helper: never rebase recursively
     int64_t    *resv;           // db_versions reserved by the current transaction (ascending)
     int         nresv, resv_cap;
@@ -258,6 +259,7 @@ struct mw_db {
     char             *path;
     int               mode;             // 1 = lane tracking on the stock WAL, 2 = private lanes
     int               refs;             // protected by the global registry mutex
+    _Atomic int       sys_refs;         // of which connections of the metadata store (flusher, readers)
     mw_db            *next;             // global registry list
     sqlite3_mutex    *mu;               // snapshot registry + lane list
     mw_lane          *active;           // lanes holding a snapshot
@@ -517,6 +519,7 @@ void      mw_log_remap_ro (mw_db *db, uint64_t need_end);            // remap wi
 int       mw_log_apply_at (mw_db *db, uint64_t off, uint64_t *out_size, uint64_t *out_epoch);   // install the record at `off` (checksummed)
 
 // registry
+void    mw_db_release_ex (mw_db *db, bool sys);
 mw_db  *mw_db_acquire (const char *path, int mode, int mpmode);   // mpmode: 0 single process, 1 multi-process (private stores), 2 multi-process shared mode   // NULL on OOM or if the file is already open in another mode
 void    mw_db_release (mw_db *db);
 
@@ -548,6 +551,9 @@ void     mw_cdc_lane_free (mw_lane *lane);
 void     mw_cdc_apply_owner (mw_db *db, mw_lane *lane, const uint32_t *pgnos, const uint8_t *const *images, int n);
 void     mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch);
 struct mw_meta *mw_cdc_meta (mw_db *db);
+void     mw_cdc_quiesce (mw_db *db);
+uint64_t mw_cdc_safe_epoch (mw_db *db);
+void     mw_cdc_ensure_schema (sqlite3 *conn, mw_db *db);
 bool     mw_rowdiff_enabled (void);
 void     mw_rowdiff_commit (mw_lane *lane, const uint8_t *const *imgs);          // (experiment, docs §51)
 void     mw_lane_fill_stats (mw_lane *lane, mw_db_stats *st);

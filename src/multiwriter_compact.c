@@ -61,6 +61,7 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
         T = oldest < visible ? oldest : visible;
         base = db->base_epoch;
     }
+    if (db->cdc) { uint64_t lim = mw_cdc_safe_epoch(db); if (T > lim) T = lim; }       // (the metadata of the commits above the last flush lives in the log records only)
     if (T <= base) goto done;                                      // nothing new to materialise (or pinned by an old reader)
 
     if (db->fd_real < 0) {

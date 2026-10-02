@@ -80,10 +80,20 @@ mw_db *mw_db_acquire (const char *path, int mode, int mpmode) {
     return db;
 }
 
-void mw_db_release (mw_db *db) {
+void mw_db_release_ex (mw_db *db, bool sys);
+void mw_db_release (mw_db *db) { mw_db_release_ex(db, false); }
+
+// sys: the connection being closed belongs to the metadata store. When the last connection of the application goes, the metadata store flushes and closes its own first
+// (while this reference still keeps the database alive): the log is about to be dropped, and the metadata of the commits in it exists nowhere else.
+void mw_db_release_ex (mw_db *db, bool sys) {
     if (!db) return;
     sqlite3_mutex *g = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MAIN);
     sqlite3_mutex_enter(g);
+    if (!sys && db->cdc && !db->orphaned && db->refs - 1 == atomic_load(&db->sys_refs)) {
+        sqlite3_mutex_leave(g);
+        mw_cdc_quiesce(db);
+        sqlite3_mutex_enter(g);
+    }
     if (--db->refs == 0) {
         for (mw_db **pp = &mw_dbs; *pp; pp = &(*pp)->next) {
             if (*pp == db) { *pp = db->next; break; }

@@ -69,6 +69,11 @@ static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
 static int mw_connection_init (sqlite3 *db, char **err, const sqlite3_api_routines *api) {
     (void)err; (void)api;
     sqlite3_trace_v2(db, SQLITE_TRACE_STMT, mw_trace_cb, NULL);
+    void *lp = NULL;
+    if (sqlite3_file_control(db, "main", MW_FCNTL_LANE_PTR, &lp) == SQLITE_OK && lp) {          // the tables of the CRDT metadata are created by the first connection, before anyone writes
+        mw_lane *lane = lp;
+        if (lane->db && lane->db->cdc && !lane->sys && !sqlite3_db_readonly(db, "main")) mw_cdc_ensure_schema(db, lane->db);
+    }
     return SQLITE_OK;
 }
 
@@ -93,9 +98,11 @@ static int mw_close (sqlite3_file *pf) {
     if (f->lane) {
         mw_lane_snapshot_end(f->lane);
         mw_db *db = f->lane->db;
+        bool sys = f->lane->sys;
+        if (sys) atomic_fetch_sub(&db->sys_refs, 1);
         mw_lane_free(f->lane);
         f->lane = NULL;
-        mw_db_release(db);
+        mw_db_release_ex(db, sys);
     }
     int rc = f->real->pMethods ? f->real->pMethods->xClose(f->real) : SQLITE_OK;
     f->base.pMethods = NULL;
@@ -247,6 +254,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         mw_lane_init(lane, db);
         if (sqlite3_uri_boolean(name, "mw_cdc", 0) && mode >= 2) { sqlite3_mutex_enter(db->mu); if (!db->cdc) (void)mw_cdc_open(db); sqlite3_mutex_leave(db->mu); }
         lane->norebase = sqlite3_uri_boolean(name, "mw_norebase", 0) != 0;
+        if (sqlite3_uri_boolean(name, "mw_sys", 0) && mode >= 2) { lane->sys = true; atomic_fetch_add(&db->sys_refs, 1); }
         lane->noreloc = sqlite3_uri_boolean(name, "mw_noreloc", 0) != 0;
         lane->noroute = sqlite3_uri_boolean(name, "mw_noroute", 0) != 0;
         lane->nomerge = sqlite3_uri_boolean(name, "mw_nomerge", 0) != 0;

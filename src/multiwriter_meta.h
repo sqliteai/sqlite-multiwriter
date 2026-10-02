@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include "sqlite3.h"
 #include "crdt/crdt.h"
 
 typedef struct mw_meta mw_meta;
@@ -41,5 +42,16 @@ int mw_meta_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcel
 uint32_t mw_meta_site_ord (mw_meta *m, const uint8_t id[16]);
 bool     mw_meta_site_id (mw_meta *m, uint32_t ord, uint8_t out[16]);
 void     mw_meta_stats (mw_meta *m, uint64_t *rows, uint64_t *bytes, uint64_t *hits, uint64_t *misses);
+
+// ---- the file tables and the flusher (multiwriter_metafile.c) ----
+int      mw_meta_attach (mw_meta *m, const char *path, int mode, int mpmode);      // where the database is (so the store can open its own connections to it)
+int      mw_meta_ready (mw_meta *m);                                              // bring in the file's state and replay the extensions the log held at recovery (idempotent)
+int      mw_meta_flush (mw_meta *m);                                              // write what changed since the last flush to the file tables, in one commit
+void     mw_meta_kick (mw_meta *m);                                               // ask the flusher thread to flush soon
+uint64_t mw_meta_safe_epoch (mw_meta *m);                                         // the log may be compacted up to here without losing metadata (UINT64_MAX: no limit)
+void     mw_meta_quiesce (mw_meta *m);                                            // stop the flusher, flush, close the store's connections
+int      mw_meta_schema (sqlite3 *conn);                                          // create the file tables if they are missing
+uint64_t mw_meta_flushed (mw_meta *m);
+uint64_t mw_meta_dirty (mw_meta *m);                                              // rows changed since the last flush
 
 #endif

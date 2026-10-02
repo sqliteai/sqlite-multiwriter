@@ -18,6 +18,7 @@ typedef struct {
 struct mw_ovl {
     mw_meta *m; orow *rows; int n, cap; int *hash; int hcap;
     mw_value_fn vfn; void *varg;
+    uint32_t *purge; int npurge, cappurge;
     uint32_t new_sites_lo;                                       // ords >= this are not in the file yet: the extension names them
 };
 
@@ -43,7 +44,7 @@ mw_meta *mw_meta_new (struct mw_db *db) {
         m->st[i].nb = 64; m->st[i].b = calloc(m->st[i].nb, sizeof(mentry *));
         if (!m->st[i].b) { mw_meta_free(m); return NULL; }
     }
-    pthread_mutex_init(&m->site_mu, NULL); pthread_mutex_init(&m->file_mu, NULL); pthread_mutex_init(&m->th_mu, NULL); pthread_cond_init(&m->th_cv, NULL);
+    pthread_mutex_init(&m->site_mu, NULL); pthread_mutex_init(&m->purge_mu, NULL); pthread_mutex_init(&m->file_mu, NULL); pthread_mutex_init(&m->th_mu, NULL); pthread_cond_init(&m->th_cv, NULL);
     for (int i = 0; i < MW_RDN; i++) pthread_mutex_init(&m->rdmu[i], NULL);
     m->capsites = 16; m->sites = calloc(m->capsites, 16); m->nsites = 1;
     if (!m->sites) { mw_meta_free(m); return NULL; }
@@ -57,7 +58,7 @@ void mw_meta_free (mw_meta *m) {
         for (size_t k = 0; m->st[i].b && k < m->st[i].nb; k++) for (mentry *e = m->st[i].b[k], *nx; e; e = nx) { nx = e->next; free(e->cells); free(e); }
         free(m->st[i].b); pthread_mutex_destroy(&m->st[i].mu);
     }
-    mw_metafile_free(m);
+    mw_metafile_free(m); free(m->purge);
     pthread_mutex_destroy(&m->site_mu); free(m->sites); free(m);
 }
 
@@ -162,12 +163,19 @@ void mw_meta_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]) {    
 mw_ovl *mw_ovl_new (mw_meta *m) { mw_ovl *o = calloc(1, sizeof *o); if (o) o->m = m; return o; }
 void mw_ovl_clear (mw_ovl *o) {
     for (int i = 0; i < o->n; i++) { free(o->rows[i].pk); free(o->rows[i].c); }
+    o->npurge = 0;
     o->n = 0; if (o->hash) memset(o->hash, 0xff, (size_t)o->hcap * sizeof(int));
     o->new_sites_lo = 0;
 }
-void mw_ovl_free (mw_ovl *o) { if (!o) return; mw_ovl_clear(o); free(o->rows); free(o->hash); free(o); }
+void mw_ovl_free (mw_ovl *o) { if (!o) return; mw_ovl_clear(o); free(o->purge); free(o->rows); free(o->hash); free(o); }
 void mw_ovl_set_value_fn (mw_ovl *o, mw_value_fn fn, void *arg) { o->vfn = fn; o->varg = arg; }
-bool mw_ovl_empty (const mw_ovl *o) { return o->n == 0; }
+bool mw_ovl_empty (const mw_ovl *o) { return o->n == 0 && o->npurge == 0; }
+void mw_ovl_purge (mw_ovl *o, uint32_t tbl) {
+    for (int i = 0; i < o->npurge; i++) if (o->purge[i] == tbl) return;
+    if (o->npurge == o->cappurge) { int nc = o->cappurge ? o->cappurge * 2 : 8; uint32_t *np = realloc(o->purge, (size_t)nc * sizeof *np); if (!np) return; o->purge = np; o->cappurge = nc; }
+    o->purge[o->npurge++] = tbl;
+    for (int i = 0; i < o->n; i++) if (o->rows[i].tbl == tbl) { o->rows[i].n = 0; o->rows[i].flags = 0; }          // (what the commit did to that table before is moot)
+}
 
 static void ovl_rehash (mw_ovl *o, int ncap) {
     int *nh = malloc((size_t)ncap * sizeof(int)); if (!nh) return;
@@ -245,7 +253,7 @@ static int r_var (const uint8_t **p, const uint8_t *end, uint64_t *v) {
 int mw_ovl_encode (mw_ovl *o, uint8_t **ext, uint32_t *len) {
     *ext = NULL; *len = 0;
     int nrows = 0; for (int i = 0; i < o->n; i++) { orow *r = &o->rows[i]; bool any = r->flags != 0; for (int k = 0; k < r->n && !any; k++) if (r->c[k].dv == OV_CHG) any = true; if (any) nrows++; }
-    if (!nrows) return 0;
+    if (!nrows && !o->npurge) return 0;
     wbuf w = {0};
     uint8_t ver = 0x4d; w_bytes(&w, &ver, 1);
     // the sites the cells name (the extension carries their ids: a replay must be able to rebuild the ord -> id map)
@@ -259,6 +267,8 @@ int mw_ovl_encode (mw_ovl *o, uint8_t **ext, uint32_t *len) {
     w_var(&w, (uint64_t)no);
     for (int q = 0; q < no; q++) { uint8_t id[16]; if (!mw_meta_site_id(o->m, ords[q], id)) memset(id, 0, 16); w_var(&w, ords[q]); w_bytes(&w, id, 16); }
     free(ords);
+    w_var(&w, (uint64_t)o->npurge);                                       // (dropped tables first: a table dropped and created again in one commit starts empty)
+    for (int i = 0; i < o->npurge; i++) w_var(&w, o->purge[i]);
     w_var(&w, (uint64_t)nrows);
     for (int i = 0; i < o->n; i++) {
         orow *r = &o->rows[i]; int np = 0;
@@ -311,8 +321,24 @@ static int apply_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pklen,
     }
 }
 
+static void purge_table (mw_meta *m, uint32_t tbl, uint64_t epoch) {
+    for (int s = 0; s < STRIPES; s++) {
+        stripe *st = &m->st[s]; pthread_mutex_lock(&st->mu);
+        for (size_t k = 0; k < st->nb; k++) { mentry **pp = &st->b[k]; while (*pp) { mentry *e = *pp; if (e->tbl == tbl) { *pp = e->next; st->n--; st->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); if (e->in_dirty) e->tbl = 0xFFFFFFFFu; else { free(e->cells); free(e); } } else pp = &e->next; } }
+        // dirty entries of the table: unlinked from the dirty list too (the list owns them now)
+        mentry **pd = &st->dirty; while (*pd) { mentry *e = *pd; if (e->tbl == 0xFFFFFFFFu && e->in_dirty) { *pd = e->dnext; atomic_fetch_sub(&m->ndirty, 1); free(e->cells); free(e); } else pd = &e->dnext; }
+        st->gen++; pthread_mutex_unlock(&st->mu);
+    }
+    pthread_mutex_lock(&m->purge_mu);
+    for (int i = 0; i < m->npurge; i++) if (m->purge[i].tbl == tbl) { if (m->purge[i].epoch < epoch) m->purge[i].epoch = epoch; pthread_mutex_unlock(&m->purge_mu); return; }
+    if (m->npurge == m->cappurge) { int nc = m->cappurge ? m->cappurge * 2 : 8; struct mw_purge *np = realloc(m->purge, (size_t)nc * sizeof *np); if (np) { m->purge = np; m->cappurge = nc; } }
+    if (m->npurge < m->cappurge) m->purge[m->npurge++] = (struct mw_purge){ tbl, epoch };
+    pthread_mutex_unlock(&m->purge_mu);
+}
+
 int mw_meta_apply (mw_meta *m, mw_ovl *o, uint64_t epoch) {
     put *puts = NULL; int pcap = 0, rc = 0;
+    for (int i = 0; i < o->npurge; i++) purge_table(m, o->purge[i], epoch);
     for (int i = 0; i < o->n && rc == 0; i++) {
         orow *r = &o->rows[i]; int np = 0;
         for (int k = 0; k < r->n; k++) if (r->c[k].dv == OV_CHG) { if (np == pcap) { pcap = pcap ? pcap * 2 : 16; puts = realloc(puts, (size_t)pcap * sizeof *puts); if (!puts) return -1; } puts[np++] = (put){ r->c[k].col, r->c[k].site, r->c[k].seq, r->c[k].cv }; }
@@ -328,6 +354,8 @@ int mw_meta_replay (mw_meta *m, uint64_t epoch, const uint8_t *ext, uint32_t len
     if (len < 1 || *p++ != 0x4d) return -1;
     if (r_var(&p, end, &v)) return -1;
     for (uint64_t i = 0; i < v; i++) { uint64_t ord; if (r_var(&p, end, &ord) || p + 16 > end) return -1; mw_meta_site_install(m, (uint32_t)ord, p); p += 16; }
+    uint64_t npg; if (r_var(&p, end, &npg)) return -1;
+    for (uint64_t i = 0; i < npg; i++) { uint64_t t; if (r_var(&p, end, &t)) return -1; purge_table(m, (uint32_t)t, epoch); }
     uint64_t nrows; if (r_var(&p, end, &nrows)) return -1;
     put *puts = NULL; int pcap = 0;
     for (uint64_t i = 0; i < nrows; i++) {

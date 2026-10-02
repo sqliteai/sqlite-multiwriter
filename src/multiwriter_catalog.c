@@ -96,6 +96,7 @@ static void tab_free (mw_tab *t) { free(t->cell_id); free(t->name); free(t->cell
 // understand one table with SQLite's help
 static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
     memset(t, 0, sizeof *t); t->root = r->root; t->name = strdup(r->name);
+    { uint64_t h = 1469598103934665603ull; for (const unsigned char *q = (const unsigned char *)r->sql; *q; q++) { h ^= *q; h *= 1099511628211ull; } t->sqlhash = h; }
     if (!starts_ci(r->sql, "CREATE TABLE") || starts_ci(r->sql, "CREATE VIRTUAL")) return;
     char *err = NULL;
     if (sqlite3_exec(scratch, r->sql, NULL, NULL, &err) != SQLITE_OK) { sqlite3_free(err); return; }

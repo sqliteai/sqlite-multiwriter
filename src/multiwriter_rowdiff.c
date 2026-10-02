@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <strings.h>
 #include "multiwriter_internal.h"
 #include "multiwriter_catalog.h"
 #include "crdt.h"
@@ -54,6 +55,7 @@ static char page_kind (const uint8_t *pg, uint32_t pgno) {
 bool mw_rd_snap_page (mw_lane *lane, uint32_t pgno, uint8_t *dst) {
     mw_store *st = lane->db->store;
     uint32_t pgsz = (uint32_t)st->pgsz;
+    if (lane->cdc_over) { for (int i = 0; i < lane->ws_n; i++) if (lane->ws_pgnos[i] == pgno) { memcpy(dst, lane->cdc_over[i], pgsz); return true; } }
     if (pgno == 0 || pgno > lane->dsz_val) return false;
     if (mw_store_read(st, pgno, lane->tx.snapshot_epoch, 0, pgsz, dst)) return true;
     mw_file *f = lane->file;
@@ -101,7 +103,7 @@ static uint32_t ov_get (const ovmap *m, uint32_t pg) {
     while (m->pg[h]) { if (m->pg[h] == pg) return m->root[h]; h = (h + 1) & (m->cap - 1); }
     return 0;
 }
-static uint32_t owner_new (const mw_rd_owner *own, const ovmap *ov, uint32_t pg) { uint32_t r = ov_get(ov, pg); return r ? r : (own && own->old_owner ? own->old_owner(own->ctx, pg) : 0); }
+static uint32_t owner_new (const mw_rd_owner *own, const ovmap *ov, uint32_t pg) { if (own && own->cat && mw_cat_by_root(own->cat, pg)) return pg; uint32_t r = ov_get(ov, pg); return r ? r : (own && own->old_owner ? own->old_owner(own->ctx, pg) : 0); }
 
 // ---- records ----
 // Column spans of a record: serial type, offset and length of every column; returns the number of columns, -1 if malformed
@@ -162,6 +164,8 @@ static int rows_of (mw_lane *lane, const uint8_t *const *imgs, bool new_state, c
     uint8_t kind = pg[0];
     const mw_tab *tab = root && cat ? mw_cat_by_root(cat, root) : NULL;
     if (cat && root && (!tab || !tab->tracked)) return 0;                          // a table we cannot read (or an index): not captured
+    if (tab && lane->cdc_nskip) for (int q = 0; q < lane->cdc_nskip; q++) if (!strcasecmp(lane->cdc_skip[q], tab->name)) return 0;     // reshaped by this commit's DDL
+    if (tab && !new_state && lane->cdc_nskip_old) for (int q = 0; q < lane->cdc_nskip_old; q++) if (!strcasecmp(lane->cdc_skip_old[q], tab->name)) return 0;
     if (cat && kind != 0x0d && !(tab && tab->without_rowid)) return 0;
     if (cat && kind == 0x0d && tab && tab->without_rowid) return 0;
     const bool interior = kind == 0x02;
@@ -189,9 +193,11 @@ static int rows_of (mw_lane *lane, const uint8_t *const *imgs, bool new_state, c
     return 0;
 }
 
+static uint64_t row_table (const rd_row *r) { return r->tab ? (uint64_t)r->tab->tid : (1ull << 40) | r->root; }       // the table a row belongs to, by name (a rebuilt table keeps its rows whatever its root page is now)
 static int row_cmp (const void *a, const void *b) {
     const rd_row *p = a, *q = b;
-    if (p->root != q->root) return p->root < q->root ? -1 : 1;
+    uint64_t tp = row_table(p), tq = row_table(q);
+    if (tp != tq) return tp < tq ? -1 : 1;
     if (p->key || q->key) {
         uint32_t m = p->keylen < q->keylen ? p->keylen : q->keylen; int c = (p->key && q->key) ? memcmp(p->key, q->key, m) : 0;
         return c ? c : (int)((int64_t)p->keylen - (int64_t)q->keylen);
@@ -200,23 +206,35 @@ static int row_cmp (const void *a, const void *b) {
 }
 static void rows_free (rowset *rs) { for (int i = 0; i < rs->n; i++) { free(rs->a[i].own); free(rs->a[i].key); free(rs->a[i].chain); } free(rs->a); }
 
-// the cells of `tab` that differ between two records of the row, as a bit mask (bit 63: all of them / not decidable); *pk_changed: the key columns differ
+// the cells that differ between two records of the row, as a bit mask over the cells of the new definition (bit 63: all of them / not decidable); *pk_changed: the key columns differ.
+// The two records may be laid out by different definitions of the table (ADD / DROP COLUMN in this commit): cells are matched by column name then.
 static uint64_t cells_differ (const mw_tab *t, const rd_row *a, const rd_row *b, bool *pk_changed) {
     *pk_changed = false;
-    if (a->reclen == b->reclen && memcmp(a->rec, b->rec, a->reclen) == 0) return 0;
+    if (a->reclen == b->reclen && memcmp(a->rec, b->rec, a->reclen) == 0 && a->tab == b->tab) return 0;
     uint64_t ta[256], tb[256]; uint32_t oa[256], ob[256], la[256], lb[256];
     int na = rec_cols(a->rec, a->reclen, ta, oa, la, 256), nb = rec_cols(b->rec, b->reclen, tb, ob, lb, 256);
     if (na < 0 || nb < 0 || !t) return 1ull << 63;
+    const mw_tab *ot = a->tab ? a->tab : t;
+    bool same_layout = ot == t || (ot->ncells == t->ncells && ot->npk == t->npk && ot->without_rowid == t->without_rowid && ot->alias_pk == t->alias_pk);
+    if (same_layout && ot != t) for (int i = 0; i < t->ncells && same_layout; i++) if (ot->cell_rec[i] != t->cell_rec[i] || strcasecmp(ot->cell_name[i], t->cell_name[i])) same_layout = false;
     uint64_t mask = 0;
     for (int i = 0; i < t->ncells; i++) {
-        int ri = t->cell_rec[i]; bool ha = ri < na, hb = ri < nb;
-        if (ha != hb) { if (i < 63) mask |= 1ull << i; else mask |= 1ull << 63; continue; }
-        if (!ha) continue;
-        if (ta[ri] != tb[ri] || (la[ri] && memcmp(a->rec + oa[ri], b->rec + ob[ri], la[ri]) != 0)) { if (i < 63) mask |= 1ull << i; else mask |= 1ull << 63; }
+        int oi = i;
+        if (!same_layout) { oi = -1; for (int j = 0; j < ot->ncells; j++) if (!strcasecmp(ot->cell_name[j], t->cell_name[i])) { oi = j; break; } }
+        int ri = t->cell_rec[i], rj = oi >= 0 ? ot->cell_rec[oi] : -1;
+        bool ha = rj >= 0 && rj < na, hb = ri < nb;
+        bool changed;
+        if (ha != hb) changed = hb ? !(tb[ri] == 0) : !(ta[rj] == 0);              // (an absent column reads as NULL)
+        else if (!ha) changed = false;
+        else changed = ta[rj] != tb[ri] || (la[rj] && memcmp(a->rec + oa[rj], b->rec + ob[ri], la[rj]) != 0);
+        if (changed) { if (i < 63) mask |= 1ull << i; else mask |= 1ull << 63; }
     }
-    if (!t->alias_pk && t->has_pk && !t->without_rowid) for (int k = 0; k < t->npk; k++) {
-        int ri = t->pk_rec[k]; if (ri >= na || ri >= nb) continue;
-        if (ta[ri] != tb[ri] || (la[ri] && memcmp(a->rec + oa[ri], b->rec + ob[ri], la[ri]) != 0)) *pk_changed = true;
+    if (!t->alias_pk && t->has_pk && !t->without_rowid) {
+        if (!same_layout && (ot->npk != t->npk || ot->alias_pk != t->alias_pk)) *pk_changed = true;
+        else for (int k = 0; k < t->npk; k++) {
+            int ri = t->pk_rec[k], rj = ot->pk_rec[k]; if (ri >= nb || rj >= na) continue;
+            if (ta[rj] != tb[ri] || (la[rj] && memcmp(a->rec + oa[rj], b->rec + ob[ri], la[rj]) != 0)) *pk_changed = true;
+        }
     }
     return mask;
 }
@@ -228,7 +246,7 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_o
     uint32_t pgsz = (uint32_t)st->pgsz;
     uint64_t t0 = 0; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t0 = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
     memset(res, 0, sizeof *res);
-    const mw_cat *cat = own ? own->cat : NULL;
+    const mw_cat *cat = own ? own->cat : NULL, *ocat = own && own->old_cat ? own->old_cat : cat;
     rowset oldr = {0}, newr = {0};
     uint8_t **keeps = NULL; int nkeeps = 0;                                           // copies of the old pages: the old rows point into them
     int opaque = 0, index_pages = 0, interior = 0, schema = 0, bad = 0;
@@ -265,7 +283,7 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_o
         if (kn == 'O') opaque++; else if (kn == 'I') index_pages++; else if (kn == 'T') interior++; else if (kn == 'S') schema++;
         bool in_fn = nfn && bsearch(&pgno, fn, (size_t)nfn, sizeof *fn, cmp_u32), in_fo = nfo && bsearch(&pgno, fo, (size_t)nfo, sizeof *fo, cmp_u32);
         if ((kn == 'L' || (own && kn == 'I')) && !in_fn) { if (rows_of(lane, imgs, true, imgs[i], pgno, pgsz, &newr, own ? owner_new(own, &ov, pgno) : 0, cat, false) < 0) bad++; }
-        if (have_old && (ko == 'L' || (own && ko == 'I')) && !in_fo) { uint8_t *cp = malloc(pgsz); if (cp) { memcpy(cp, oldimg, pgsz); keeps = realloc(keeps, (size_t)(nkeeps + 1) * sizeof *keeps); keeps[nkeeps++] = cp; if (rows_of(lane, imgs, false, cp, pgno, pgsz, &oldr, own && own->old_owner ? own->old_owner(own->ctx, pgno) : 0, cat, false) < 0) bad++; } }
+        if (have_old && (ko == 'L' || (own && ko == 'I')) && !in_fo) { uint8_t *cp = malloc(pgsz); if (cp) { memcpy(cp, oldimg, pgsz); keeps = realloc(keeps, (size_t)(nkeeps + 1) * sizeof *keeps); keeps[nkeeps++] = cp; if (rows_of(lane, imgs, false, cp, pgno, pgsz, &oldr, own && own->old_owner ? own->old_owner(own->ctx, pgno) : 0, ocat, false) < 0) bad++; } }
     }
     // pages the transaction freed (on the freelist now, not before) and not rewritten: their old rows are old rows that are gone
     for (int k = 0; k < nfn && oldimg; k++) {
@@ -275,7 +293,7 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_o
         if (ws_image(lane, imgs, pg)) continue;                                                                    // rewritten: handled in the loop above
         if (!mw_rd_snap_page(lane, pg, oldimg)) continue;
         char kk = page_kind(oldimg, pg);
-        if (kk == 'L' || (own && kk == 'I')) { uint8_t *cp = malloc(pgsz); if (cp) { memcpy(cp, oldimg, pgsz); keeps = realloc(keeps, (size_t)(nkeeps + 1) * sizeof *keeps); keeps[nkeeps++] = cp; if (rows_of(lane, imgs, false, cp, pg, pgsz, &oldr, own && own->old_owner ? own->old_owner(own->ctx, pg) : 0, cat, false) < 0) bad++; } }
+        if (kk == 'L' || (own && kk == 'I')) { uint8_t *cp = malloc(pgsz); if (cp) { memcpy(cp, oldimg, pgsz); keeps = realloc(keeps, (size_t)(nkeeps + 1) * sizeof *keeps); keeps[nkeeps++] = cp; if (rows_of(lane, imgs, false, cp, pg, pgsz, &oldr, own && own->old_owner ? own->old_owner(own->ctx, pg) : 0, ocat, false) < 0) bad++; } }
     }
     // overflow pages written without their cell: an update that rewrites only the tail of a big value leaves the leaf page alone. The owner of an overflow page (the leaf its record is in)
     // comes from the overflow owner map; the rows of that leaf that have overflow chains are taken in both states, and netting finds the one that changed.
@@ -297,7 +315,7 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_o
             if (!mw_rd_snap_page(lane, leaf, oldimg)) continue;
             uint8_t *cp = malloc(pgsz); if (!cp) continue; memcpy(cp, oldimg, pgsz); keeps = realloc(keeps, (size_t)(nkeeps + 1) * sizeof *keeps); keeps[nkeeps++] = cp;
             uint32_t root = own->old_owner ? own->old_owner(own->ctx, leaf) : 0;
-            if (rows_of(lane, imgs, false, cp, leaf, pgsz, &oldr, root, cat, true) < 0) bad++;
+            if (rows_of(lane, imgs, false, cp, leaf, pgsz, &oldr, root, ocat, true) < 0) bad++;
             if (rows_of(lane, imgs, true, cp, leaf, pgsz, &newr, root, cat, true) < 0) bad++;
         }
         free(nch);
@@ -318,7 +336,7 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_o
             if (r->tab && !r->bad) { if (!row_pk(r->tab, r, &x->pk, &x->pklen)) x->pk = NULL; }
             nout++; if (c < 0) i++; else j++;
         } else {
-            bool pkc = false; uint64_t m = cells_differ(r->tab, &oldr.a[i], &newr.a[j], &pkc);
+            bool pkc = false; uint64_t m = cells_differ(newr.a[j].tab, &oldr.a[i], &newr.a[j], &pkc);
             if (getenv("MW_ROWDIFF_DEBUG") && (m || pkc)) { const rd_row *o = &oldr.a[i], *w = &newr.a[j]; fprintf(stderr, "rowdiff: update root %u rowid %lld mask %llx: old len %u new len %u; old:", r->root, (long long)o->rowid, (unsigned long long)m, o->reclen, w->reclen); for (uint32_t q = 0; q < o->reclen && q < 24; q++) fprintf(stderr, " %02x", o->rec[q]); fprintf(stderr, " | new:"); for (uint32_t q = 0; q < w->reclen && q < 24; q++) fprintf(stderr, " %02x", w->rec[q]); fprintf(stderr, "\n"); }
             if (m || pkc) {
                 x->kind = 2; x->tab = newr.a[j].tab; x->root = newr.a[j].root; x->rowid = newr.a[j].rowid; x->changed = m;

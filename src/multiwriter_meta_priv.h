@@ -42,6 +42,7 @@ struct mw_meta {
     #define MW_RDN 4
     sqlite3 *rd[MW_RDN]; sqlite3_stmt *rds[MW_RDN]; pthread_mutex_t rdmu[MW_RDN];
     pthread_t th; bool th_running; bool th_stop; bool kicked; pthread_mutex_t th_mu; pthread_cond_t th_cv;
+    struct mw_purge { uint32_t tbl; uint64_t epoch; } *purge; int npurge, cappurge; pthread_mutex_t purge_mu;       // tables dropped since the last flush: the cells of the file older than the drop are dead, and deleted with the next batch
     uint64_t last_flush_ns; uint32_t sites_flushed;
     _Atomic uint64_t n_flushes, flushed_cells, flush_ns, flush_retries;
 };

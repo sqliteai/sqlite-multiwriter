@@ -87,7 +87,12 @@ locked:
         }
         if (r != SQLITE_DONE && rc == 0) rc = -1;
         sqlite3_reset(st); sqlite3_clear_bindings(st);
-        if (rc == 0) { *cells = c; *n = cnt; } else free(c);
+        if (rc == 0) {
+            pthread_mutex_lock(&m->purge_mu);                                         // cells older than a drop of the table that the flush has not deleted yet are dead
+            for (int q = 0; q < m->npurge; q++) if (m->purge[q].tbl == tbl) { int k = 0; for (int i = 0; i < cnt; i++) if (c[i].dv >= (int64_t)m->purge[q].epoch) c[k++] = c[i]; cnt = k; }
+            pthread_mutex_unlock(&m->purge_mu);
+            *cells = c; *n = cnt;
+        } else free(c);
     }
     pthread_mutex_unlock(&m->rdmu[slot]);
     return rc;
@@ -160,7 +165,7 @@ fail:
     free(v); return -1;
 }
 
-static int write_batch (mw_meta *m, fitem *v, int n, uint64_t V, uint32_t nsites) {
+static int write_batch (mw_meta *m, fitem *v, int n, uint64_t V, uint32_t nsites, const struct mw_purge *purge, int npurge) {
     sqlite3 *c = m->wr; int rc;
     rc = mw_meta_schema(c); if (rc != SQLITE_OK) return rc;
     m->tables_ok = true;
@@ -171,6 +176,7 @@ static int write_batch (mw_meta *m, fitem *v, int n, uint64_t V, uint32_t nsites
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_sites(ord, id) VALUES(?1, ?2)", -1, &site, NULL);
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_state(k, v) VALUES('meta_epoch', ?1)", -1, &state, NULL);
     rc = (del && ins && site && state) ? SQLITE_OK : SQLITE_ERROR;
+    for (int i = 0; i < npurge && rc == SQLITE_OK; i++) { char q[80]; snprintf(q, sizeof q, "DELETE FROM mw_cells WHERE tbl = %u AND dv < %llu", purge[i].tbl, (unsigned long long)purge[i].epoch); rc = sqlite3_exec(c, q, NULL, NULL, NULL); }
     uint64_t cells = 0;
     for (int i = 0; i < n && rc == SQLITE_OK; i++) {
         if (v[i].drop) { sqlite3_bind_int64(del, 1, v[i].tbl); sqlite3_bind_blob(del, 2, v[i].pk, (int)v[i].pklen, SQLITE_STATIC); if (sqlite3_step(del) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(del); }
@@ -203,19 +209,24 @@ int mw_meta_flush (mw_meta *m) {
     uint64_t V = atomic_load(&m->db->epoch), F = atomic_load(&m->flushed);
     uint32_t nsites; pthread_mutex_lock(&m->site_mu); nsites = m->nsites; pthread_mutex_unlock(&m->site_mu);
     bool need_sites = nsites > m->sites_flushed;
-    if (atomic_load(&m->ndirty) == 0 && !need_sites) { pthread_mutex_unlock(&m->file_mu); return 0; }
+    if (atomic_load(&m->ndirty) == 0 && !need_sites && m->npurge == 0) { pthread_mutex_unlock(&m->file_mu); return 0; }
     if (!m->wr) m->wr = open_conn(m);
     if (!m->wr) { pthread_mutex_unlock(&m->file_mu); return SQLITE_CANTOPEN; }
+    struct mw_purge *purge = NULL; int npurge = 0;
+    pthread_mutex_lock(&m->purge_mu); if (m->npurge) { purge = malloc((size_t)m->npurge * sizeof *purge); if (purge) { memcpy(purge, m->purge, (size_t)m->npurge * sizeof *purge); npurge = m->npurge; } } pthread_mutex_unlock(&m->purge_mu);
     fitem *v = NULL; int n = 0;
     if (collect(m, F, &v, &n) != 0) { pthread_mutex_unlock(&m->file_mu); return SQLITE_NOMEM; }
     int rc = SQLITE_BUSY;
     for (int attempt = 0; attempt < 200 && busyish(rc); attempt++) {
-        rc = write_batch(m, v, n, V, nsites);
+        rc = write_batch(m, v, n, V, nsites, purge, npurge);
         if (busyish(rc)) { atomic_fetch_add(&m->flush_retries, 1); usleep(500 * (unsigned)(attempt < 20 ? attempt + 1 : 20)); }
     }
     for (int i = 0; i < n; i++) { free(v[i].pk); free(v[i].c); }
-    free(v);
+    free(v); free(purge);
     if (rc == SQLITE_OK) {
+        pthread_mutex_lock(&m->purge_mu);                                         // (a drop that happened again meanwhile has a newer epoch and stays)
+        for (int i = 0; i < npurge; i++) for (int q = 0; q < m->npurge; q++) if (m->purge[q].tbl == purge[i].tbl && m->purge[q].epoch == purge[i].epoch) { m->purge[q] = m->purge[--m->npurge]; break; }
+        pthread_mutex_unlock(&m->purge_mu);
         atomic_store(&m->flushed, V); m->sites_flushed = nsites;
         uint64_t cleaned = 0;
         for (int s = 0; s < STRIPES; s++) {

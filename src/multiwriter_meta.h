@@ -31,6 +31,7 @@ const crdt_ops *mw_ovl_ops (void);                                          // t
 typedef bool (*mw_value_fn) (void *arg, uint32_t tbl, const void *pk, size_t pklen, uint32_t col, crdt_value *out);
 void    mw_ovl_set_value_fn (mw_ovl *o, mw_value_fn fn, void *arg);         // the base-table value of a cell (the merge needs it when the versions tie)
 bool    mw_ovl_empty (const mw_ovl *o);
+void    mw_ovl_purge (mw_ovl *o, uint32_t tbl);                              // the table is gone: all its cells go (DROP TABLE)
 int     mw_ovl_encode (mw_ovl *o, uint8_t **ext, uint32_t *len);            // the delta as a record extension (malloc'd; len 0 and *ext NULL if there is nothing)
 
 // ---- applying a delta ----

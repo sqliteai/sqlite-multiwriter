@@ -211,6 +211,10 @@ struct mw_lane {
     sqlite3    *rb_c, *rb_v;    // cached rebase helper connections (writer at the latest snapshot / overlay reader)
     // change capture (mw_cdc=1): the row changes of the transaction being committed, and the catalog they were decoded with
     mw_rd_result cdc_res; mw_cat *cdc_cat; int cdc_nfreed;
+    bool        cdc_vacuum;                      // a VACUUM statement is running on this connection (its commit rebuilds every table)
+    const uint8_t *const *cdc_over;              // while the catalog of a schema-changing commit is read: the pages the commit wrote (they win over the snapshot's)
+    const char *const *cdc_skip; int cdc_nskip;  // tables whose rows are not diffed in this commit (reshaped by DDL)
+    const char *const *cdc_skip_old; int cdc_nskip_old;   // tables whose rows are not diffed on the old side only (dropped and created again: the old rows are gone, the new ones are inserts)
     struct mw_ovl *cdc_ovl;                      // the metadata delta of the commit being published (multiwriter_meta.c)
     uint8_t *cdc_ext; uint32_t cdc_ext_len;      // the commit's change-capture extension, written in the log record next to the pages
     int64_t     min_reserved;   // lowest db_version reserved by the current transaction, 0 = none (protected by db->mu)
@@ -535,7 +539,7 @@ void     mw_gate_exit (mw_db *db);
 void     mw_gate_close (mw_db *db, mw_lane *owner);       // starving rebase: exclusive side
 void     mw_gate_open (mw_db *db);   // multiwriter_rebase.c: replay the logical changes at the latest snapshot
 void     mw_lane_rebase_free (mw_lane *lane);
-typedef struct { void *ctx; uint32_t (*old_owner) (void *ctx, uint32_t pgno); uint32_t (*ovfl_owner) (void *ctx, uint32_t pgno); const mw_cat *cat; } mw_rd_owner;      // the table (root page) a page belonged to before the commit, 0 if unknown; the schema
+typedef struct { void *ctx; uint32_t (*old_owner) (void *ctx, uint32_t pgno); uint32_t (*ovfl_owner) (void *ctx, uint32_t pgno); const mw_cat *cat; const mw_cat *old_cat; const char *const *skip; int nskip; } mw_rd_owner;      // the table (root page) a page belonged to before the commit, 0 if unknown; the schema
 // One row of the net change of a commit. pk: the key as sqlite-sync encodes it (NULL if the row could not be decoded); oldpk: an update that changed the key; changed: bit i = cell i of the
 // table changed (bit 63 = all of them).
 void     mw_rd_result_free (mw_rd_result *r);

@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <strings.h>
 #include "multiwriter_internal.h"
 #include "multiwriter_meta.h"
 
@@ -161,25 +162,50 @@ static mw_cat *catalog_for (mw_cdc *c, mw_lane *lane) {
     return cat;
 }
 
-static void build_delta (mw_lane *lane, mw_cdc *c);
+static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int npurge);
+
+// ---- DDL in the commit ----
+typedef struct { const char **skip; int nskip; const char **skip_old; int nskip_old; uint32_t *purge; int npurge; } ddl_plan;
+// What the schema change of this commit does to the tables, by name. A table that is in both catalogs is the same table: its rows are diffed by content (cells of an old and a new
+// layout are matched by column name; VACUUM rebuilds every table with the same rows, which nets to nothing). A table that is gone: its cells go too (DROP TABLE is not a delete of its rows
+// at the peers; sqlite-sync's cleanup does the same), and its rows are not diffed. A table that is new: its rows are inserts.
+static void plan_ddl (const mw_cat *oc, const mw_cat *nc, ddl_plan *pl) {
+    int cap = oc->n + 1;
+    pl->skip_old = calloc((size_t)cap, sizeof *pl->skip_old); pl->purge = calloc((size_t)cap, sizeof *pl->purge);
+    if (!pl->skip_old || !pl->purge) return;
+    for (int i = 0; i < oc->n; i++) { const mw_tab *o = &oc->tabs[i]; if (!o->tracked || mw_cat_by_name(nc, o->name)) continue; pl->skip_old[pl->nskip_old++] = o->name; if (o->synced) pl->purge[pl->npurge++] = o->tid; }
+}
 
 // ---- per commit ----
 void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
     mw_cdc *c = lane->db->cdc; uint64_t t0 = now_ns();
     mw_rd_result_free(&lane->cdc_res); lane->cdc_nfreed = 0;
-    mw_cat *cat = catalog_for(c, lane);
-    mw_rd_owner own = { c, old_owner, ovfl_owner, cat };
+    mw_cat *cat = catalog_for(c, lane), *newcat = NULL;
+    ddl_plan plan = {0};
+    const uint8_t *p1new = NULL; for (int i = 0; i < lane->ws_n; i++) if (lane->ws_pgnos[i] == 1) p1new = imgs[i];
+    if (p1new && cat && be32(p1new + 40) != cat->cookie) {                       // the schema changes in this commit: the rows of the new tables, the dropped tables, VACUUM
+        lane->cdc_over = imgs; newcat = mw_cat_build(lane); lane->cdc_over = NULL;
+        if (newcat) plan_ddl(cat, newcat, &plan);
+    }
+    free(plan.skip);                                                            // (set below for VACUUM)
+    plan.skip = NULL; plan.nskip = 0;
+    if (lane->cdc_vacuum) { lane->cdc_vacuum = false; plan.skip = calloc((size_t)(cat->n + 1), sizeof *plan.skip); if (plan.skip) for (int i = 0; i < cat->n; i++) plan.skip[plan.nskip++] = cat->tabs[i].name; }       // VACUUM: every table is rebuilt with the same rows
+    mw_rd_owner own = { c, old_owner, ovfl_owner, newcat ? newcat : cat, newcat ? cat : NULL, NULL, 0 };
+    lane->cdc_skip = plan.skip; lane->cdc_nskip = plan.nskip; lane->cdc_skip_old = plan.skip_old; lane->cdc_nskip_old = plan.nskip_old;
     mw_rowdiff_compute(lane, imgs, &own, &lane->cdc_res);
     if (lane->cdc_res.unknown_ovfl && !c->ovfl_complete) {                                // an overflow page written without its cell and nobody to ask: scan once, then ask again
         pthread_mutex_lock(&c->mu); if (!c->ovfl_complete) build_ovfl(c, lane); pthread_mutex_unlock(&c->mu);
         mw_rd_result_free(&lane->cdc_res); mw_rowdiff_compute(lane, imgs, &own, &lane->cdc_res);
     }
+    lane->cdc_skip = NULL; lane->cdc_nskip = 0; lane->cdc_skip_old = NULL; lane->cdc_nskip_old = 0;
     if (lane->cdc_res.unknown_ovfl) atomic_fetch_add(&c->ovfl_unattributed, (uint64_t)lane->cdc_res.unknown_ovfl);
     atomic_fetch_add(&c->commits, 1); atomic_fetch_add(&c->changes, (uint64_t)lane->cdc_res.n);
     for (int i = 0; i < lane->cdc_res.n; i++) if (!lane->cdc_res.chg[i].tab) atomic_fetch_add(&c->unowned, 1);
     if (c->sink) c->sink(c->sink_arg, lane->cdc_res.chg, lane->cdc_res.n, &lane->cdc_res.info);
-    build_delta(lane, c);
-    lane->cdc_cat = cat;                                                   // (kept for the apply step of the same commit; released there)
+    build_delta(lane, c, plan.purge, plan.npurge);
+    free(plan.skip); free(plan.skip_old); free(plan.purge);
+    // the rows point into the catalog they were decoded with: it stays alive until the apply step of the same commit
+    if (newcat) { mw_cat_free(cat); lane->cdc_cat = newcat; } else lane->cdc_cat = cat;
     atomic_fetch_add(&c->ns_prepare, now_ns() - t0);
 }
 
@@ -202,7 +228,7 @@ void mw_cdc_apply_owner (mw_db *db, mw_lane *lane, const uint32_t *pgnos, const 
 static void ensure_ready (mw_db *db, mw_cdc *c) { (void)db; if (!c->ready) { mw_meta_ready(c->meta); c->ready = true; } }
 
 // the changes of the commit as local changes of the CRDT, into the lane's overlay; the overlay is then encoded as the record extension
-static void build_delta (mw_lane *lane, mw_cdc *c) {
+static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int npurge) {
     free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
     if (!lane->cdc_ovl) lane->cdc_ovl = mw_ovl_new(c->meta);
     if (!lane->cdc_ovl) return;
@@ -210,6 +236,7 @@ static void build_delta (mw_lane *lane, mw_cdc *c) {
     ensure_ready(lane->db, c);
     const crdt_ops *ops = mw_ovl_ops();
     int64_t seq = 0;
+    for (int i = 0; i < npurge; i++) mw_ovl_purge(o, purge[i]);
     // order: deletes (a key that is deleted and written again in one commit is a new life of the row), key changes, inserts, updates
     for (int pass = 0; pass < 4; pass++) for (int i = 0; i < lane->cdc_res.n; i++) {
         const mw_chg *x = &lane->cdc_res.chg[i]; const mw_tab *t = x->tab;

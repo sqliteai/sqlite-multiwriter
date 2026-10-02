@@ -24,6 +24,7 @@ typedef struct {
     int nrec;                           // columns stored in a record
     int npk; int pk_rec[MW_CAT_MAXPK];  // the record column of each key column, in key order
     bool synced;                        // the CRDT keeps cells for it: tracked, has an explicit primary key, not an internal table (mw_*, sqlite_*), no id collisions
+    uint64_t sqlhash;                   // hash of the CREATE TABLE text: a rebuilt table with the same text (VACUUM) is the same table
     uint32_t tid;                       // stable id of the table: hash of its name (the same on every peer, nothing to persist)
     uint32_t *cell_id;                  // stable id of each cell: hash of the column name
     int ncells; int *cell_rec; char **cell_name;     // the cells: non-key, non-generated columns in column order; cell i lives in record column cell_rec[i]

@@ -61,7 +61,11 @@ static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
     static const char *kw[] = { "CREATE", "DROP", "ALTER", "REINDEX", "VACUUM" };
     for (unsigned i = 0; i < sizeof(kw) / sizeof(kw[0]); i++) {
         size_t n = strlen(kw[i]);
-        if (sqlite3_strnicmp(sql, kw[i], (int)n) == 0) { sqlite3_file_control(sqlite3_db_handle(st), "main", MW_FCNTL_DDL_BEGIN, NULL); return 0; }
+        if (sqlite3_strnicmp(sql, kw[i], (int)n) == 0) {
+            sqlite3_file_control(sqlite3_db_handle(st), "main", MW_FCNTL_DDL_BEGIN, NULL);
+            if (i == 4) sqlite3_file_control(sqlite3_db_handle(st), "main", MW_FCNTL_VACUUM_BEGIN, NULL);
+            return 0;
+        }
     }
     return 0;
 }

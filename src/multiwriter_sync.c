@@ -301,6 +301,8 @@ int mw_sync_apply (sqlite3 *db, const uint8_t *payload, size_t len, mw_sync_stat
         mw_ovl *ov = mw_ovl_new(m); sysch sc; if (!ov || sch_load(db, &sc) != SQLITE_OK) { mw_ovl_free(ov); rc = SQLITE_NOMEM; break; }
         sc.meta = m; mw_ovl_set_value_fn(ov, value_cb, &sc);
         stats->applied = stats->ignored = 0;
+        int gate = attempt >= 6;                                           // it keeps losing against the commits of this process: they wait until it is through
+        if (gate) sqlite3_file_control(db, "main", MW_FCNTL_GATE, &gate);
         rc = sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
         if (rc == SQLITE_OK) {
             sqlite3_file_control(db, "main", MW_FCNTL_DECLARE, ov);
@@ -309,6 +311,7 @@ int mw_sync_apply (sqlite3 *db, const uint8_t *payload, size_t len, mw_sync_stat
             sqlite3_file_control(db, "main", MW_FCNTL_DECLARE, NULL);
             if (rc != SQLITE_OK && !sqlite3_get_autocommit(db)) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         }
+        if (gate) { int off = 0; sqlite3_file_control(db, "main", MW_FCNTL_GATE, &off); }
         sch_free(&sc); mw_ovl_free(ov);
         if (rc != SQLITE_OK && busyish(rc) && attempt < 1000) { stats->retries++; rc = SQLITE_OK; usleep(200u * (unsigned)(attempt < 50 ? attempt + 1 : 50)); continue; }
         break;

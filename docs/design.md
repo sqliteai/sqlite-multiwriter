@@ -1,58 +1,111 @@
-# sqlite-multiwriter: design and plan
+# sqlite-multiwriter: design
 
 ## What it is
 
 A wrapper VFS that lets many connections (threads and processes) write one SQLite database concurrently (page-level optimistic concurrency, a commit log with group
-commit, versioned pages, compaction into the database file: docs/engine-history.md has the measurements behind each choice), and that captures, for every table, the
-row-level changes of every commit so that the database always carries the state a CRDT (the algorithms of sqlite-sync) needs. No SQLite source is changed, no SQL syntax
-is added, triggers and hooks are not used (they do not exist for WITHOUT ROWID tables, the pre-update hook needs a compile option, and an application can replace
-the update hook of its connection).
+commit, versioned pages, compaction into the database file: `docs/engine-history.md` has the measurements behind each choice of the engine), and that captures, for
+**every** table, the row-level changes of every commit, so that the database always carries the state a CRDT (the algorithms of sqlite-sync) needs. No SQLite source
+is changed, no SQL syntax is added, triggers and hooks are not used (they do not exist for WITHOUT ROWID tables, the pre-update hook needs a compile option, and an
+application can replace the update hook of its connection).
 
-sqlite-sync (`deps/sqlite-sync`, a submodule) is the reference for the algorithms and the wire format, and it is the oracle of the differential tests. Its SQL-level
-API (database.h, the metadata tables built by triggers, the `cloudsync_*` functions) is not used.
+sqlite-sync (`deps/sqlite-sync`, a submodule) is the reference for the algorithms and the wire format and the oracle of the differential tests. Its SQL-level API
+(`database.h`, the metadata tables built by triggers, the `cloudsync_*` functions) is not used; of the submodule only `lz4.c` is linked into the library.
+
+Open a database through the VFS with `file:db?mw=2&mw_cdc=1` (threads, one process) or `file:db?mw=2&mw_mp=1&mw_cdc=1` (processes; `mw_mp=1` is the shared mode). Without
+`mw_cdc=1` it is the plain multi-writer engine.
 
 ## Layers
 
 1. **Engine** (`src/multiwriter_*.c`): lanes (one per connection), page store, commit log (staged ring in one process, segmented log shared by processes), shared version
-   index, compaction, relocation of pages after concurrent growth, admission control, recovery after a crash. Unchanged by what follows except for one addition: a commit
-   record can carry a *metadata extension* (below).
-2. **Capture** (`multiwriter_rowdiff.c`, `multiwriter_cdc.c`): from the pages a transaction wrote and the same pages at its snapshot, the net row changes of every table
-   b-tree: inserts, updates (with the columns that changed), deletes. The table of a page comes from the owner map (page -> root page), kept up to date from the commits.
-   The schema (columns, primary key, WITHOUT ROWID, INTEGER PRIMARY KEY alias) comes from `sqlite_schema` through a helper connection, refreshed when the schema cookie moves.
-3. **CRDT core** (`src/crdt/`): the algorithms of sqlite-sync as pure functions over a small state interface: causal length per row (odd = alive), column version
-   per cell (odd = alive, +2 per local update, +1 when it is even), db_version and seq per change, site id; local change generation from the captured row changes; merge of
-   a remote change (causal length first, then column version, then the value, then the site id); export of "changes since db_version"; primary-key and payload encoding.
-4. **Metadata store**: where the state lives. A shared memory table (per cell: version, db_version, site, seq) in front of an ordinary table inside the database file
-   (`mw_cells`), written in batches by a flusher in ordinary, logged transactions. The database file is therefore self-contained: copy it and the CRDT state comes along.
-5. **Sync API** (`src/sync/`): site id, db_version, export a payload since a version, apply a payload atomically, the commit hook for "this commit was made by a merge".
+   index, compaction, relocation of pages after concurrent growth, admission control, recovery after a crash. A commit record carries, after its pages, a *metadata
+   extension* (the CRDT state of the rows the commit touched).
+2. **Capture** (`multiwriter_rowdiff.c`, `multiwriter_catalog.c`, `multiwriter_cdc.c`): from the pages a transaction wrote and the same pages at its snapshot, the net
+   row changes of every table b-tree: inserts, updates (with the cells that changed), deletes, key changes. The table of a page comes from the owner map
+   (page -> root page of its table, kept up to date from the commits); the layout of a table from the catalog (`sqlite_schema` parsed by SQLite itself in a scratch
+   database: generated columns, WITHOUT ROWID, collations, INTEGER PRIMARY KEY aliases are never guessed). Overflow pages are followed; a write to an overflow page alone
+   (the tail of a big value changes, the cell does not) is attributed through an overflow owner map.
+3. **CRDT core** (`src/crdt/`): the algorithms of sqlite-sync as functions over an abstract state: causal length per row (odd = alive), column version per cell (odd =
+   alive, +2 per local update, +1 when it is even), the merge of a remote change (causal length, then column version, then the value, then the site id), the primary-key
+   byte format. It is differentially tested against the real sqlite-sync (`test/oracle_*.c`).
+4. **Metadata store** (`multiwriter_meta*.c`, `multiwriter_mmeta.c`): per row the cells (column version, db_version, site, sequence). In one process a striped memory table
+   in front of three ordinary tables of the database file; in several processes a shared index of row buckets into the log. See below.
+5. **Sync API** (`multiwriter_sync.c`): site id, db_version, export a payload since a db_version, apply a payload atomically.
 
-## Atomicity and durability of the metadata (the rule that keeps it ACID)
+## What a commit carries
 
-The metadata of a commit is a function of the commit's record (its pages, and for a merge its declared cell versions) and of the state before it. So it is never
-logged separately: a commit is durable when its record is in the log, and its metadata is recomputed from the record wherever it is missing.
-- Applying a commit puts its cells in the shared memory table *before the commit becomes visible* (a transaction that sees it finds its versions).
-- The flusher writes the cells to `mw_cells` in one transaction together with the row `meta_epoch = F` of `mw_state`: F is the visible epoch at the moment the table
-  was switched, so every commit <= F is in the batch. The batch and F are atomic (one commit).
-- Recovery (the first process to open, after a crash): the pages come back from the log as today; the metadata of every commit with epoch > meta_epoch is recomputed by replaying
-  its record through capture and the CRDT core in epoch order (the old images are the versions in the page store). Replay is idempotent: a cell whose stored db_version is
-  >= the epoch being replayed is skipped (the flush batch may contain cells of commits above F).
-- Compaction may not move the base above meta_epoch (the old images of the records to replay would be gone): a compaction that needs it asks for a flush first.
-- A commit made by a merge (remote changes) carries its cell versions in the record extension: replay must not take its row changes for local edits.
+The metadata of a commit is a function of its row changes and of the state before it. It is computed before the commit is published, from the transaction's own pages,
+and written *inside the commit record*: the rows the commit touched, each with its complete new state (every cell: column id, version, db_version, site, seq). Applying a
+commit's metadata is the single way the state changes, whether the commit is ours (at publication), another process's, or the log's (at recovery), and it is idempotent:
+the state of a row is replaced, so applying a commit twice, or after a flush that already holds it, changes nothing.
 
-## Multi-process
+Ids are stable and nothing has to be persisted for them: a table's id is the hash of its name (case-insensitive FNV-1a), a column's id the hash of its name; a collision between
+two tables (or two columns of a table) is detected when the catalog is built and the later one is not synchronised. Sites have ordinals (0 = this database) that the extension
+names with their ids, so a replay can rebuild the map.
 
-The owner map, the schema catalog, the memory table and its change feed are in shared memory (one writer at a time under the publication lock; lock-free readers; the flusher
-elected like the compactor). Every process applies the commits of the others to what it keeps privately (nothing in the shared design needs that: the shared tables are the state).
+db_versions: each commit has the db_version `epoch + origin`, where the epoch is the engine's commit counter (it restarts at 1 whenever the database is opened afresh after a
+clean close) and `origin` is the largest db_version the file tables have seen, found when the store is first used. So db_versions only grow, over restarts too.
+
+## Where the state lives
+
+### One process (`mw_mp=0`)
+A table of rows in memory (striped by row hash, each entry the cells of one row), applied by the publisher after the commit's record is in the log and before the commit is
+visible. Rows changed since the last flush are *dirty* and never dropped; the rest is a cache that is filled from the file when a row is asked for and shrinks under a budget.
+
+### Several processes (`mw_mp=1`, the shared mode)
+Nothing is kept in a process. The newest state of a row is in the log (the extension of the commit that made it) and a **second shared index** (`<db>-mwrow`, the same
+structure as the page index) maps the *bucket* of the row (hash of table and key, 2^21 buckets) to the log position of the newest state of the whole bucket. A commit writes
+the complete new state of every bucket it touches (the touched rows and the others the bucket holds, which are almost always none), so the head version of a bucket is
+complete and older versions are only for readers that started earlier (none: reads take the head). The publisher, under the publication lock, validates that the buckets it
+writes have the head epoch the transaction read them at, installs them, and publishes. The owner maps are a file mapped by every process (`<db>-mwown`), rebuilt, when the schema
+cookie moves, under the publication lock. The site table and the list of dropped tables are in the shared header. The flusher is whichever process claims it (a byte lock).
+
+### The file tables
+`mw_state(k, v)` (`meta_epoch`, `dv_hwm`), `mw_sites(ord, id)`, `mw_cells(tbl, pk, col, cv, dv, seq, site)` (WITHOUT ROWID, plus an index on `dv, seq`), created by the first
+connection. They are ordinary tables, so the file is self-contained: copy it and the CRDT state comes along. A flusher thread writes what changed since the last flush in one
+ordinary logged transaction together with `meta_epoch`: the batch and the epoch it covers are atomic. Reads that miss the cache go through a small pool of read-only connections.
+
+### Durability and recovery (the rule that makes it ACID)
+- A commit is durable when its record is in the log; its metadata is in the record. A crash can therefore never leave pages without their metadata or metadata without
+  pages: they are one record, valid or not as a whole (checksummed).
+- Recovery replays the valid prefix of the log: pages as always, and the extensions of the records (memory table in one process, bucket index in several). The flush point of
+  the file is of an older incarnation of the epochs, so everything the log holds is applied again (idempotent).
+- Compaction (which moves the log into the database file and lets the log forget) is held back to the flushed point as long as there is metadata above it: the metadata of
+  a commit exists in the log record or in the file tables, never nowhere. A compaction that is limited asks the flusher to run.
+- The last connection to close flushes before the log is dropped.
+
+## Capture and DDL
+
+Tables are tracked when they have an explicit primary key and are not internal (`mw_*`, `sqlite_*`). A table without a primary key has no stable identity and is not synchronised.
+- A table created and filled in one transaction: its rows are captured (the catalog of the new schema is built from the transaction's own pages).
+- ADD / DROP COLUMN, and a table recreated with another layout: rows are matched by content and cells by column name (a column that is new to the record of a rewritten
+  row gets a cell, the default of the column is not known to the capture).
+- DROP TABLE removes the cells of the table (it is not a delete of its rows: sqlite-sync's cleanup does the same); dead cells are filtered by db_version until a flush deletes them.
+- VACUUM (recognised as a statement) changes no row logically and produces no changes. RENAME TABLE starts the new name clean (the history of the old name goes).
+- Savepoints and rollbacks leave no trace (nothing is captured before the commit); triggers and foreign-key actions are rows like any other.
+
+## Sync
+
+`mw_sync_export(db, since, &payload, &len, &upto)`: every change with db_version in `(since, upto]`, as the container of sqlite-sync (header `CLSY`, LZ4, tuples
+`(tbl, pk, col_name, col_value, col_version, db_version, site_id, cl, seq)`), so peers of either implementation understand each other; `mw_sync_apply(db, payload, len, &stats)`:
+the merge in one transaction, all or nothing, retried on conflicts, holding the commit gate of the process when it keeps losing. The merge decisions are made on the metadata
+overlay of the transaction; the commit then *declares* its metadata (the merge's cells) instead of having it derived from the pages, and the extension of the commit carries it.
+`mw_sync_backfill` creates the metadata of rows that exist without any (a database that had data before the capture was on).
+
+A difference with sqlite-sync that is by design: versions are counted per commit, not per statement (a row changed twice in one transaction gets one version bump, not two).
+Cells of equal version and equal value are won by the larger site id (sqlite-sync's `merge_equal_values`); the site of a causal-length entry is whoever got there first when two
+peers delete or resurrect the same row, as in sqlite-sync; the *version* is what converges.
 
 ## What is covered, what is not
 
-Covered by design: rowid tables with and without INTEGER PRIMARY KEY, tables with a TEXT/composite/BLOB primary key, WITHOUT ROWID tables, tables without a primary key (tracked
-locally by rowid, not exported: no stable identity), overflow values, DDL (the capture stops at a schema change and re-reads the catalog), VACUUM (a barrier), savepoints, rollbacks,
-triggers and foreign-key actions (they are rows like any other), attached databases (not supported), virtual tables (their shadow tables are tables; the virtual table itself is not tracked).
-Not covered in v1: block-level (text) merging, the DWS/AWS algorithms, filters/RLS, the network layer.
+Covered and tested: rowid tables with and without INTEGER PRIMARY KEY, TEXT / composite / BLOB keys, WITHOUT ROWID tables, key changes, overflow values (including overflow-only
+updates), tables with more than 63 columns, values of every type, DDL as above, savepoints and rollbacks, triggers, foreign-key actions, upserts, updates that change nothing,
+threads and processes, crashes (SIGKILL at any moment, flush at any pace, log compacting), concurrent applies and local writes, convergence of several peers.
+Not covered (by design, version 1): block-level (text) merging, the DWS/AWS algorithms, filters/row-level security, the network layer, attached databases, virtual tables
+(their shadow tables are tables; the virtual table itself is not tracked), tables without a primary key (kept locally, not exported), the multi-process mode with private
+stores (`mw_mp=3`: the metadata design needs the shared mode; opening it with `mw_cdc=1` is refused). Platforms: macOS; Linux, iOS, Windows, Android later.
 
-## Milestones
+## Tests
 
-M0 repository, standalone build, engine and its suite (done). M1 capture for every table kind (catalog, WITHOUT ROWID, overflow, DDL) with randomized differential tests.
-M2 CRDT core + differential tests against sqlite-sync. M3 metadata store, flusher, recovery; crash tests. M4 sync API (export/apply), two-peer convergence tests incl. concurrent
-writers. M5 multi-process. M6 benchmarks against the previous version (tracked and untracked), memory.
+`make test` (the engine and the metadata: capture against a model, the store across restarts and SIGKILL, DDL, sync convergence and atomicity, multi-process with a live reader
+and SIGKILL rounds), `make oracle-test` (differential tests against sqlite-sync: primary-key encoding, local generation, merge of 37 thousand changes, 4000 transactions of the
+live store, features, 300 rounds of two peers exchanging payloads through the real encoder and decoder), `make test-mp` (the metadata tests again with the processes mode).

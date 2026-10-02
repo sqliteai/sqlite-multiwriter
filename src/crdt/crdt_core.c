@@ -20,7 +20,7 @@ static crdt_cell local_cell (const crdt_ops *o, void *st, uint32_t tbl, const vo
     return c;
 }
 
-int crdt_local_insert (const crdt_ops *o, void *st, uint32_t tbl, const void *pk, size_t pklen, int ncols, int64_t dv, int64_t *seq, crdt_wcell *out, int max) {
+int crdt_local_insert (const crdt_ops *o, void *st, uint32_t tbl, const void *pk, size_t pklen, const uint32_t *cols, int ncols, int64_t dv, int64_t *seq, crdt_wcell *out, int max) {
     int n = 0; crdt_cell c;
     bool known = o->row_known(st, tbl, pk, pklen);
     if (ncols == 0) {                                                  // a table with nothing but its key: the sentinel is the row
@@ -32,7 +32,8 @@ int crdt_local_insert (const crdt_ops *o, void *st, uint32_t tbl, const void *pk
         }
     }
     for (int i = 0; i < ncols; i++) {
-        c = local_cell(o, st, tbl, pk, pklen, (uint32_t)i, dv, seq); o->put(st, tbl, pk, pklen, (uint32_t)i, &c); n = emit(out, max, n, (uint32_t)i, &c);
+        uint32_t col = cols ? cols[i] : (uint32_t)i;
+        c = local_cell(o, st, tbl, pk, pklen, col, dv, seq); o->put(st, tbl, pk, pklen, col, &c); n = emit(out, max, n, col, &c);
     }
     return n;
 }

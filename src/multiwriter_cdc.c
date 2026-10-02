@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include "multiwriter_internal.h"
+#include "multiwriter_meta.h"
 
 #define OWNER_PAGES (1u << 24)                            // pages the owner map can describe (64 GB at 4 KB)
 
@@ -25,6 +26,7 @@ typedef struct {
     _Atomic uint32_t *ovo;                               // overflow page -> the leaf (or index) page holding the cell whose record spills into it
     bool ovfl_complete;                                  // ovo covers every record with overflow of the database (built by a scan on the first overflow page written without its cell)
     mw_cat *cat; uint32_t cookie; bool built;
+    mw_meta *meta; pthread_mutex_t ready_mu; bool ready;  // the CRDT metadata; ready once the extensions found in the log at recovery are applied
     mw_cdc_sink_fn sink; void *sink_arg;                  // tests: every commit's changes
     _Atomic uint64_t commits, changes, unowned, builds, ovfl_scans, ovfl_unattributed, ns_prepare, ns_build;
 } mw_cdc;
@@ -39,7 +41,9 @@ int mw_cdc_open (mw_db *db) {
     c->owner = mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     c->ovo = mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (c->owner == MAP_FAILED || c->ovo == MAP_FAILED) { free(c); return SQLITE_NOMEM; }
-    pthread_mutex_init(&c->mu, NULL);
+    pthread_mutex_init(&c->mu, NULL); pthread_mutex_init(&c->ready_mu, NULL);
+    c->meta = mw_meta_new(db);
+    if (!c->meta) { free(c); return SQLITE_NOMEM; }
     db->cdc = c;
     return SQLITE_OK;
 }
@@ -49,7 +53,7 @@ void mw_cdc_close (mw_db *db) {
     if (!c) return;
     if (getenv("MW_CDC_STATS")) fprintf(stderr, "cdc: %llu commits, %llu row changes (%llu in pages of unknown owner), catalog/owner map built %llu times (%.1f ms), overflow map scanned %llu times, %llu overflow writes unattributed; prepare %.2f us per commit\n",
         (unsigned long long)c->commits, (unsigned long long)c->changes, (unsigned long long)c->unowned, (unsigned long long)c->builds, (double)c->ns_build / 1e6, (unsigned long long)c->ovfl_scans, (unsigned long long)c->ovfl_unattributed, c->commits ? (double)c->ns_prepare / 1000.0 / (double)c->commits : 0.0);
-    mw_cat_free(c->cat);
+    mw_cat_free(c->cat); mw_meta_free(c->meta);
     munmap((void *)c->owner, (size_t)OWNER_PAGES * sizeof(uint32_t)); munmap((void *)c->ovo, (size_t)OWNER_PAGES * sizeof(uint32_t));
     pthread_mutex_destroy(&c->mu);
     free(c);
@@ -156,6 +160,8 @@ static mw_cat *catalog_for (mw_cdc *c, mw_lane *lane) {
     return cat;
 }
 
+static void build_delta (mw_lane *lane, mw_cdc *c);
+
 // ---- per commit ----
 void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
     mw_cdc *c = lane->db->cdc; uint64_t t0 = now_ns();
@@ -171,6 +177,7 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
     atomic_fetch_add(&c->commits, 1); atomic_fetch_add(&c->changes, (uint64_t)lane->cdc_res.n);
     for (int i = 0; i < lane->cdc_res.n; i++) if (!lane->cdc_res.chg[i].tab) atomic_fetch_add(&c->unowned, 1);
     if (c->sink) c->sink(c->sink_arg, lane->cdc_res.chg, lane->cdc_res.n, &lane->cdc_res.info);
+    build_delta(lane, c);
     lane->cdc_cat = cat;                                                   // (kept for the apply step of the same commit; released there)
     atomic_fetch_add(&c->ns_prepare, now_ns() - t0);
 }
@@ -190,10 +197,56 @@ void mw_cdc_apply_owner (mw_db *db, mw_lane *lane, const uint32_t *pgnos, const 
     for (int i = 0; i < lane->cdc_res.novupd; i++) ovo_set(c, lane->cdc_res.ovupd[i].page, lane->cdc_res.ovupd[i].leaf);
 }
 
+// ---- the CRDT metadata of the commit ----
+// the extensions the log held at recovery, applied once before the first use of the store (the file part of it comes in the next step)
+static void ensure_ready (mw_db *db, mw_cdc *c) {
+    if (c->ready) return;
+    pthread_mutex_lock(&c->ready_mu);
+    if (!c->ready) {
+        for (int i = 0; i < db->nrext; i++) (void)mw_meta_replay(c->meta, db->rext[i].epoch, db->rext[i].data, db->rext[i].len);
+        c->ready = true;
+    }
+    pthread_mutex_unlock(&c->ready_mu);
+}
+
+// the changes of the commit as local changes of the CRDT, into the lane's overlay; the overlay is then encoded as the record extension
+static void build_delta (mw_lane *lane, mw_cdc *c) {
+    free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
+    if (!lane->cdc_ovl) lane->cdc_ovl = mw_ovl_new(c->meta);
+    if (!lane->cdc_ovl) return;
+    mw_ovl *o = lane->cdc_ovl; mw_ovl_clear(o);
+    ensure_ready(lane->db, c);
+    const crdt_ops *ops = mw_ovl_ops();
+    int64_t seq = 0;
+    // order: deletes (a key that is deleted and written again in one commit is a new life of the row), key changes, inserts, updates
+    for (int pass = 0; pass < 4; pass++) for (int i = 0; i < lane->cdc_res.n; i++) {
+        const mw_chg *x = &lane->cdc_res.chg[i]; const mw_tab *t = x->tab;
+        if (!t || !t->synced || !x->pk) continue;
+        int want = x->kind == 3 ? 0 : (x->kind == 2 && x->oldpk) ? 1 : x->kind == 1 ? 2 : 3;
+        if (want != pass) continue;
+        uint32_t cols[64]; int nc = 0;
+        if (x->kind == 2 && !x->oldpk) { for (int k = 0; k < t->ncells && k < 63; k++) if (x->changed & (1ull << k)) cols[nc++] = t->cell_id[k]; if (t->ncells > 63 && (x->changed >> 63)) { nc = 0; for (int k = 0; k < t->ncells && nc < 64; k++) cols[nc++] = t->cell_id[k]; } }
+        if (x->kind == 3) crdt_local_delete(ops, o, t->tid, x->pk, x->pklen, 0, &seq, NULL, 0);
+        else if (x->kind == 1) crdt_local_insert(ops, o, t->tid, x->pk, x->pklen, t->cell_id, t->ncells, 0, &seq, NULL, 0);
+        else if (x->oldpk) crdt_local_rekey(ops, o, t->tid, x->oldpk, x->oldpklen, x->pk, x->pklen, t->cell_id, t->ncells, 0, &seq, NULL, 0);
+        else if (nc) crdt_local_update(ops, o, t->tid, x->pk, x->pklen, cols, nc, 0, &seq, NULL, 0);
+    }
+    if (mw_ovl_encode(o, &lane->cdc_ext, &lane->cdc_ext_len) != 0) { lane->cdc_ext = NULL; lane->cdc_ext_len = 0; }
+}
+
 void mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch) {
-    (void)db; (void)epoch;
+    mw_cdc *c = db->cdc;
+    if (lane->cdc_ovl && lane->cdc_ext_len) mw_meta_apply(c->meta, lane->cdc_ovl, epoch);
+    if (lane->cdc_ovl) mw_ovl_clear(lane->cdc_ovl);
+    free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
     mw_cat_free(lane->cdc_cat); lane->cdc_cat = NULL;
     mw_rd_result_free(&lane->cdc_res);
 }
 
-void mw_cdc_lane_free (mw_lane *lane) { mw_rd_result_free(&lane->cdc_res); mw_cat_free(lane->cdc_cat); lane->cdc_cat = NULL; }
+void mw_cdc_lane_free (mw_lane *lane) {
+    mw_rd_result_free(&lane->cdc_res); mw_cat_free(lane->cdc_cat); lane->cdc_cat = NULL;
+    free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
+    mw_ovl_free(lane->cdc_ovl); lane->cdc_ovl = NULL;
+}
+
+mw_meta *mw_cdc_meta (mw_db *db) { mw_cdc *c = db->cdc; return c ? c->meta : NULL; }

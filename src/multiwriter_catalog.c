@@ -85,7 +85,13 @@ static void schema_collect (mw_lane *lane, uint32_t pgno, uint32_t pgsz, srows *
 
 static bool starts_ci (const char *s, const char *p) { while (*s == ' ' || *s == '\n' || *s == '\t' || *s == '\r') s++; return strncasecmp(s, p, strlen(p)) == 0; }
 
-static void tab_free (mw_tab *t) { free(t->name); free(t->cell_rec); for (int i = 0; i < t->ncells; i++) free(t->cell_name[i]); free(t->cell_name); }
+uint32_t mw_name_id (const char *name) {
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) { h ^= (uint32_t)((*p >= 'A' && *p <= 'Z') ? *p + 32 : *p); h *= 16777619u; }
+    return h == 0xFFFFFFFFu ? 0xFFFFFFFEu : h;
+}
+
+static void tab_free (mw_tab *t) { free(t->cell_id); free(t->name); free(t->cell_rec); for (int i = 0; i < t->ncells; i++) free(t->cell_name[i]); free(t->cell_name); }
 
 // understand one table with SQLite's help
 static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
@@ -120,6 +126,11 @@ static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
     for (int i = 0; i < nc; i++) if (cols[i].pk == 0 && cols[i].hidden == 0) { t->cell_rec[t->ncells] = rec_of[i]; t->cell_name[t->ncells] = strdup(cols[i].name); t->ncells++; }
     for (int i = 0; i < nc; i++) { free(cols[i].name); free(cols[i].type); }
     t->tracked = true;
+    t->tid = mw_name_id(t->name);
+    t->cell_id = malloc((size_t)(t->ncells ? t->ncells : 1) * sizeof(uint32_t));
+    bool ok = t->cell_id != NULL;
+    for (int i = 0; ok && i < t->ncells; i++) { t->cell_id[i] = mw_name_id(t->cell_name[i]); for (int j = 0; j < i; j++) if (t->cell_id[j] == t->cell_id[i]) ok = false; }
+    t->synced = ok && t->has_pk && t->npk > 0 && strncasecmp(t->name, "mw_", 3) != 0 && strncasecmp(t->name, "sqlite_", 7) != 0;
 }
 
 mw_cat *mw_cat_build (mw_lane *lane) {
@@ -130,6 +141,7 @@ mw_cat *mw_cat_build (mw_lane *lane) {
     sqlite3 *scratch = NULL; sqlite3_open_v2(":memory:", &scratch, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
     c->tabs = calloc((size_t)(rows.n ? rows.n : 1), sizeof *c->tabs);
     for (int i = 0; i < rows.n && c->tabs && scratch; i++) { tab_parse(scratch, &rows.rows[i], &c->tabs[c->n]); c->n++; }
+    for (int i = 0; i < c->n; i++) if (c->tabs[i].synced) for (int j = 0; j < i; j++) if (c->tabs[j].synced && c->tabs[j].tid == c->tabs[i].tid) c->tabs[i].synced = false;     // (an id collision between two tables: the later one is not synchronised)
     for (int i = 0; i < rows.n; i++) { free(rows.rows[i].name); free(rows.rows[i].sql); }
     free(rows.rows); sqlite3_close(scratch);
     return c;

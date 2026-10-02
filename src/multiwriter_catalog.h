@@ -23,6 +23,9 @@ typedef struct {
     bool has_pk;                        // an explicit primary key; without one the identity of a row is its rowid and the table cannot be synchronised
     int nrec;                           // columns stored in a record
     int npk; int pk_rec[MW_CAT_MAXPK];  // the record column of each key column, in key order
+    bool synced;                        // the CRDT keeps cells for it: tracked, has an explicit primary key, not an internal table (mw_*, sqlite_*), no id collisions
+    uint32_t tid;                       // stable id of the table: hash of its name (the same on every peer, nothing to persist)
+    uint32_t *cell_id;                  // stable id of each cell: hash of the column name
     int ncells; int *cell_rec; char **cell_name;     // the cells: non-key, non-generated columns in column order; cell i lives in record column cell_rec[i]
 } mw_tab;
 
@@ -33,6 +36,7 @@ mw_cat *mw_cat_build (mw_lane *lane);                         // the schema at t
 mw_cat *mw_cat_ref (mw_cat *c);                               // a catalog is shared by the lanes: reference counted
 void mw_cat_free (mw_cat *c);                                 // drops a reference; the last one frees it
 const mw_tab *mw_cat_by_root (const mw_cat *c, uint32_t root);
+uint32_t mw_name_id (const char *name);                        // the id of a table or column name (case-insensitive FNV-1a, never the sentinel)
 const mw_tab *mw_cat_by_name (const mw_cat *c, const char *name);
 
 #endif

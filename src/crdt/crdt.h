@@ -44,7 +44,7 @@ typedef struct crdt_ops {
 // Every function updates the state through ops and appends to `out` the cells that were written (for the export and for the write-ahead record). `seq` is the running
 // sequence number of the commit (incremented per cell written), dv its db_version. Versions follow sqlite-sync: a live cell is odd, +2 per local update, +1 when it was even.
 typedef struct { uint32_t col; crdt_cell cell; } crdt_wcell;
-int crdt_local_insert (const crdt_ops *o, void *st, uint32_t tbl, const void *pk, size_t pklen, int ncols, int64_t dv, int64_t *seq, crdt_wcell *out, int max);
+int crdt_local_insert (const crdt_ops *o, void *st, uint32_t tbl, const void *pk, size_t pklen, const uint32_t *cols, int ncols, int64_t dv, int64_t *seq, crdt_wcell *out, int max);   // cols: the column ids of the cells (NULL: 0..ncols-1)
 int crdt_local_update (const crdt_ops *o, void *st, uint32_t tbl, const void *pk, size_t pklen, const uint32_t *cols, int n, int64_t dv, int64_t *seq, crdt_wcell *out, int max);
 int crdt_local_delete (const crdt_ops *o, void *st, uint32_t tbl, const void *pk, size_t pklen, int64_t dv, int64_t *seq, crdt_wcell *out, int max);
 // the primary key changed: the old row is deleted, its cells move to the new key with version 1, the new row gets its sentinel (docs of sqlite-sync: PriKey.md)

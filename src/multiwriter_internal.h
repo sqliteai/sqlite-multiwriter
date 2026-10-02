@@ -210,6 +210,7 @@ struct mw_lane {
     sqlite3    *rb_c, *rb_v;    // cached rebase helper connections (writer at the latest snapshot / overlay reader)
     // change capture (mw_cdc=1): the row changes of the transaction being committed, and the catalog they were decoded with
     mw_rd_result cdc_res; mw_cat *cdc_cat; int cdc_nfreed;
+    struct mw_ovl *cdc_ovl;                      // the metadata delta of the commit being published (multiwriter_meta.c)
     uint8_t *cdc_ext; uint32_t cdc_ext_len;      // the commit's change-capture extension, written in the log record next to the pages
     int64_t     min_reserved;   // lowest db_version reserved by the current transaction, 0 = none (protected by db->mu)
     uint64_t    writer_id;      // unique per connection (lane) in this process; NOT the sqlite-sync site_id
@@ -546,6 +547,7 @@ void     mw_cdc_set_sink (mw_db *db, mw_cdc_sink_fn fn, void *arg);
 void     mw_cdc_lane_free (mw_lane *lane);
 void     mw_cdc_apply_owner (mw_db *db, mw_lane *lane, const uint32_t *pgnos, const uint8_t *const *images, int n);
 void     mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch);
+struct mw_meta *mw_cdc_meta (mw_db *db);
 bool     mw_rowdiff_enabled (void);
 void     mw_rowdiff_commit (mw_lane *lane, const uint8_t *const *imgs);          // (experiment, docs §51)
 void     mw_lane_fill_stats (mw_lane *lane, mw_db_stats *st);

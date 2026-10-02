@@ -125,6 +125,7 @@ void mw_rowdiff_set_sink (mw_rowdiff_sink_fn fn, void *arg);
 // changed, the old key. Called from the committing thread before the commit is published, for every attempt (a refused commit is reported again when it is retried).
 typedef struct { int kind; const char *table; const uint8_t *pk; size_t pklen; const uint8_t *oldpk; size_t oldpklen; uint64_t changed; int64_t rowid; } mw_capture_row;
 typedef void (*mw_capture_fn) (void *arg, const mw_capture_row *rows, int n);
+#define MW_FCNTL_META     0x4d57000d       // sqlite3_file_control(db, "main", MW_FCNTL_META, mw_meta **): the CRDT metadata store of the database (mw_cdc=1), for tests and the sync API
 #define MW_FCNTL_CDC_SINK 0x4d57000c       // sqlite3_file_control(db, "main", MW_FCNTL_CDC_SINK, &(mw_capture_sink){ fn, arg })
 typedef struct { mw_capture_fn fn; void *arg; } mw_capture_sink;
 

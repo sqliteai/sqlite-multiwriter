@@ -101,7 +101,7 @@ int main (void) {
             if (!alive[k]) {                                                                         // insert (a first insert, or a re-insert after a delete)
                 snprintf(sql, sizeof sql, "INSERT INTO t(id,a,b,c) VALUES('%s','v%d',%d,%d.5)", KEYS[k], op, op, op);
                 CHECK_RC(mw_exec(p, sql), SQLITE_OK); int64_t dv = mw_scalar(p, "SELECT cloudsync_db_version()"); CHECK(dv > dv0);
-                crdt_local_insert(&OPS, &S, 0, pk, pl, 3, dv, &seq, out, 8); alive[k] = ever[k] = true;
+                crdt_local_insert(&OPS, &S, 0, pk, pl, NULL, 3, dv, &seq, out, 8); alive[k] = ever[k] = true;
             } else if (what < 7) {                                                                    // update 1-3 columns
                 uint32_t cols[3]; int nc = 0; char set[120] = "";
                 for (uint32_t c = 0; c < 3; c++) if (rnd() % 2 || (c == 2 && nc == 0)) { cols[nc++] = c; char one[40]; snprintf(one, sizeof one, "%s%c=%s%d%s", nc > 1 ? "," : "", "abc"[c], c == 0 ? "'u" : "", op + 1000, c == 0 ? "'" : c == 2 ? ".25" : ""); strcat(set, one); }
@@ -135,7 +135,7 @@ local_done:
             int act = (int)(rnd() % 10);
             if (act < 5) {                                                                            // a local operation on one of the peers (tracked by our own state too: the changes must agree)
                 int w = (int)(rnd() % 3); int k = (int)(rnd() % 6); char sql[256]; size_t pl; char *pk = enc(KEYS[k], &pl); crdt_wcell out[8]; int64_t dv0 = mw_scalar(P[w], "SELECT cloudsync_db_version()");
-                if (!alive[w][k]) { snprintf(sql, sizeof sql, "INSERT INTO t(id,a,b,c) VALUES('%s','p%d_%d',%d,%d.5)", KEYS[k], w, step, step + w, step); mw_exec(P[w], sql); crdt_local_insert(&OPS, &PS[w], 0, pk, pl, 3, mw_scalar(P[w], "SELECT cloudsync_db_version()"), &pseq[w], out, 8); alive[w][k] = true; }
+                if (!alive[w][k]) { snprintf(sql, sizeof sql, "INSERT INTO t(id,a,b,c) VALUES('%s','p%d_%d',%d,%d.5)", KEYS[k], w, step, step + w, step); mw_exec(P[w], sql); crdt_local_insert(&OPS, &PS[w], 0, pk, pl, NULL, 3, mw_scalar(P[w], "SELECT cloudsync_db_version()"), &pseq[w], out, 8); alive[w][k] = true; }
                 else if (rnd() % 4) { uint32_t cols[3]; int nc = 0; char set[120] = ""; for (uint32_t c = 0; c < 3; c++) if (rnd() % 2 || (c == 2 && nc == 0)) { cols[nc++] = c; char one[48]; snprintf(one, sizeof one, "%s%c=%s%d%s", nc > 1 ? "," : "", "abc"[c], c == 0 ? "'q" : "", step * 10 + w, c == 0 ? "'" : c == 2 ? ".75" : ""); strcat(set, one); }
                     snprintf(sql, sizeof sql, "UPDATE t SET %s WHERE id='%s'", set, KEYS[k]); mw_exec(P[w], sql); crdt_local_update(&OPS, &PS[w], 0, pk, pl, cols, nc, mw_scalar(P[w], "SELECT cloudsync_db_version()"), &pseq[w], out, 8); }
                 else { snprintf(sql, sizeof sql, "DELETE FROM t WHERE id='%s'", KEYS[k]); mw_exec(P[w], sql); crdt_local_delete(&OPS, &PS[w], 0, pk, pl, mw_scalar(P[w], "SELECT cloudsync_db_version()"), &pseq[w], out, 8); alive[w][k] = false; }
@@ -144,7 +144,7 @@ local_done:
                 int k = (int)(rnd() % 6); char sql[256]; size_t pl; char *pk = enc(KEYS[k], &pl); crdt_wcell out[8];
                 rowrec *rr = row_find(&RS, pk, pl, false); bool exists = rr && rr->exists;
                 if (!exists) { snprintf(sql, sizeof sql, "INSERT INTO t(id,a,b,c) VALUES('%s','r%d',%d,%d.5)", KEYS[k], step, step, step); mw_exec(R, sql);
-                    crdt_local_insert(&OPS, &RS, 0, pk, pl, 3, mw_scalar(R, "SELECT cloudsync_db_version()"), &rseq, out, 8);
+                    crdt_local_insert(&OPS, &RS, 0, pk, pl, NULL, 3, mw_scalar(R, "SELECT cloudsync_db_version()"), &rseq, out, 8);
                     rr = row_find(&RS, pk, pl, true); rr->exists = true; for (int c = 0; c < 3; c++) { rr->has[c] = true; } snprintf(rr->a, sizeof rr->a, "r%d", step); rr->b = step; rr->cc = step + 0.5; rr->types[0] = CRDT_TEXT; rr->types[1] = CRDT_INTEGER; rr->types[2] = CRDT_FLOAT; }
                 else { snprintf(sql, sizeof sql, "UPDATE t SET b=%d WHERE id='%s'", step + 500, KEYS[k]); mw_exec(R, sql); uint32_t cols[1] = { 1 };
                     crdt_local_update(&OPS, &RS, 0, pk, pl, cols, 1, mw_scalar(R, "SELECT cloudsync_db_version()"), &rseq, out, 8); rr->b = step + 500; rr->types[1] = CRDT_INTEGER; rr->has[1] = true; }

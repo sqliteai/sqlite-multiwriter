@@ -477,8 +477,12 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     if (db->log_max_bytes && log_end > mw_log_limit(db)) {
         mw_db_compactor_kick(db);
         if (log_end > db->log_max_bytes * 16) {
+            // in proportion to the overshoot (a fixed half millisecond does not slow eight writers at all): ratio 1 = 0.5 ms, 2 = 4 ms, 3 = 13 ms, at most 50 ms; the mapping of the
+            // log is 1 GB and the compaction can be held back by the metadata flush, so the writers must not outrun it
             atomic_fetch_add(&db->n_backpressure, 1);
-            struct timespec ts = { 0, 500000 };
+            double r = (double)log_end / ((double)db->log_max_bytes * 16.0);
+            double us = 500.0 * r * r * r; if (us > 50000.0) us = 50000.0;
+            struct timespec ts = { 0, (long)(us * 1000.0) };
             nanosleep(&ts, NULL);
         }
     }

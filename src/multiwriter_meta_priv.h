@@ -13,6 +13,7 @@
 struct mw_db; struct mw_lane;
 
 #define STRIPES 64
+#define MW_PAR 8                         // most connections a flush writes with
 #define SEN CRDT_COL_SENTINEL
 #define OV_CHG INT64_MIN                 // in an overlay cell: written by this commit (its db_version is the commit's epoch, not known yet)
 #define EXT_VERSION 0x4e                // the format of the extension of a commit record (bumped when it changes)
@@ -45,6 +46,7 @@ struct mw_meta {
     char *uri; bool attached, tables_ok; _Atomic bool ready;
     pthread_mutex_t file_mu;                                     // ready / flush / writer connection
     sqlite3 *wr;                                                 // the flusher's connection
+    sqlite3 *wrp[MW_PAR - 1]; int par; _Atomic bool schema_seen;                           // the others of a parallel flush, and how many ranges a big flush is cut in
     #define MW_RDN 4
     sqlite3 *rd[MW_RDN]; sqlite3_stmt *rds[MW_RDN]; pthread_mutex_t rdmu[MW_RDN];
     pthread_t th; bool th_running; bool th_stop; bool kicked; bool kick_pending; pthread_mutex_t th_mu; pthread_cond_t th_cv;

@@ -71,6 +71,7 @@ int      mw_meta_schema (sqlite3 *conn);
 int      mw_meta_export_index (sqlite3 *conn);                                     // the index on db_version, for the export (created by the first one)                                          // create the file tables if they are missing
 uint64_t mw_meta_flushed (mw_meta *m);
 uint64_t mw_meta_dirty (mw_meta *m);
+uint64_t mw_meta_dirty_limit (mw_meta *m);
 uint64_t mw_meta_epoch (mw_meta *m);
 uint64_t mw_meta_dv (mw_meta *m, uint64_t epoch);                               // the db_version of an epoch of this incarnation                                              // the last commit made visible                                              // rows changed since the last flush
 

@@ -41,6 +41,7 @@ uint64_t mw_meta_hash (uint32_t tbl, const void *pk, size_t n) {
 mw_meta *mw_meta_new (struct mw_db *db) {
     mw_meta *m = calloc(1, sizeof *m);
     if (!m) return NULL;
+    m->par = 1; { const char *ep = getenv("MW_META_FLUSH_PAR"); if (ep && atoi(ep) > 1) m->par = atoi(ep) > MW_PAR ? MW_PAR : atoi(ep); }
     m->db = db; m->shared = db->shared; m->cap_bytes = 64u << 20;
     const char *e = getenv("MW_META_CACHE_MB"); if (e && atol(e) > 0) m->cap_bytes = (size_t)atol(e) << 20;
     for (int i = 0; i < STRIPES; i++) {

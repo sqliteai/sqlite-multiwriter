@@ -167,8 +167,9 @@ static int do_txn (agent_t *a) {
             return retryable(rc) ? 0 : -1;
         }
         case W_BULK: {
-            char big[100 * 128 + 64]; size_t n = (size_t)snprintf(big, sizeof big, "INSERT INTO bk(id,v) VALUES");
-            for (int i = 0; i < 100; i++) n += (size_t)snprintf(big + n, sizeof big - n, "%s(%llu,'0123456789012345678901234567890123456789012345678901234567890123')", i ? "," : "", ((unsigned long long)a->id << 32) | (a->commits * 100 + (uint64_t)i));
+            char big[100 * 160 + 64]; bool wide = getenv("MW_BENCH_BULK_WIDE") != NULL;      // (wide: five columns besides the key, six cells a row with the sentinel)
+            size_t n = (size_t)snprintf(big, sizeof big, wide ? "INSERT INTO bkw(id,a,b,c,d,v) VALUES" : "INSERT INTO bk(id,v) VALUES");
+            for (int i = 0; i < 100; i++) n += (size_t)snprintf(big + n, sizeof big - n, wide ? "%s(%llu,1,2,3,4,'0123456789012345678901234567890123456789')" : "%s(%llu,'0123456789012345678901234567890123456789012345678901234567890123')", i ? "," : "", ((unsigned long long)a->id << 32) | (a->commits * 100 + (uint64_t)i));
             if (cfg.think_us) { struct timespec ts = { 0, (long)cfg.think_us * 1000 }; nanosleep(&ts, NULL); }
             if (cfg.begin_wait) {                                  // explicit transaction: BEGIN IMMEDIATE is where SQLite takes the write lock (and waits for it)
                 rc = exec_(a->db, "BEGIN IMMEDIATE");
@@ -389,6 +390,7 @@ int main (int argc, char **argv) {
     snprintf(sql, sizeof sql, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<%d) INSERT INTO t SELECT i, 0, zeroblob(3000) FROM n", cfg.rows);
     exec_(s, sql);
     exec_(s, (getenv("MW_BENCH_TRACK_BK") || getenv("MW_BENCH_BK_TEXT")) ? "CREATE TABLE bk(id TEXT PRIMARY KEY NOT NULL, v TEXT)" : "CREATE TABLE bk(id INTEGER PRIMARY KEY, v TEXT)");
+    exec_(s, "CREATE TABLE bkw(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, d INTEGER, v TEXT)");
     exec_(s, "CREATE TABLE tu(id TEXT PRIMARY KEY, v INTEGER); CREATE TABLE ti(id INTEGER PRIMARY KEY, v INTEGER); CREATE TABLE ta(id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)");
     if (cfg.tracked) {
         exec_(s, "CREATE TABLE ct(id TEXT PRIMARY KEY NOT NULL, a INTEGER, b INTEGER, c INTEGER, d INTEGER, pad TEXT)");
@@ -498,7 +500,7 @@ int main (int argc, char **argv) {
     if (shared_db) { /* several processes share the database: the driver verifies once at the end */ } else
     switch (cfg.wl) {
         case W_BULK: {
-            int64_t n = scalar_(v, "SELECT count(*) FROM bk");
+            int64_t n = scalar_(v, getenv("MW_BENCH_BULK_WIDE") ? "SELECT count(*) FROM bkw" : "SELECT count(*) FROM bk");
             if ((uint64_t)n != expect * 100) { valid = 0; snprintf(why, sizeof why, "count(bk)=%lld != 100 x committed %llu", (long long)n, (unsigned long long)expect); }
             break;
         }

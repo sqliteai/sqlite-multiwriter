@@ -67,6 +67,7 @@ static sqlite3 *open_conn (mw_meta *m) {
 void mw_metafile_free (mw_meta *m) {
     for (int i = 0; i < MW_RDN; i++) { sqlite3_finalize(m->rds[i]); sqlite3_close(m->rd[i]); m->rds[i] = NULL; m->rd[i] = NULL; }
     sqlite3_close(m->wr); m->wr = NULL;
+    for (int i = 0; i < MW_PAR - 1; i++) { sqlite3_close(m->wrp[i]); m->wrp[i] = NULL; }
     free(m->uri); m->uri = NULL;
 }
 
@@ -319,10 +320,10 @@ static void sort_items (fitem *v, int n) {
 
 // One transaction of the flush: the items [i0, i1) and, in the last one, the sites, the flushed point and the high-water mark. A flush is several of them (a transaction of hundreds of
 // thousands of cells would hold its whole write set in memory and in the log): the points move only with the last, and what the others wrote is what a replay would write again.
-static int write_batch (mw_meta *m, fitem *v, int i0, int i1, bool last, uint64_t V, uint64_t hwm, uint32_t nsites, uint32_t sflushed, const struct mw_purge *purge, int npurge) {
+static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool last, uint64_t V, uint64_t hwm, uint32_t nsites, uint32_t sflushed, const struct mw_purge *purge, int npurge) {
     int n = i1;
-    sqlite3 *c = m->wr; int rc;
-    rc = mw_meta_schema(c); if (rc != SQLITE_OK) return rc;
+    int rc;
+    if (!atomic_load_explicit(&m->schema_seen, memory_order_relaxed)) { rc = mw_meta_schema(c); if (rc != SQLITE_OK) return rc; atomic_store(&m->schema_seen, true); }
     m->tables_ok = true;
     if ((rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL)) != SQLITE_OK) return rc;
     sqlite3_stmt *del = NULL, *ins = NULL, *site = NULL, *state = NULL, *hw = NULL;
@@ -349,7 +350,6 @@ static int write_batch (mw_meta *m, fitem *v, int i0, int i1, bool last, uint64_
         sqlite3_bind_int64(site, 1, o); sqlite3_bind_blob(site, 2, id, 16, SQLITE_STATIC);
         if (sqlite3_step(site) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(site);
     }
-    for (int i = 0; i < n; i++) for (int k = 0; k < v[i].n; k++) if ((uint64_t)v[i].c[k].dv > hwm) hwm = (uint64_t)v[i].c[k].dv;
     if (V > hwm) hwm = V;
     if (last && rc == SQLITE_OK) { sqlite3_bind_int64(state, 1, (int64_t)V); if (sqlite3_step(state) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(state); }
     if (last && rc == SQLITE_OK) { sqlite3_bind_int64(hw, 1, (int64_t)hwm); if (sqlite3_step(hw) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(hw); }
@@ -363,6 +363,30 @@ static int write_batch (mw_meta *m, fitem *v, int i0, int i1, bool last, uint64_
 
 // Writes what changed since the last flush to the file tables, in one commit together with the epoch it covers. wait: another process may be flushing (shared mode): wait for it
 // (a barrier: when this returns, everything committed before the call is in the file), otherwise skip.
+// the items [i0, i1) in transactions of about 20000 cells (the first also does the purges, the last the sites and the points when `last`)
+static int write_range (mw_meta *m, sqlite3 *c, fitem *v, int i0, int n, bool last_range, uint64_t V, uint64_t hwm, uint32_t nsites, uint32_t sflushed, const struct mw_purge *purge, int npurge) {
+    int rc = SQLITE_OK;
+    for (int a = i0; a <= n && rc == SQLITE_OK; ) {
+        int b = a, cells = 0; while (b < n && cells < 20000) cells += v[b++].n ? v[b - 1].n : 1;
+        bool last = last_range && b >= n;
+        rc = SQLITE_BUSY;
+        for (int attempt = 0; attempt < 200 && busyish(rc); attempt++) {
+            rc = write_batch(m, c, v, a, b, last, V, hwm, nsites, sflushed, purge, npurge);
+            if (busyish(rc)) { atomic_fetch_add(&m->flush_retries, 1); usleep(500 * (unsigned)(attempt < 20 ? attempt + 1 : 20)); }
+        }
+        if (b >= n) break;
+        a = b;
+    }
+    return rc;
+}
+typedef struct { mw_meta *m; sqlite3 *c; fitem *v; int i0, i1; uint64_t V, hwm; int rc; } slice_job;
+static void *slice_main (void *arg) {
+    slice_job *j = arg;
+    // a slice never touches the purges, the sites or the points (those are the serial part): `n` bounds the range, an empty range writes nothing
+    j->rc = j->i0 >= j->i1 ? SQLITE_OK : write_range(j->m, j->c, j->v, j->i0 == 0 ? 0 : j->i0, j->i1, false, j->V, j->hwm, 0, 0, NULL, 0);
+    return NULL;
+}
+
 static int flush_impl (mw_meta *m, bool wait) {
     if (!m->attached) return 0;
     mw_meta_ready(m);
@@ -392,18 +416,31 @@ static int flush_impl (mw_meta *m, bool wait) {
     fitem *v = fb.v; int n = fb.n;
     sort_items(v, n);
     uint64_t hw0 = sh ? atomic_load(&sh->dv_hwm) : atomic_load(&m->hwm);
+    for (int i = 0; i < n; i++) for (int k = 0; k < v[i].n; k++) if ((uint64_t)v[i].c[k].dv > hw0) hw0 = (uint64_t)v[i].c[k].dv;
     rc = SQLITE_OK;
-    for (int i0 = 0; i0 <= n && rc == SQLITE_OK; ) {
-        int i1 = i0, cells = 0; while (i1 < n && cells < 20000) cells += v[i1++].n ? v[i1 - 1].n : 1;
-        bool last = i1 >= n;
-        rc = SQLITE_BUSY;
-        for (int attempt = 0; attempt < 200 && busyish(rc); attempt++) {
-            rc = write_batch(m, v, i0, i1, last, V, hw0, nsites, sflushed, purge, npurge);
-            if (busyish(rc)) { atomic_fetch_add(&m->flush_retries, 1); usleep(500 * (unsigned)(attempt < 20 ? attempt + 1 : 20)); }
+    uint64_t total = 0; for (int i = 0; i < n; i++) total += v[i].n ? (uint64_t)v[i].n : 1;
+    static int pmin = -1; if (pmin < 0) { const char *e = getenv("MW_META_PAR_MIN"); pmin = e ? atoi(e) : 200000; }
+    int par = m->par; if (total < (uint64_t)pmin || n < par) par = 1;
+    if (par > 1) {
+        // the batch is cut in key ranges written at the same time, each by a connection of its own: the b-tree leaves of different ranges are different pages, so the commits do not conflict
+        // (but for the pages above them). The purges first, alone; the sites and the points last, after every range is on disk: the points move only when all of it is.
+        if (npurge) rc = write_range(m, m->wr, v, 0, 0, false, V, hw0, nsites, sflushed, purge, npurge);
+        slice_job job[MW_PAR]; pthread_t th[MW_PAR]; bool started[MW_PAR] = {false};
+        int cut[MW_PAR + 1]; cut[0] = 0; uint64_t acc = 0; int q = 1;
+        for (int i = 0; i < n && q < par; i++) { acc += v[i].n ? (uint64_t)v[i].n : 1; if (acc >= total * (uint64_t)q / (uint64_t)par) cut[q++] = i + 1; }
+        while (q <= par) cut[q++] = n;
+        for (int k = 0; k < par && rc == SQLITE_OK; k++) {
+            if (k > 0 && !m->wrp[k - 1]) m->wrp[k - 1] = open_conn(m);
+            job[k] = (slice_job){ m, k == 0 ? m->wr : m->wrp[k - 1], v, cut[k], cut[k + 1], V, hw0, SQLITE_OK };
+            if (k > 0 && (!job[k].c || pthread_create(&th[k], NULL, slice_main, &job[k]) != 0)) { if (!job[k].c) rc = SQLITE_CANTOPEN; else slice_main(&job[k]); }   // (no thread: this one does it)
+            else if (k > 0) started[k] = true;
         }
-        if (last) break;
-        i0 = i1;
-    }
+        if (rc == SQLITE_OK) slice_main(&job[0]);
+        for (int k = 1; k < par; k++) if (started[k]) pthread_join(th[k], NULL);
+        for (int k = 0; k < par && rc == SQLITE_OK; k++) rc = job[k].rc;
+        if (busyish(rc)) rc = write_range(m, m->wr, v, 0, n, true, V, hw0, nsites, sflushed, NULL, 0);     // (a range lost against the others too often: the rows are replaced, so writing all of them again, alone, is the same)
+        else if (rc == SQLITE_OK) rc = write_range(m, m->wr, v, n, n, true, V, hw0, nsites, sflushed, NULL, 0);
+    } else rc = write_range(m, m->wr, v, 0, n, true, V, hw0, nsites, sflushed, purge, npurge);
     mw_fbatch_free(&fb);
     if (rc == SQLITE_OK) {
         if (sh) {
@@ -432,6 +469,8 @@ out:
 int mw_meta_flush (mw_meta *m) { return flush_impl(m, true); }
 
 uint64_t mw_meta_epoch (mw_meta *m) { return m->shared ? atomic_load_explicit(&m->db->shm->committed_epoch, memory_order_acquire) : atomic_load(&m->db->epoch); }
+// rows that may wait for the flusher before the writers are slowed down: a row waiting takes about 256 bytes
+uint64_t mw_meta_dirty_limit (mw_meta *m) { uint64_t l = (uint64_t)m->cap_bytes * 4 / 256; return l < 65536 ? 65536 : l; }
 uint64_t mw_meta_dirty (mw_meta *m) {
     if (!m->shared) return atomic_load(&m->ndirty);
     mw_shm *sh = m->db->shm;                                                   // dirty: a commit with metadata is newer than the last flush (the count is a measure for the flusher's pace only)
@@ -464,8 +503,9 @@ static void *flusher_main (void *arg) {
         uint64_t rows = er ? (uint64_t)atoll(er) : 16384, ms = em ? (uint64_t)atoll(em) : 250;
         d = mw_meta_dirty(m);
         uint64_t age = now_ns() - m->last_flush_ns;
+        const char *ek = getenv("MW_META_KICK_MS"); uint64_t kick_ns = (ek ? (uint64_t)atoll(ek) : 20) * 1000000ull;
         // a flush is a transaction of its own (a log record, a sync): small ones at a high rate cost the writers more than they save, so a kick is heard only when the last flush is not too recent
-        if (d && ((kicked && (age > 20000000ull || d >= 4 * rows)) || d >= rows || age > ms * 1000000ull)) flush_impl(m, false);
+        if (d && ((kicked && (age > kick_ns || d >= 4 * rows)) || d >= rows || age > ms * 1000000ull)) flush_impl(m, false);
     }
     return NULL;
 }
@@ -489,11 +529,12 @@ void mw_meta_quiesce (mw_meta *m) {
     if (run) { pthread_join(m->th, NULL); m->th_running = false; }
     if (m->shared ? atomic_load(&m->db->shm->meta_state) == 2 : atomic_load(&m->ready)) mw_meta_flush(m);
     pthread_mutex_lock(&m->th_mu); m->th_stop = false; pthread_mutex_unlock(&m->th_mu);       // (a later open starts the thread again)
-    sqlite3 *conns[MW_RDN + 1]; sqlite3_stmt *stmts[MW_RDN]; int nc = 0;
+    sqlite3 *conns[MW_RDN + MW_PAR]; sqlite3_stmt *stmts[MW_RDN]; int nc = 0;
     pthread_mutex_lock(&m->file_mu);
     for (int i = 0; i < MW_RDN; i++) { pthread_mutex_lock(&m->rdmu[i]); stmts[i] = m->rds[i]; m->rds[i] = NULL; if (m->rd[i]) conns[nc++] = m->rd[i]; m->rd[i] = NULL; pthread_mutex_unlock(&m->rdmu[i]); }
     if (m->wr) conns[nc++] = m->wr;
     m->wr = NULL;
+    for (int i = 0; i < MW_PAR - 1; i++) if (m->wrp[i]) { conns[nc++] = m->wrp[i]; m->wrp[i] = NULL; }
     pthread_mutex_unlock(&m->file_mu);
     atomic_store(&m->quiescing, 0);
     // the last connection to close releases the database for good, and that frees this store: nothing of it may be touched after the closes

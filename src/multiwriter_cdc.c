@@ -380,3 +380,5 @@ void mw_cdc_relocated (mw_lane *lane) {
     lane->cdc_res.nfreed = k;
     ovfl_set(lane->db, c, false);
 }
+
+void mw_cdc_set_cache_mb (mw_db *db, int mb) { mw_cdc *c = db->cdc; if (c && mb > 0) mw_meta_set_cache_mb(c->meta, mb); }

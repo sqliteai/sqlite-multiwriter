@@ -33,7 +33,7 @@ struct mw_meta {
     struct mw_db *db;
     bool shared;                                                 // multi-process shared mode: the state lives in the shared index and the log, not in this table
     stripe st[STRIPES];
-    size_t cap_rows;                                            // the cache budget (rows) before clean entries are dropped
+    size_t cap_bytes;                                           // the cache budget before clean entries are dropped (URI mw_meta_cache_mb, default 64)
     pthread_mutex_t site_mu; uint8_t (*sites)[16]; uint32_t nsites, capsites;     // ord -> site id (0 = this database)
     int64_t origin; _Atomic uint64_t hwm; uint64_t new_hwm;                         // db_version = epoch + origin; the largest db_version in the file tables
     _Atomic uint64_t flushed;                                    // db_version up to which the cells are in the file

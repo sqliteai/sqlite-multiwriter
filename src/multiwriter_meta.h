@@ -21,6 +21,7 @@ struct mw_db;
 typedef struct { int64_t cv, dv; uint32_t col, site, seq; } mw_mcell;       // site 0 = this database
 
 mw_meta *mw_meta_new (struct mw_db *db);
+void     mw_meta_set_cache_mb (mw_meta *m, int mb);                                 // the memory the row cache may hold (rows that are not waiting for a flush)
 void     mw_meta_free (mw_meta *m);
 
 // ---- the transaction's view: an overlay over the store, with the crdt_ops the CRDT core runs on ----

@@ -41,8 +41,8 @@ uint64_t mw_meta_hash (uint32_t tbl, const void *pk, size_t n) {
 mw_meta *mw_meta_new (struct mw_db *db) {
     mw_meta *m = calloc(1, sizeof *m);
     if (!m) return NULL;
-    m->db = db; m->shared = db->shared; m->cap_rows = 1u << 20;
-    const char *e = getenv("MW_META_CACHE_ROWS"); if (e && atol(e) > 0) m->cap_rows = (size_t)atol(e);
+    m->db = db; m->shared = db->shared; m->cap_bytes = 64u << 20;
+    const char *e = getenv("MW_META_CACHE_MB"); if (e && atol(e) > 0) m->cap_bytes = (size_t)atol(e) << 20;
     for (int i = 0; i < STRIPES; i++) {
         pthread_mutex_init(&m->st[i].mu, NULL);
         m->st[i].nb = 64; m->st[i].b = calloc(m->st[i].nb, sizeof(mentry *));
@@ -82,14 +82,14 @@ static void grow (stripe *s) {
 
 // drops clean entries of the stripe until it is under its share of the budget (the caller holds the lock)
 static void evict (mw_meta *m, stripe *s) {
-    size_t cap = m->cap_rows / STRIPES + 1;
+    size_t cap = m->cap_bytes / STRIPES + 1;
     size_t scanned = 0;
-    while (s->n > cap && scanned < s->nb) {
+    while (s->bytes > cap && scanned < s->nb) {
         size_t k = s->hand++ & (s->nb - 1); scanned++;
         mentry **pp = &s->b[k];
         while (*pp) {
             mentry *e = *pp;
-            if (!e->in_dirty && s->n > cap) { *pp = e->next; s->n--; s->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); free(e->cells); free(e); s->gen++; }
+            if (!e->in_dirty && s->bytes > cap) { *pp = e->next; s->n--; s->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); free(e->cells); free(e); s->gen++; }
             else pp = &e->next;
         }
     }
@@ -489,3 +489,5 @@ void mw_meta_stats (mw_meta *m, uint64_t *rows, uint64_t *bytes, uint64_t *hits,
     if (rows) *rows = atomic_load(&m->rows); if (bytes) *bytes = atomic_load(&m->bytes);
     if (hits) *hits = atomic_load(&m->hits); if (misses) *misses = atomic_load(&m->misses);
 }
+
+void mw_meta_set_cache_mb (mw_meta *m, int mb) { m->cap_bytes = (size_t)mb << 20; }

@@ -232,9 +232,7 @@ static void col_cb (void *arg, uint32_t bucket, uint64_t epoch, uint64_t loc) {
         int dirtyc = 0;
         for (int k = 0; k < n; k++) if (c->cells[k].dv > (int64_t)c->F) dirtyc++;
         if (!dirtyc) continue;
-        fitem *it = mw_fbatch_add(c->out, (uint32_t)tbl, pk, (uint32_t)pklen, false, n);         // (the whole state of the row: the file replaces its copy)
-        if (!it) { c->err = 1; return; }
-        for (int k = 0; k < n; k++) it->c[k] = c->cells[k];
+        if (!mw_fbatch_add_row(c->out, (uint32_t)tbl, pk, (uint32_t)pklen, c->cells, n)) { c->err = 1; return; }         // (the whole state of the row: the file replaces its copy)
     }
 }
 int mm_collect (mw_meta *m, uint64_t F, uint64_t Fe, fbatch *out) {

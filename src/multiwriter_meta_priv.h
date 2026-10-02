@@ -21,14 +21,15 @@ struct mw_db; struct mw_lane;
 #define F_ZERO 2                         // the non-sentinel cells get version 0 and the db_version of the commit
 
 typedef struct mentry {
-    struct mentry *next, *dnext;
+    struct mentry *next;
     uint64_t h, ver, fver, drop_ver;           // ver: epoch of the last change; fver: ver as the flush in progress collected it; drop_ver: epoch of the last DROP (the file must lose the old cells too)
     uint32_t tbl, pklen; int n, cap; bool in_dirty;
     mw_mcell *cells;
     uint8_t pk[];
 } mentry;
 
-typedef struct { pthread_mutex_t mu; mentry **b; size_t nb, n; mentry *dirty; size_t bytes; size_t hand; uint64_t gen; uint32_t backoff; } stripe;
+typedef struct { pthread_mutex_t mu; mentry **b; size_t nb, n; mentry **dq; size_t ndq, capdq; size_t bytes; size_t hand; uint64_t gen; uint32_t backoff; } stripe;   // dq: the dirty entries, as a vector (read in order, with the next ones fetched ahead: a list would be a cache miss at a time)
+typedef struct { mentry **v; size_t n; } dlist;                          // a dirty vector taken from a stripe by a flush
 
 struct mw_meta {
     struct mw_db *db;
@@ -43,7 +44,7 @@ struct mw_meta {
     _Atomic int quiescing;
     _Atomic uint64_t ndirty;                                     // rows changed since the last flush
     // the file tables (multiwriter_metafile.c)
-    char *uri; bool attached, tables_ok; _Atomic bool ready;
+    char *uri; bool attached; _Atomic bool tables_ok, ready;
     pthread_mutex_t file_mu;                                     // ready / flush / writer connection
     sqlite3 *wr;                                                 // the flusher's connection
     sqlite3 *wrp[MW_PAR - 1]; int par; _Atomic bool schema_seen;                           // the others of a parallel flush, and how many ranges a big flush is cut in
@@ -51,7 +52,7 @@ struct mw_meta {
     sqlite3 *rd[MW_RDN]; sqlite3_stmt *rds[MW_RDN]; pthread_mutex_t rdmu[MW_RDN];
     pthread_t th; bool th_running; bool th_stop; bool kicked; bool kick_pending; pthread_mutex_t th_mu; pthread_cond_t th_cv;
     struct mw_purge { uint32_t tbl; uint64_t epoch; } *purge; int npurge, cappurge; pthread_mutex_t purge_mu;       // tables dropped since the last flush: the cells of the file older than the drop are dead, and deleted with the next batch
-    uint64_t last_flush_ns; uint32_t sites_flushed;
+    _Atomic uint64_t last_flush_ns; uint32_t sites_flushed;
     _Atomic uint64_t n_flushes, flushed_cells, flush_ns, flush_retries;
 };
 
@@ -67,11 +68,11 @@ void     mw_metafile_free (mw_meta *m);
 void     mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]);
 #endif
 
-typedef struct { uint32_t tbl; uint8_t *pk; uint32_t pklen; bool drop; int n; mw_mcell *c; } fitem;       // a row to write to the file tables: its cells (drop: the file's other cells of the row go first)
+typedef struct { uint32_t tbl; uint8_t *pk; uint32_t pklen; uint32_t n; uint32_t bloblen; uint8_t *blob; int64_t dv; } fitem;       // a row to write to the file: its key and its cells already packed (n of them; none: the row goes), dv the largest db_version among them
 // the rows of a flush: the items, and the bytes they point to (keys and cells) in blocks of their own (a flush holds hundreds of thousands of rows: no allocation per row)
-typedef struct { fitem *v; int n, cap; uint8_t **blocks; int nblocks, capblocks; size_t used, blockcap; } fbatch;
+typedef struct { fitem *v; int n, cap; uint8_t **blocks; int nblocks, capblocks; size_t used, blockcap; uint8_t *tmp; size_t tmpcap; } fbatch;
 void *mw_fbatch_alloc (fbatch *b, size_t n);
-fitem *mw_fbatch_add (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t pklen, bool drop, int ncells);   // a new item with its key copied and room for ncells cells (c[ ] to be filled); NULL on memory failure
+fitem *mw_fbatch_add_row (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t pklen, const mw_mcell *c, int n);   // a new item: the key copied, the cells packed; NULL on memory failure
 void   mw_fbatch_free (fbatch *b);
 
 // ---- the shared-mode backend (multiwriter_mmeta.c) ----
@@ -96,3 +97,9 @@ int      mm_collect (mw_meta *m, uint64_t F, uint64_t Fe, fbatch *out);        /
 // the offset between the epochs of this incarnation of the database and the db_versions of the cells
 #include "multiwriter_internal.h"
 static inline int64_t mw_meta_origin (mw_meta *m) { return m->shared ? (int64_t)atomic_load_explicit(&m->db->shm->dv_origin, memory_order_acquire) : m->origin; }
+
+// the dirty vector of a stripe (the caller holds its lock)
+static inline bool dq_push (stripe *s, mentry *e) {
+    if (s->ndq == s->capdq) { size_t nc = s->capdq ? s->capdq * 2 : 256; mentry **nv = realloc(s->dq, nc * sizeof *nv); if (!nv) return false; s->dq = nv; s->capdq = nc; }
+    s->dq[s->ndq++] = e; return true;
+}

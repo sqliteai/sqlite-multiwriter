@@ -252,56 +252,67 @@ void *mw_fbatch_alloc (fbatch *b, size_t n) {
     }
     void *p = b->blocks[b->nblocks - 1] + b->used; b->used += n; return p;
 }
-fitem *mw_fbatch_add (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t pklen, bool drop, int ncells) {
+fitem *mw_fbatch_add_row (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t pklen, const mw_mcell *c, int n) {
     if (b->n == b->cap) { int nc = b->cap ? b->cap * 2 : 1024; fitem *nv = realloc(b->v, (size_t)nc * sizeof *nv); if (!nv) return NULL; b->v = nv; b->cap = nc; }
-    uint8_t *k = mw_fbatch_alloc(b, pklen ? pklen : 1); mw_mcell *c = mw_fbatch_alloc(b, (size_t)(ncells ? ncells : 1) * sizeof(mw_mcell));
-    if (!k || !c) return NULL;
-    memcpy(k, pk, pklen);
-    fitem *it = &b->v[b->n++]; *it = (fitem){ tbl, k, pklen, drop, ncells, c };
+    size_t need = ROW_PACK_MAX(n);
+    if (n && need > b->tmpcap) { uint8_t *nt = realloc(b->tmp, need * 2); if (!nt) return NULL; b->tmp = nt; b->tmpcap = need * 2; }
+    size_t len = n ? row_pack(c, n, b->tmp) : 0;
+    uint8_t *k = mw_fbatch_alloc(b, (size_t)pklen + len + 1);                 // (the key and, after it, the packed cells: one place)
+    if (!k) return NULL;
+    memcpy(k, pk, pklen); if (len) memcpy(k + pklen, b->tmp, len);
+    int64_t dv = 0; for (int i = 0; i < n; i++) if (c[i].dv > dv) dv = c[i].dv;
+    fitem *it = &b->v[b->n++]; *it = (fitem){ tbl, k, pklen, (uint32_t)n, (uint32_t)len, k + pklen, dv };
     return it;
 }
-void mw_fbatch_free (fbatch *b) { for (int i = 0; i < b->nblocks; i++) free(b->blocks[i]); free(b->blocks); free(b->v); memset(b, 0, sizeof *b); }
+void mw_fbatch_free (fbatch *b) { for (int i = 0; i < b->nblocks; i++) free(b->blocks[i]); free(b->blocks); free(b->v); free(b->tmp); memset(b, 0, sizeof *b); }
 
-// The dirty lists are taken away from the stripes whole (a moment under the lock) and then read in blocks, the lock released between them: a flusher that holds a stripe for the whole
-// of a long list (a million rows when it lags) is what the writers of that stripe would wait for. The entries of a taken list cannot be freed (they are dirty) and nobody else touches
-// their `dnext` (a writer links an entry only when it is not dirty).
+// The dirty vectors are taken away from the stripes whole (a moment under the lock) and then read in blocks, the lock released between them: a flusher that holds a stripe for the whole of
+// a long vector (a million rows when it lags) is what the writers of that stripe would wait for. The entries of a taken vector cannot be freed (they are dirty) and a writer that changes one
+// of them does not link it again. Each entry is read once, packed into the batch on the spot, with the entries a few places ahead already being fetched into the cache.
 #define DIRTY_BLOCK 256
-static int collect (mw_meta *m, uint64_t F, fbatch *out, mentry **det) {
+static int collect (mw_meta *m, uint64_t F, fbatch *out, dlist *det) {
     for (int s = 0; s < STRIPES; s++) {
         stripe *st = &m->st[s];
-        pthread_mutex_lock(&st->mu); det[s] = st->dirty; st->dirty = NULL; pthread_mutex_unlock(&st->mu);
-        for (mentry *e = det[s]; e; ) {
+        pthread_mutex_lock(&st->mu); det[s] = (dlist){ st->dq, st->ndq }; st->dq = NULL; st->ndq = st->capdq = 0; pthread_mutex_unlock(&st->mu);
+        mentry **v = det[s].v; size_t n = det[s].n;
+        for (size_t i = 0; i < n; ) {
+            size_t end = i + DIRTY_BLOCK < n ? i + DIRTY_BLOCK : n;
+            for (size_t k = i; k < end && k < i + 16; k++) __builtin_prefetch(v[k]);
             pthread_mutex_lock(&st->mu);
-            for (int blk = 0; e && blk < DIRTY_BLOCK; blk++, e = e->dnext) {
+            for (; i < end; i++) {
+                mentry *e = v[i];
+                if (i + 16 < n) __builtin_prefetch(v[i + 16]);
+                if (i + 8 < n) __builtin_prefetch(v[i + 8]->cells);
                 if (e->tbl == 0xFFFFFFFFu) continue;                                  // (its table was dropped meanwhile)
-                bool changed = e->drop_ver > F; for (int i = 0; i < e->n && !changed; i++) if (e->cells[i].dv > (int64_t)F) changed = true;
+                bool changed = e->drop_ver > F; for (int c = 0; c < e->n && !changed; c++) if (e->cells[c].dv > (int64_t)F) changed = true;
                 e->fver = e->ver;
                 if (!changed) continue;
-                fitem *it = mw_fbatch_add(out, e->tbl, e->pk, e->pklen, false, e->n);                    // (the whole state of the row: the file replaces its copy)
-                if (!it) { pthread_mutex_unlock(&st->mu); mw_fbatch_free(out); return -1; }
-                for (int i = 0; i < e->n; i++) it->c[i] = e->cells[i];
+                if (!mw_fbatch_add_row(out, e->tbl, e->pk, e->pklen, e->cells, e->n)) { pthread_mutex_unlock(&st->mu); mw_fbatch_free(out); return -1; }     // (the whole state of the row: the file replaces its copy)
             }
             pthread_mutex_unlock(&st->mu);
         }
     }
     return 0;
 }
-// What is done with the taken lists: after a flush that wrote them the entries nobody changed since are clean; the others (and all of them when the flush failed) are dirty again.
-static void collect_done (mw_meta *m, mentry **det, bool ok) {
+// What is done with the taken vectors: after a flush that wrote them the entries nobody changed since are clean; the others (and all of them when the flush failed) are dirty again.
+static void collect_done (mw_meta *m, dlist *det, bool ok) {
     uint64_t cleaned = 0;
     for (int s = 0; s < STRIPES; s++) {
-        stripe *st = &m->st[s];
-        for (mentry *e = det[s], *nx; e; ) {
+        stripe *st = &m->st[s]; mentry **v = det[s].v; size_t n = det[s].n;
+        for (size_t i = 0; i < n; ) {
+            size_t end = i + DIRTY_BLOCK < n ? i + DIRTY_BLOCK : n;
+            for (size_t k = i; k < end && k < i + 16; k++) __builtin_prefetch(v[k]);
             pthread_mutex_lock(&st->mu);
-            for (int blk = 0; e && blk < DIRTY_BLOCK; blk++, e = nx) {
-                nx = e->dnext;
+            for (; i < end; i++) {
+                mentry *e = v[i];
+                if (i + 16 < n) __builtin_prefetch(v[i + 16]);
                 if (e->tbl == 0xFFFFFFFFu) { free(e->cells); free(e); cleaned++; }
-                else if (ok && e->fver == e->ver) { e->dnext = NULL; e->in_dirty = false; cleaned++; }
-                else { e->dnext = st->dirty; st->dirty = e; }
+                else if (ok && e->fver == e->ver) { e->in_dirty = false; cleaned++; }
+                else if (!dq_push(st, e)) { e->in_dirty = false; cleaned++; }     // (no memory to remember it: it stays in the table as a clean entry that the next change of the row marks again; the file lacks this state until then: it is also in the log)
             }
             pthread_mutex_unlock(&st->mu);
         }
-        det[s] = NULL;
+        free(v); det[s] = (dlist){ NULL, 0 };
     }
     atomic_fetch_sub(&m->ndirty, cleaned);
 }
@@ -364,17 +375,11 @@ static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool l
     rc = (del && ins && site && state && hw) ? SQLITE_OK : SQLITE_ERROR;
     for (int i = 0; i0 == 0 && i < npurge && rc == SQLITE_OK; i++) { char q[80]; snprintf(q, sizeof q, "DELETE FROM mw_rows WHERE tbl = %u AND dv < %llu", purge[i].tbl, (unsigned long long)purge[i].epoch); rc = sqlite3_exec(c, q, NULL, NULL, NULL); }
     uint64_t cells = 0;
-    uint8_t *pack = NULL; size_t packcap = 0;
     for (int i = i0; i < n && rc == SQLITE_OK; i++) {
         if (!v[i].n) { sqlite3_bind_int64(del, 1, v[i].tbl); sqlite3_bind_blob(del, 2, v[i].pk, (int)v[i].pklen, SQLITE_STATIC); if (sqlite3_step(del) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(del); continue; }
-        size_t need = ROW_PACK_MAX(v[i].n);
-        if (need > packcap) { uint8_t *np = realloc(pack, need * 2); if (!np) { rc = SQLITE_NOMEM; break; } pack = np; packcap = need * 2; }
-        size_t len = row_pack(v[i].c, v[i].n, pack);
-        int64_t dvmax = 0; for (int k = 0; k < v[i].n; k++) if (v[i].c[k].dv > dvmax) dvmax = v[i].c[k].dv;
-        sqlite3_bind_int64(ins, 1, v[i].tbl); sqlite3_bind_blob(ins, 2, v[i].pk, (int)v[i].pklen, SQLITE_STATIC); sqlite3_bind_int64(ins, 3, dvmax); sqlite3_bind_blob(ins, 4, pack, (int)len, SQLITE_STATIC);
-        if (sqlite3_step(ins) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(ins); cells += (uint64_t)v[i].n;
+        sqlite3_bind_int64(ins, 1, v[i].tbl); sqlite3_bind_blob(ins, 2, v[i].pk, (int)v[i].pklen, SQLITE_STATIC); sqlite3_bind_int64(ins, 3, v[i].dv); sqlite3_bind_blob(ins, 4, v[i].blob, (int)v[i].bloblen, SQLITE_STATIC);
+        if (sqlite3_step(ins) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(ins); cells += v[i].n;
     }
-    free(pack);
     for (uint32_t o = sflushed; last && o < nsites && rc == SQLITE_OK; o++) {
         uint8_t id[16]; if (!mw_meta_site_id(m, o, id)) continue;
         sqlite3_bind_int64(site, 1, o); sqlite3_bind_blob(site, 2, id, 16, SQLITE_STATIC);
@@ -432,7 +437,7 @@ static int flush_impl (mw_meta *m, bool wait) {
     uint32_t nsites = sh ? atomic_load(&sh->nsites) : 0, sflushed = sh ? atomic_load(&sh->sites_flushed) : m->sites_flushed;
     if (!sh) { pthread_mutex_lock(&m->site_mu); nsites = m->nsites; pthread_mutex_unlock(&m->site_mu); }
     int rc = SQLITE_OK;
-    mentry *det[STRIPES]; bool taken = false;
+    dlist det[STRIPES]; bool taken = false;
     struct mw_purge *purge = NULL; int npurge = 0;
     if (sh) { uint32_t np = atomic_load_explicit(&sh->npurge, memory_order_acquire); if (np) { purge = malloc(np * sizeof *purge); if (purge) for (uint32_t i = 0; i < np; i++) purge[npurge++] = (struct mw_purge){ atomic_load(&sh->purge[i].tbl), atomic_load(&sh->purge[i].epoch) }; } }
     else { pthread_mutex_lock(&m->purge_mu); if (m->npurge) { purge = malloc((size_t)m->npurge * sizeof *purge); if (purge) { memcpy(purge, m->purge, (size_t)m->npurge * sizeof *purge); npurge = m->npurge; } } pthread_mutex_unlock(&m->purge_mu); }
@@ -446,7 +451,7 @@ static int flush_impl (mw_meta *m, bool wait) {
     fitem *v = fb.v; int n = fb.n;
     sort_items(v, n);
     uint64_t hw0 = sh ? atomic_load(&sh->dv_hwm) : atomic_load(&m->hwm);
-    for (int i = 0; i < n; i++) for (int k = 0; k < v[i].n; k++) if ((uint64_t)v[i].c[k].dv > hw0) hw0 = (uint64_t)v[i].c[k].dv;
+    for (int i = 0; i < n; i++) if ((uint64_t)v[i].dv > hw0) hw0 = (uint64_t)v[i].dv;
     rc = SQLITE_OK;
     uint64_t total = 0; for (int i = 0; i < n; i++) total += v[i].n ? (uint64_t)v[i].n : 1;
     static int pmin = -1; if (pmin < 0) { const char *e = getenv("MW_META_PAR_MIN"); pmin = e ? atoi(e) : 200000; }

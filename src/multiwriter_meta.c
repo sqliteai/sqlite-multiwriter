@@ -61,7 +61,7 @@ void mw_meta_free (mw_meta *m) {
     if (!m) return;
     for (int i = 0; i < STRIPES; i++) {
         for (size_t k = 0; m->st[i].b && k < m->st[i].nb; k++) for (mentry *e = m->st[i].b[k], *nx; e; e = nx) { nx = e->next; free(e->cells); free(e); }
-        free(m->st[i].b); pthread_mutex_destroy(&m->st[i].mu);
+        free(m->st[i].b); free(m->st[i].dq); pthread_mutex_destroy(&m->st[i].mu);
     }
     mw_metafile_free(m); free(m->purge); free(m->bloom);
     pthread_mutex_destroy(&m->site_mu); free(m->sites); free(m);
@@ -456,9 +456,11 @@ static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pkle
         ne = entry_new(h, tbl, pk, pklen, c, n);
         if (!ne) { pthread_mutex_unlock(&s->mu); return -1; }
         for (int k = 0; k < n; k++) if (ne->cells[k].dv == OV_CHG) ne->cells[k].dv = (int64_t)epoch;
-        ne->ver = epoch; ne->in_dirty = true; ne->dnext = s->dirty; s->dirty = ne;
+        ne->ver = epoch; ne->in_dirty = true;
+        if (!dq_push(s, ne)) { free(ne->cells); free(ne); pthread_mutex_unlock(&s->mu); return -1; }
         insert_entry(m, s, ne); atomic_fetch_add(&m->ndirty, 1);
     } else {
+        if (!e->in_dirty) { if (!dq_push(s, e)) { pthread_mutex_unlock(&s->mu); return -1; } e->in_dirty = true; atomic_fetch_add(&m->ndirty, 1); }
         size_t before = entry_bytes(e);
         bool removed = false;                                          // a cell of the old state is not in the new one: the file has to forget it
         for (int i = 0; i < e->n && !removed; i++) { bool f = false; for (int k = 0; k < n; k++) if (c[k].col == e->cells[i].col) { f = true; break; } if (!f) removed = true; }
@@ -467,7 +469,6 @@ static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pkle
         e->n = n;
         if (removed) e->drop_ver = epoch;
         e->ver = epoch;
-        if (!e->in_dirty) { e->in_dirty = true; e->dnext = s->dirty; s->dirty = e; atomic_fetch_add(&m->ndirty, 1); }
         size_t after = entry_bytes(e);
         if (after != before) { s->bytes += after - before; atomic_fetch_add(&m->bytes, after - before); }
     }
@@ -482,7 +483,7 @@ static void purge_table (mw_meta *m, uint32_t tbl, uint64_t epoch) {
         stripe *st = &m->st[s]; pthread_mutex_lock(&st->mu);
         for (size_t k = 0; k < st->nb; k++) { mentry **pp = &st->b[k]; while (*pp) { mentry *e = *pp; if (e->tbl == tbl) { *pp = e->next; st->n--; st->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); if (e->in_dirty) e->tbl = 0xFFFFFFFFu; else { free(e->cells); free(e); } } else pp = &e->next; } }
         // dirty entries of the table: unlinked from the dirty list too (the list owns them now)
-        mentry **pd = &st->dirty; while (*pd) { mentry *e = *pd; if (e->tbl == 0xFFFFFFFFu && e->in_dirty) { *pd = e->dnext; atomic_fetch_sub(&m->ndirty, 1); free(e->cells); free(e); } else pd = &e->dnext; }
+        { size_t k = 0; for (size_t i = 0; i < st->ndq; i++) { mentry *e = st->dq[i]; if (e->tbl == 0xFFFFFFFFu && e->in_dirty) { atomic_fetch_sub(&m->ndirty, 1); free(e->cells); free(e); } else st->dq[k++] = e; } st->ndq = k; }
         st->gen++; pthread_mutex_unlock(&st->mu);
     }
     pthread_mutex_lock(&m->purge_mu);

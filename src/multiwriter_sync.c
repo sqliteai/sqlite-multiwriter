@@ -34,7 +34,7 @@ static void sch_free (sysch *s) {
 static int sch_load (sqlite3 *db, sysch *s) {
     memset(s, 0, sizeof *s); s->db = db;
     sqlite3_stmt *st = NULL, *pi = NULL; int cap = 0;
-    if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'mw_%' ORDER BY name", -1, &st, NULL) != SQLITE_OK) return sqlite3_errcode(db);
+    if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_schema WHERE type = 'table' AND sql NOT LIKE 'CREATE VIRTUAL%' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'mw_%' ORDER BY name", -1, &st, NULL) != SQLITE_OK) return sqlite3_errcode(db);
     while (sqlite3_step(st) == SQLITE_ROW) {
         char *name = strdup((const char *)sqlite3_column_text(st, 0)); if (!name) continue;
         char *q = sqlite3_mprintf("PRAGMA table_xinfo(\"%w\")", name);
@@ -43,11 +43,15 @@ static int sch_load (sqlite3 *db, sysch *s) {
         struct col { char *name; int pk, hidden; } cols[2048]; int nc = 0, npk = 0;
         while (sqlite3_step(pi) == SQLITE_ROW && nc < 2048) { cols[nc].name = strdup((const char *)sqlite3_column_text(pi, 1)); cols[nc].pk = sqlite3_column_int(pi, 5); cols[nc].hidden = sqlite3_column_int(pi, 6); if (cols[nc].pk > 0) npk++; nc++; }
         sqlite3_finalize(pi);
-        if (npk == 0 || npk > MW_CAT_MAXPK) { for (int i = 0; i < nc; i++) free(cols[i].name); free(name); continue; }
+        const char *rowid_name = NULL;                                                          // a table without a primary key: its rowid is its key
+        if (npk == 0) { static const char *alias[3] = { "rowid", "_rowid_", "oid" }; for (int a = 0; a < 3 && !rowid_name; a++) { bool used = false; for (int i = 0; i < nc; i++) if (!strcasecmp(cols[i].name, alias[a])) used = true; if (!used) rowid_name = alias[a]; } }
+        if ((npk == 0 && !rowid_name) || npk > MW_CAT_MAXPK) { for (int i = 0; i < nc; i++) free(cols[i].name); free(name); continue; }
+        if (npk == 0) npk = 1;
         if (s->n == cap) { cap = cap ? cap * 2 : 16; s->t = realloc(s->t, (size_t)cap * sizeof *s->t); }
         syt *t = &s->t[s->n++]; memset(t, 0, sizeof *t);
         t->name = name; t->tid = mw_name_id(name); t->npk = npk; t->pk = calloc((size_t)npk, sizeof(char *));
-        for (int k = 1; k <= npk; k++) for (int i = 0; i < nc; i++) if (cols[i].pk == k) t->pk[k - 1] = strdup(cols[i].name);
+        if (rowid_name) t->pk[0] = strdup(rowid_name);
+        else for (int k = 1; k <= npk; k++) for (int i = 0; i < nc; i++) if (cols[i].pk == k) t->pk[k - 1] = strdup(cols[i].name);
         t->cell = calloc((size_t)nc + 1, sizeof(char *)); t->cid = calloc((size_t)nc + 1, sizeof(uint32_t)); t->val = calloc((size_t)nc + 1, sizeof(sqlite3_stmt *));
         for (int i = 0; i < nc; i++) { if (cols[i].pk == 0 && cols[i].hidden == 0) { t->cell[t->nc] = strdup(cols[i].name); t->cid[t->nc] = mw_name_id(cols[i].name); t->nc++; } free(cols[i].name); }
     }
@@ -110,10 +114,13 @@ typedef struct __attribute__((packed)) {
     uint32_t signature; uint8_t version; uint8_t libversion[3]; uint32_t expanded_size; uint16_t ncols; uint32_t nrows; uint64_t schema_hash; uint8_t checksum[6];
 } phdr;
 
+// The payload is written uncompressed (expanded_size 0 in the header, as the container allows): it stays on this machine, and compressing it costs more than it saves. A payload that arrives
+// compressed (from sqlite-sync, or from a peer that compresses: MW_SYNC_COMPRESS=1 here) is decoded as before.
 static int container_encode (const buf *tuples, uint32_t nrows, uint8_t **out, size_t *len) {
-    int bound = LZ4_compressBound((int)tuples->n);
+    static int comp = -1; if (comp < 0) comp = getenv("MW_SYNC_COMPRESS") != NULL;
+    int bound = comp ? LZ4_compressBound((int)tuples->n) : (int)tuples->n;
     uint8_t *z = malloc(sizeof(phdr) + (size_t)bound); if (!z) return SQLITE_NOMEM;
-    int zn = LZ4_compress_default((const char *)tuples->p, (char *)z + sizeof(phdr), (int)tuples->n, bound);
+    int zn = comp ? LZ4_compress_default((const char *)tuples->p, (char *)z + sizeof(phdr), (int)tuples->n, bound) : 0;
     bool raw = zn <= 0 || (size_t)zn > tuples->n;
     phdr h; memset(&h, 0, sizeof h);
     h.signature = htonl(PAYLOAD_SIGNATURE); h.version = PAYLOAD_VERSION; h.libversion[0] = 1; h.libversion[1] = 2; h.libversion[2] = 0;
@@ -124,8 +131,6 @@ static int container_encode (const buf *tuples, uint32_t nrows, uint8_t **out, s
     memcpy(z, &h, sizeof h); *out = z; *len = sizeof h + (size_t)zn;
     return SQLITE_OK;
 }
-
-// the tuples of a payload: the decompressed bytes (owned by the caller) and the number of rows
 static int container_decode (const uint8_t *p, size_t n, uint8_t **tuples, size_t *tlen, uint32_t *nrows) {
     if (n < sizeof(phdr)) return SQLITE_MISUSE;
     phdr h; memcpy(&h, p, sizeof h);

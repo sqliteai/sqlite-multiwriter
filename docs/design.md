@@ -111,7 +111,7 @@ the metadata tests with the store under pressure.
 
 ## Capture and DDL
 
-Tables are tracked when they have an explicit primary key and are not internal (`mw_*`, `sqlite_*`). A table without a primary key has no stable identity and is not synchronised.
+Tables are tracked when they are not internal (`mw_*`, `sqlite_*`) and are not virtual: with an explicit primary key (INTEGER, composite, text, WITHOUT ROWID), or without one, in which case the **rowid is the key** (a column that is itself called `rowid` moves the key to `_rowid_` or `oid`). A table without a primary key has no identity that is the same on every peer: if peers insert into it concurrently, equal rowids are taken for the same row (a choice: the application that wants otherwise declares a primary key).
 - A table created and filled in one transaction: its rows are captured (the catalog of the new schema is built from the transaction's own pages).
 - ADD / DROP COLUMN, and a table recreated with another layout: rows are matched by content and cells by column name (a column that is new to the record of a rewritten
   row gets a cell, the default of the column is not known to the capture).
@@ -122,7 +122,7 @@ Tables are tracked when they have an explicit primary key and are not internal (
 ## Sync
 
 `mw_sync_export(db, since, &payload, &len, &upto)`: every change with db_version in `(since, upto]`, as the container of sqlite-sync (header `CLSY`, LZ4, tuples
-`(tbl, pk, col_name, col_value, col_version, db_version, site_id, cl, seq)`), so peers of either implementation understand each other; `mw_sync_apply(db, payload, len, &stats)`:
+`(tbl, pk, col_name, col_value, col_version, db_version, site_id, cl, seq)`), so peers of either implementation understand each other (the payload is written uncompressed, `expanded_size` 0 as the container allows, since it stays on the machine; `MW_SYNC_COMPRESS=1` compresses it with LZ4, and a compressed payload is always decoded); `mw_sync_apply(db, payload, len, &stats)`:
 the merge in one transaction, all or nothing, retried on conflicts, holding the commit gate of the process when it keeps losing. The merge decisions are made on the metadata
 overlay of the transaction; the commit then *declares* its metadata (the merge's cells) instead of having it derived from the pages, and the extension of the commit carries it.
 `mw_sync_backfill` creates the metadata of rows that exist without any (a database that had data before the capture was on).
@@ -137,7 +137,7 @@ Covered and tested: rowid tables with and without INTEGER PRIMARY KEY, TEXT / co
 updates), tables with more than 63 columns, values of every type, DDL as above, savepoints and rollbacks, triggers, foreign-key actions, upserts, updates that change nothing,
 threads and processes, crashes (SIGKILL at any moment, flush at any pace, log compacting), concurrent applies and local writes, convergence of several peers.
 Not covered (by design, version 1): block-level (text) merging, the DWS/AWS algorithms, filters/row-level security, the network layer, attached databases, virtual tables
-(their shadow tables are tables; the virtual table itself is not tracked), tables without a primary key (kept locally, not exported), the multi-process mode with private
+(their shadow tables are tables; the virtual table itself is not tracked), the multi-process mode with private
 stores (`mw_mp=3`: the metadata design needs the shared mode; opening it with `mw_cdc=1` is refused). Platforms: macOS; Linux, iOS, Windows, Android later.
 
 ## Tests

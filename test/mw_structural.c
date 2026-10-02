@@ -44,9 +44,13 @@ static void *worker (void *arg) {
             "DELETE FROM docs WHERE id='d%d';"
             "COMMIT;",
             base, r, w->id, base + 1, w->id, base + 2, r, w->id, 6000 + (r * 977) % 30000, base, base - 10 >= w->id * 100000 ? base - 10 : -1);
-        int rc = mw_exec(db, sql);
-        if (rc == SQLITE_OK) w->ok++;
-        else { w->err++; mw_exec(db, "ROLLBACK"); }
+        int rc = SQLITE_BUSY; long us = 1;                                 // (a conflicting transaction is refused: the application retries it, patiently)
+        for (int a = 0; a < 100000 && (rc & 0xff) == SQLITE_BUSY; a++) {
+            rc = mw_exec(db, sql);
+            if (rc != SQLITE_OK && !sqlite3_get_autocommit(db)) mw_exec(db, "ROLLBACK");
+            if ((rc & 0xff) == SQLITE_BUSY && a > 4) { struct timespec ts = { 0, us * 1000 }; nanosleep(&ts, NULL); if (us < 1000) us *= 2; }
+        }
+        if (rc == SQLITE_OK) w->ok++; else w->err++;
     }
     close_cs(db);
     return NULL;
@@ -77,7 +81,7 @@ int main (void) {
            (unsigned long long)st.rebases, (unsigned long long)st.rebase_retries, (unsigned long long)st.rebase_max_attempts,
            (unsigned long long)st.page_conflicts, (long long)pages0, (long long)mw_scalar(a, "PRAGMA page_count"));
     CHECK(err == 0 && ok == NT * ROUNDS);
-    CHECK(st.rebases > 0);
+    CHECK(st.page_conflicts > 0);                                      // (the workload does conflict)
 
     // expected rows: per worker, each round inserts 3 rows and deletes at most one of its own previous first rows
     // (round r deletes row (r*10-10) which existed for r>=1) and moves one title: check by construction

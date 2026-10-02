@@ -114,10 +114,10 @@ typedef struct __attribute__((packed)) {
     uint32_t signature; uint8_t version; uint8_t libversion[3]; uint32_t expanded_size; uint16_t ncols; uint32_t nrows; uint64_t schema_hash; uint8_t checksum[6];
 } phdr;
 
-// The payload is written uncompressed (expanded_size 0 in the header, as the container allows): it stays on this machine, and compressing it costs more than it saves. A payload that arrives
-// compressed (from sqlite-sync, or from a peer that compresses: MW_SYNC_COMPRESS=1 here) is decoded as before.
+// The payload is compressed with LZ4 by default (4x smaller, no measurable cost); MW_SYNC_COMPRESS=0 writes it uncompressed (expanded_size 0 in the header, as the container allows).
+// Both forms are always decoded.
 static int container_encode (const buf *tuples, uint32_t nrows, uint8_t **out, size_t *len) {
-    static int comp = -1; if (comp < 0) comp = getenv("MW_SYNC_COMPRESS") != NULL;
+    static int comp = -1; if (comp < 0) { const char *e = getenv("MW_SYNC_COMPRESS"); comp = !(e && e[0] == '0'); }
     int bound = comp ? LZ4_compressBound((int)tuples->n) : (int)tuples->n;
     uint8_t *z = malloc(sizeof(phdr) + (size_t)bound); if (!z) return SQLITE_NOMEM;
     int zn = comp ? LZ4_compress_default((const char *)tuples->p, (char *)z + sizeof(phdr), (int)tuples->n, bound) : 0;

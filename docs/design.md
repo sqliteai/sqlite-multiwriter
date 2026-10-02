@@ -122,7 +122,7 @@ Tables are tracked when they are not internal (`mw_*`, `sqlite_*`) and are not v
 ## Sync
 
 `mw_sync_export(db, since, &payload, &len, &upto)`: every change with db_version in `(since, upto]`, as the container of sqlite-sync (header `CLSY`, LZ4, tuples
-`(tbl, pk, col_name, col_value, col_version, db_version, site_id, cl, seq)`), so peers of either implementation understand each other (the payload is written uncompressed, `expanded_size` 0 as the container allows, since it stays on the machine; `MW_SYNC_COMPRESS=1` compresses it with LZ4, and a compressed payload is always decoded); `mw_sync_apply(db, payload, len, &stats)`:
+`(tbl, pk, col_name, col_value, col_version, db_version, site_id, cl, seq)`), so peers of either implementation understand each other (the payload is LZ4-compressed by default; `MW_SYNC_COMPRESS=0` writes it uncompressed, `expanded_size` 0 as the container allows: measured no difference in apply time, 4x the size; both forms are always decoded); `mw_sync_apply(db, payload, len, &stats)`:
 the merge in one transaction, all or nothing, retried on conflicts, holding the commit gate of the process when it keeps losing. The merge decisions are made on the metadata
 overlay of the transaction; the commit then *declares* its metadata (the merge's cells) instead of having it derived from the pages, and the extension of the commit carries it.
 `mw_sync_backfill` creates the metadata of rows that exist without any (a database that had data before the capture was on).

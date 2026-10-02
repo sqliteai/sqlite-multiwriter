@@ -63,7 +63,8 @@ int main (void) {
         int64_t sum; int bad = check_rows(r, &sum);
         printf("%-34s at commit %2d: acknowledged %2d, sum(n) = %lld, cells disagreeing: %d\n", F[k].name, at, acked, (long long)sum, bad);
         CHECK(bad == 0); CHECK(sum >= acked);
-        if (F[k].f < MW_CRASH_MID_LOG) CHECK(sum == acked);                // (a fault that fails the commit: exactly the acknowledged ones are there)
+        if (F[k].f == MW_FAULT_LOG_SYNC_ERR) CHECK(sum == acked || sum == acked + 1);   // (the record was written and its sync failed: the outcome is unknown to the caller, as with any failed fsync; the metadata agrees either way)
+        else if (F[k].f < MW_CRASH_MID_LOG) CHECK(sum == acked);                // (a fault that fails the commit: exactly the acknowledged ones are there)
         CHECK_RC(mw_exec(r, "UPDATE t SET n = n + 1"), SQLITE_OK); bad = check_rows(r, &sum); CHECK(bad == 0);
         sqlite3_close(r); mw_rmdb(path);
     }

@@ -231,22 +231,49 @@ fitem *mw_fbatch_add (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t pklen
 }
 void mw_fbatch_free (fbatch *b) { for (int i = 0; i < b->nblocks; i++) free(b->blocks[i]); free(b->blocks); free(b->v); memset(b, 0, sizeof *b); }
 
-static int collect (mw_meta *m, uint64_t F, fbatch *out) {
+// The dirty lists are taken away from the stripes whole (a moment under the lock) and then read in blocks, the lock released between them: a flusher that holds a stripe for the whole
+// of a long list (a million rows when it lags) is what the writers of that stripe would wait for. The entries of a taken list cannot be freed (they are dirty) and nobody else touches
+// their `dnext` (a writer links an entry only when it is not dirty).
+#define DIRTY_BLOCK 256
+static int collect (mw_meta *m, uint64_t F, fbatch *out, mentry **det) {
     for (int s = 0; s < STRIPES; s++) {
         stripe *st = &m->st[s];
-        pthread_mutex_lock(&st->mu);
-        for (mentry *e = st->dirty; e; e = e->dnext) {
-            int nc = 0; for (int i = 0; i < e->n; i++) if (e->cells[i].dv > (int64_t)F) nc++;
-            bool drop = e->drop_ver > F;
-            e->fver = e->ver;
-            if (!nc && !drop) continue;
-            fitem *it = mw_fbatch_add(out, e->tbl, e->pk, e->pklen, drop, nc);
-            if (!it) { pthread_mutex_unlock(&st->mu); mw_fbatch_free(out); return -1; }
-            int k = 0; for (int i = 0; i < e->n; i++) if (e->cells[i].dv > (int64_t)F) it->c[k++] = e->cells[i];
+        pthread_mutex_lock(&st->mu); det[s] = st->dirty; st->dirty = NULL; pthread_mutex_unlock(&st->mu);
+        for (mentry *e = det[s]; e; ) {
+            pthread_mutex_lock(&st->mu);
+            for (int blk = 0; e && blk < DIRTY_BLOCK; blk++, e = e->dnext) {
+                if (e->tbl == 0xFFFFFFFFu) continue;                                  // (its table was dropped meanwhile)
+                int nc = 0; for (int i = 0; i < e->n; i++) if (e->cells[i].dv > (int64_t)F) nc++;
+                bool drop = e->drop_ver > F;
+                e->fver = e->ver;
+                if (!nc && !drop) continue;
+                fitem *it = mw_fbatch_add(out, e->tbl, e->pk, e->pklen, drop, nc);
+                if (!it) { pthread_mutex_unlock(&st->mu); mw_fbatch_free(out); return -1; }
+                int k = 0; for (int i = 0; i < e->n; i++) if (e->cells[i].dv > (int64_t)F) it->c[k++] = e->cells[i];
+            }
+            pthread_mutex_unlock(&st->mu);
         }
-        pthread_mutex_unlock(&st->mu);
     }
     return 0;
+}
+// What is done with the taken lists: after a flush that wrote them the entries nobody changed since are clean; the others (and all of them when the flush failed) are dirty again.
+static void collect_done (mw_meta *m, mentry **det, bool ok) {
+    uint64_t cleaned = 0;
+    for (int s = 0; s < STRIPES; s++) {
+        stripe *st = &m->st[s];
+        for (mentry *e = det[s], *nx; e; ) {
+            pthread_mutex_lock(&st->mu);
+            for (int blk = 0; e && blk < DIRTY_BLOCK; blk++, e = nx) {
+                nx = e->dnext;
+                if (e->tbl == 0xFFFFFFFFu) { free(e->cells); free(e); cleaned++; }
+                else if (ok && e->fver == e->ver) { e->dnext = NULL; e->in_dirty = false; cleaned++; }
+                else { e->dnext = st->dirty; st->dirty = e; }
+            }
+            pthread_mutex_unlock(&st->mu);
+        }
+        det[s] = NULL;
+    }
+    atomic_fetch_sub(&m->ndirty, cleaned);
 }
 
 // the batch in the order of the table's key (table, then key bytes): inserts into the b-tree then walk it instead of jumping about. Sorting fitems directly chases a pointer per
@@ -351,6 +378,7 @@ static int flush_impl (mw_meta *m, bool wait) {
     uint32_t nsites = sh ? atomic_load(&sh->nsites) : 0, sflushed = sh ? atomic_load(&sh->sites_flushed) : m->sites_flushed;
     if (!sh) { pthread_mutex_lock(&m->site_mu); nsites = m->nsites; pthread_mutex_unlock(&m->site_mu); }
     int rc = SQLITE_OK;
+    mentry *det[STRIPES]; bool taken = false;
     struct mw_purge *purge = NULL; int npurge = 0;
     if (sh) { uint32_t np = atomic_load_explicit(&sh->npurge, memory_order_acquire); if (np) { purge = malloc(np * sizeof *purge); if (purge) for (uint32_t i = 0; i < np; i++) purge[npurge++] = (struct mw_purge){ atomic_load(&sh->purge[i].tbl), atomic_load(&sh->purge[i].epoch) }; } }
     else { pthread_mutex_lock(&m->purge_mu); if (m->npurge) { purge = malloc((size_t)m->npurge * sizeof *purge); if (purge) { memcpy(purge, m->purge, (size_t)m->npurge * sizeof *purge); npurge = m->npurge; } } pthread_mutex_unlock(&m->purge_mu); }
@@ -359,7 +387,8 @@ static int flush_impl (mw_meta *m, bool wait) {
     if (!m->wr) m->wr = open_conn(m);
     if (!m->wr) { rc = SQLITE_CANTOPEN; goto out; }
     fbatch fb = {0};
-    if ((sh ? mm_collect(m, F, Fe, &fb) : collect(m, F, &fb)) != 0) { rc = SQLITE_NOMEM; goto out; }
+    if (!sh) { memset(det, 0, sizeof det); taken = true; }
+    if ((sh ? mm_collect(m, F, Fe, &fb) : collect(m, F, &fb, det)) != 0) { rc = SQLITE_NOMEM; goto out; }
     fitem *v = fb.v; int n = fb.n;
     sort_items(v, n);
     uint64_t hw0 = sh ? atomic_load(&sh->dv_hwm) : atomic_load(&m->hwm);
@@ -387,20 +416,14 @@ static int flush_impl (mw_meta *m, bool wait) {
             for (int i = 0; i < npurge; i++) for (int q = 0; q < m->npurge; q++) if (m->purge[q].tbl == purge[i].tbl && m->purge[q].epoch == purge[i].epoch) { m->purge[q] = m->purge[--m->npurge]; break; }
             pthread_mutex_unlock(&m->purge_mu);
             atomic_store(&m->flushed, V); atomic_store(&m->hwm, m->new_hwm); m->sites_flushed = nsites;
-            uint64_t cleaned = 0;
-            for (int s = 0; s < STRIPES; s++) {
-                stripe *st = &m->st[s]; pthread_mutex_lock(&st->mu);
-                mentry **pp = &st->dirty;
-                while (*pp) { mentry *e = *pp; if (e->fver == e->ver) { *pp = e->dnext; e->dnext = NULL; e->in_dirty = false; cleaned++; } else pp = &e->dnext; }
-                pthread_mutex_unlock(&st->mu);
-            }
-            atomic_fetch_sub(&m->ndirty, cleaned);
+            collect_done(m, det, true); taken = false;
         }
         atomic_fetch_add(&m->n_flushes, 1);
     }
     atomic_fetch_add(&m->flush_ns, now_ns() - t0);
     m->last_flush_ns = now_ns();
 out:
+    if (taken) collect_done(m, det, false);                                      // (failed: the entries are dirty again)
     free(purge);
     if (sh) mw_mp_meta_unlock(m->db, 1);
     pthread_mutex_unlock(&m->file_mu);

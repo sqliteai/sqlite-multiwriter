@@ -27,7 +27,7 @@ typedef struct mentry {
     uint8_t pk[];
 } mentry;
 
-typedef struct { pthread_mutex_t mu; mentry **b; size_t nb, n; mentry *dirty; size_t bytes; size_t hand; uint64_t gen; } stripe;
+typedef struct { pthread_mutex_t mu; mentry **b; size_t nb, n; mentry *dirty; size_t bytes; size_t hand; uint64_t gen; uint32_t backoff; } stripe;
 
 struct mw_meta {
     struct mw_db *db;

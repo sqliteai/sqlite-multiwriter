@@ -69,30 +69,33 @@ void mw_meta_free (mw_meta *m) {
 static size_t entry_bytes (const mentry *e) { return sizeof *e + e->pklen + (size_t)e->cap * sizeof(mw_mcell); }
 
 static mentry *find (stripe *s, uint64_t h, uint32_t tbl, const void *pk, size_t pklen) {
-    for (mentry *e = s->b[h & (s->nb - 1)]; e; e = e->next) if (e->h == h && e->tbl == tbl && e->pklen == pklen && !memcmp(e->pk, pk, pklen)) return e;
+    for (mentry *e = s->b[(h >> 8) & (s->nb - 1)]; e; e = e->next) if (e->h == h && e->tbl == tbl && e->pklen == pklen && !memcmp(e->pk, pk, pklen)) return e;
     return NULL;
 }
 
 static void grow (stripe *s) {
     size_t nn = s->nb * 2; mentry **nb = calloc(nn, sizeof *nb);
     if (!nb) return;
-    for (size_t k = 0; k < s->nb; k++) for (mentry *e = s->b[k], *nx; e; e = nx) { nx = e->next; size_t j = e->h & (nn - 1); e->next = nb[j]; nb[j] = e; }
+    for (size_t k = 0; k < s->nb; k++) for (mentry *e = s->b[k], *nx; e; e = nx) { nx = e->next; size_t j = (e->h >> 8) & (nn - 1); e->next = nb[j]; nb[j] = e; }
     free(s->b); s->b = nb; s->nb = nn;
 }
 
 // drops clean entries of the stripe until it is under its share of the budget (the caller holds the lock)
 static void evict (mw_meta *m, stripe *s) {
     size_t cap = m->cap_bytes / STRIPES + 1;
-    size_t scanned = 0;
-    while (s->bytes > cap && scanned < s->nb) {
+    size_t scanned = 0, freed = 0;
+    if (s->bytes <= cap) return;
+    if (s->backoff) { s->backoff--; return; }                                          // (the last look found only rows that are waiting for the flusher)
+    while (s->bytes > cap && scanned < s->nb && scanned < 48) {                       // (a bounded step: when the rows are dirty there is nothing to drop and a full scan of the stripe at every insert, under its lock, is what the writers would wait for)
         size_t k = s->hand++ & (s->nb - 1); scanned++;
         mentry **pp = &s->b[k];
         while (*pp) {
             mentry *e = *pp;
-            if (!e->in_dirty && s->bytes > cap) { *pp = e->next; s->n--; s->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); free(e->cells); free(e); s->gen++; }
+            if (!e->in_dirty && s->bytes > cap) { *pp = e->next; s->n--; s->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); free(e->cells); free(e); s->gen++; freed++; }
             else pp = &e->next;
         }
     }
+    if (!freed) s->backoff = 256;
 }
 
 static mentry *entry_new (uint64_t h, uint32_t tbl, const void *pk, size_t pklen, const mw_mcell *c, int n) {
@@ -106,7 +109,7 @@ static mentry *entry_new (uint64_t h, uint32_t tbl, const void *pk, size_t pklen
 
 static void insert_entry (mw_meta *m, stripe *s, mentry *e) {
     if (s->n * 2 > s->nb) grow(s);
-    size_t j = e->h & (s->nb - 1); e->next = s->b[j]; s->b[j] = e; s->n++; s->bytes += entry_bytes(e);
+    size_t j = (e->h >> 8) & (s->nb - 1); e->next = s->b[j]; s->b[j] = e; s->n++; s->bytes += entry_bytes(e);
     atomic_fetch_add(&m->bytes, entry_bytes(e)); atomic_fetch_add(&m->rows, 1);
 }
 

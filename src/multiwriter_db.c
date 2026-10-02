@@ -94,6 +94,8 @@ void mw_db_release (mw_db *db) {
         // ordinary SQLite database again) and drop the log. If the database failed, the log is kept for recovery.
         mw_db_compactor_stop(db);
         mw_cdc_close(db);
+        for (int i = 0; i < db->nrext; i++) free(db->rext[i].data);
+        free(db->rext); db->rext = NULL; db->nrext = db->caprext = 0;
         bool clean = false, sole = true;
         if (db->shared) {
             mw_mp_close(db, &sole);

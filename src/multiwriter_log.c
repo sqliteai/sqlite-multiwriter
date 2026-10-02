@@ -6,7 +6,7 @@
 //  the versions live in memory, so every commit is first appended here as one checksummed record:
 //
 //    header (64 B): LOG_MAGIC, version, page size, base_epoch, salt, cksum
-//    record (32 B header + npages * (4 + pgsz)): magic, npages, epoch, dbsize, pgsz, cksum
+//    record (40 B header + npages * (4 + pgsz) + ext_len): magic, npages, epoch, dbsize, pgsz, ext_len, cksum
 //
 //  Durability ordering (documented in docs/multiwriter.md):
 //    1. the commit is validated and installed in the store *invisibly* (epoch not advanced) under the
@@ -39,8 +39,8 @@
 #define LOG_GROW_BYTES (32ull << 20)
 #define LOG_MAGIC "MWLOG002"                /* one constant for create, rewrite and recovery */
 #define LOG_HDR_SIZE 64
-#define REC_HDR_SIZE 32
-#define REC_MAGIC    0x3143574du      /* "MWC1" */
+#define REC_HDR_SIZE 40
+#define REC_MAGIC    0x3243574du      /* "MWC2": records carry a metadata extension (the change-capture cells of the commit) after the pages */
 
 typedef struct {
     char     magic[8];
@@ -54,6 +54,7 @@ typedef struct {
     uint32_t magic, npages;
     uint64_t epoch;
     uint32_t dbsize, pgsz;
+    uint32_t ext_len, pad;           // bytes of the extension that follows the pages (0 without change capture)
     uint64_t cksum;
 } rec_hdr;
 
@@ -144,8 +145,22 @@ static uint64_t rec_cksum (uint64_t salt, const rec_hdr *h, const void *body, si
     return fnv64(x, body, body_len);
 }
 
-uint64_t mw_log_record_size (mw_db *db, int n) {
-    return REC_HDR_SIZE + (uint64_t)n * (4 + (uint64_t)db->store->pgsz);
+int mw_recovered_ext_add (mw_db *db, uint64_t epoch, const uint8_t *ext, uint32_t len) {
+    if (db->nrext == db->caprext) {
+        int nc = db->caprext ? db->caprext * 2 : 16;
+        mw_rext *n = realloc(db->rext, (size_t)nc * sizeof(mw_rext));
+        if (!n) return SQLITE_NOMEM;
+        db->rext = n; db->caprext = nc;
+    }
+    uint8_t *c = malloc(len);
+    if (!c) return SQLITE_NOMEM;
+    memcpy(c, ext, len);
+    db->rext[db->nrext++] = (mw_rext){ epoch, c, len };
+    return SQLITE_OK;
+}
+
+uint64_t mw_log_record_size (mw_db *db, int n, uint32_t ext_len) {
+    return REC_HDR_SIZE + (uint64_t)n * (4 + (uint64_t)db->store->pgsz) + ext_len;
 }
 
 // MARK: - open / recovery -
@@ -200,7 +215,8 @@ int mw_log_open (mw_db *db, int pgsz) {
         if ((uint64_t)off >= limit) break;
         if (pread_all(db->logfd, &r, sizeof r, off) != SQLITE_OK) break;
         if (r.magic != REC_MAGIC || r.pgsz != (uint32_t)pgsz || r.npages == 0 || r.npages > (1u << 24)) break;
-        size_t body = (size_t)r.npages * (4 + (size_t)pgsz);
+        if (r.ext_len > (64u << 20)) break;                                            // (an extension is at most a few MB: a larger value is garbage)
+        size_t body = (size_t)r.npages * (4 + (size_t)pgsz) + r.ext_len;
         if ((uint64_t)off + REC_HDR_SIZE + body > fsz) break;                          // a torn / garbage header must not size an allocation
         if (body > rec_cap) {
             uint8_t *nb = realloc(buf, body);
@@ -223,6 +239,7 @@ int mw_log_open (mw_db *db, int pgsz) {
             }
             rc = mw_store_install_recovered(st, r.epoch, r.dbsize, (int)r.npages, pgnos, imgs);
             if (rc == SQLITE_OK) st->sizes[st->nsizes - 1].log_off = (uint64_t)off;
+            if (rc == SQLITE_OK && r.ext_len) rc = mw_recovered_ext_add(db, r.epoch, buf + (size_t)r.npages * (4 + (size_t)pgsz), r.ext_len);
             free(pgnos); free(imgs);
             if (rc != SQLITE_OK) break;
             last = r.epoch;
@@ -311,7 +328,7 @@ int mw_log_apply_at (mw_db *db, uint64_t off, uint64_t *out_size, uint64_t *out_
     memcpy(&r, base, sizeof r);
     size_t pgsz = (size_t)db->store->pgsz;
     if (r.magic != REC_MAGIC || r.pgsz != (uint32_t)pgsz || r.npages == 0 || r.npages > (1u << 24)) { if (dbg) fprintf(stderr, "apply_at: bad header at %llu (magic %x npages %u)\n", (unsigned long long)off, r.magic, r.npages); return SQLITE_CORRUPT; }
-    size_t body = (size_t)r.npages * (4 + pgsz);
+    size_t body = (size_t)r.npages * (4 + pgsz) + r.ext_len;
     if (off + REC_HDR_SIZE + body > db->logfile_size) { if (dbg) fprintf(stderr, "apply_at: record at %llu beyond mapped size %llu\n", (unsigned long long)off, (unsigned long long)db->logfile_size); return SQLITE_IOERR_SHORT_READ; }
     if (r.epoch != atomic_load(&db->epoch) + 1) { if (dbg) fprintf(stderr, "apply_at: epoch %llu after %llu\n", (unsigned long long)r.epoch, (unsigned long long)atomic_load(&db->epoch)); return SQLITE_CORRUPT; }
     uint32_t pg_small[16]; const uint8_t *im_small[16];
@@ -565,15 +582,16 @@ static bool mark_written (mw_db *db, uint64_t epoch, uint64_t end) {
     return true;
 }
 
-static int append_staged (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, int sync) {
+static int append_staged (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, const uint8_t *ext, uint32_t ext_len, int sync) {
     size_t pgsz = (size_t)db->store->pgsz;
-    size_t body = (size_t)n * (4 + pgsz);
+    size_t body = (size_t)n * (4 + pgsz) + ext_len;
     uint64_t size = REC_HDR_SIZE + (uint64_t)body, end = off + size, R = db->stage_r;
     if (mw_fault_hit(MW_FAULT_LOG_WRITE_ERR)) return SQLITE_IOERR_WRITE;
-    rec_hdr r = { .magic = REC_MAGIC, .npages = (uint32_t)n, .epoch = epoch, .dbsize = dbsize, .pgsz = (uint32_t)pgsz, .cksum = 0 };
+    rec_hdr r = { .magic = REC_MAGIC, .npages = (uint32_t)n, .epoch = epoch, .dbsize = dbsize, .pgsz = (uint32_t)pgsz, .ext_len = ext_len, .cksum = 0 };
     // checksum straight from the sources (same value as over the contiguous record)
     { rec_hdr c = r; ckstream ck; ck.h = fnv64(db->log_salt ^ 1469598103934665603ull, &c, sizeof c); ck.tn = 0;
       for (int i = 0; i < n; i++) { ck_feed(&ck, &pgnos[i], 4); ck_feed(&ck, images[i], pgsz); }
+      if (ext_len) ck_feed(&ck, ext, ext_len);
       r.cksum = ck_final(&ck); }
     bool big = size > R / 4;                                             // (a record that cannot fit the ring comfortably goes to the file directly)
     // 1. room: the ring bytes of file offset x are reused by x + R, so everything below end - R must be in the file
@@ -599,6 +617,7 @@ static int append_staged (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsi
         memcpy(buf, &r, sizeof r);
         uint8_t *p = buf + REC_HDR_SIZE;
         for (int i = 0; i < n; i++) { memcpy(p, &pgnos[i], 4); memcpy(p + 4, images[i], pgsz); p += 4 + pgsz; }
+        if (ext_len) memcpy(p, ext, ext_len);
         if (fault_fires(MW_CRASH_MID_LOG)) { pwrite_all(db->logfd, buf, (size_t)size / 2, (off_t)off); _exit(9); }
         int rc = pwrite_all(db->logfd, buf, (size_t)size, (off_t)off);
         free(buf);
@@ -614,6 +633,7 @@ static int append_staged (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsi
     ring_copy(db, off, &r, sizeof r);
     uint64_t pos = off + REC_HDR_SIZE;
     for (int i = 0; i < n; i++) { ring_copy(db, pos, &pgnos[i], 4); ring_copy(db, pos + 4, images[i], pgsz); pos += 4 + pgsz; }
+    if (ext_len) ring_copy(db, pos, ext, ext_len);
     if (fault_fires(MW_CRASH_MID_LOG)) { ring_write_file(db, off, size / 2); _exit(9); }        // torn-write crash: half the record reaches the file
     // 3. join the prefix
     if (sync) atomic_store(&db->saw_sync, 1);
@@ -706,12 +726,12 @@ static bool stage_drained (mw_db *db) {
 
 // MARK: - append / group commit -
 
-int mw_log_append (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, int sync) {
+int mw_log_append (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, const uint8_t *ext, uint32_t ext_len, int sync) {
     size_t pgsz = (size_t)db->store->pgsz;
-    size_t body = (size_t)n * (4 + pgsz);
+    size_t body = (size_t)n * (4 + pgsz) + ext_len;
     if (mw_fault_hit(MW_FAULT_ALLOC_ERR)) return SQLITE_NOMEM;
-    if (staged_mode(db, sync)) return append_staged(db, off, epoch, dbsize, n, pgnos, images, sync);
-    rec_hdr r = { .magic = REC_MAGIC, .npages = (uint32_t)n, .epoch = epoch, .dbsize = dbsize, .pgsz = (uint32_t)pgsz, .cksum = 0 };
+    if (staged_mode(db, sync)) return append_staged(db, off, epoch, dbsize, n, pgnos, images, ext, ext_len, sync);
+    rec_hdr r = { .magic = REC_MAGIC, .npages = (uint32_t)n, .epoch = epoch, .dbsize = dbsize, .pgsz = (uint32_t)pgsz, .ext_len = ext_len, .cksum = 0 };
     int rc = SQLITE_OK;
     uint8_t *map = db->logmap;
     if (mw_fault_hit(MW_FAULT_LOG_WRITE_ERR)) {
@@ -720,6 +740,7 @@ int mw_log_append (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsize, int
         // body first, header (with the magic) last: a record that was never completed does not validate
         uint8_t *p = map + off + REC_HDR_SIZE;
         for (int i = 0; i < n; i++) { memcpy(p, &pgnos[i], 4); memcpy(p + 4, images[i], pgsz); p += 4 + pgsz; }
+        if (ext_len) memcpy(p, ext, ext_len);
         if (fault_fires(MW_CRASH_MID_LOG)) _exit(9);                        // body written, header not: torn record
         r.cksum = rec_cksum(db->log_salt, &r, map + off + REC_HDR_SIZE, body);
         memcpy(map + off, &r, sizeof r);
@@ -728,6 +749,7 @@ int mw_log_append (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsize, int
         if (!buf) return SQLITE_NOMEM;
         uint8_t *p = buf + REC_HDR_SIZE;
         for (int i = 0; i < n; i++) { memcpy(p, &pgnos[i], 4); memcpy(p + 4, images[i], pgsz); p += 4 + pgsz; }
+        if (ext_len) memcpy(p, ext, ext_len);
         r.cksum = rec_cksum(db->log_salt, &r, buf + REC_HDR_SIZE, body);
         memcpy(buf, &r, sizeof r);
         if (fault_fires(MW_CRASH_MID_LOG)) {                                // torn-write crash: half the record reaches the file
@@ -957,7 +979,7 @@ uint64_t mw_log_scan_after (mw_db *db, uint64_t epoch, uint64_t end) {
         memcpy(&r, db->logmap + off, sizeof r);
         if (r.magic != REC_MAGIC || r.pgsz != (uint32_t)pgsz || r.npages == 0) break;
         if (r.epoch > epoch) return off;
-        off += REC_HDR_SIZE + (uint64_t)r.npages * (4 + pgsz);
+        off += REC_HDR_SIZE + (uint64_t)r.npages * (4 + pgsz) + r.ext_len;
     }
     return off;
 }

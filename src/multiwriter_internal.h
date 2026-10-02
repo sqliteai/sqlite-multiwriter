@@ -210,6 +210,7 @@ struct mw_lane {
     sqlite3    *rb_c, *rb_v;    // cached rebase helper connections (writer at the latest snapshot / overlay reader)
     // change capture (mw_cdc=1): the row changes of the transaction being committed, and the catalog they were decoded with
     mw_rd_result cdc_res; mw_cat *cdc_cat; int cdc_nfreed;
+    uint8_t *cdc_ext; uint32_t cdc_ext_len;      // the commit's change-capture extension, written in the log record next to the pages
     int64_t     min_reserved;   // lowest db_version reserved by the current transaction, 0 = none (protected by db->mu)
     uint64_t    writer_id;      // unique per connection (lane) in this process; NOT the sqlite-sync site_id
     mw_tx_info  tx;             // current/last transaction
@@ -282,6 +283,7 @@ struct mw_db {
     // durable log (multiwriter_log.c)
     char             *logpath;
     int               logfd;               // -1 = no log (never for a private-lane db)
+    struct mw_rext   *rext; int nrext, caprext;   // extensions found in the log at recovery (epoch, bytes), consumed once by the change capture
     uint64_t          log_salt;            // per-database: stored in the log header, seeds the record checksums
     uint64_t          log_off;             // next append offset (protected by store->seq_mu)
     uint8_t          *logmap;              // the log file mapped MAP_SHARED (records are memcpy'd, no syscall); NULL = pwrite fallback
@@ -455,10 +457,12 @@ int       mw_store_install_recovered (mw_store *st, uint64_t epoch, uint32_t dbs
 // durable log (multiwriter_log.c)
 int       mw_log_open (mw_db *db, int pgsz);                       // create or recover; installs recovered commits in the store
 void      mw_log_close (mw_db *db, bool remove_file);
-int       mw_log_append (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, int sync);
+int       mw_log_append (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, const uint8_t *ext, uint32_t ext_len, int sync);
 void      mw_log_decide_mode (mw_db *db, int sync);                  // how records are written is decided once, before the first offset is assigned
 void      mw_log_stage_reset (mw_db *db, uint64_t off);              // the log restarts at `off`: nothing staged or unflushed
-uint64_t  mw_log_record_size (mw_db *db, int n);
+uint64_t  mw_log_record_size (mw_db *db, int n, uint32_t ext_len);
+typedef struct mw_rext { uint64_t epoch; uint8_t *data; uint32_t len; } mw_rext;
+int       mw_recovered_ext_add (mw_db *db, uint64_t epoch, const uint8_t *ext, uint32_t len);          // recovery: an extension seen in the log, kept for the change capture to replay
 int       mw_log_sync (mw_db *db, uint64_t epoch, uint64_t my_end);   // my_end: file offset where this commit's record ends (staged mode)
 int       mw_log_set_base (mw_db *db, uint64_t base_epoch);
 void      mw_log_reserve_space (mw_db *db);                          // caller holds store->seq_mu: grow the file ahead of log_off

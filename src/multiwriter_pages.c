@@ -397,7 +397,7 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     st->sizes[st->nsizes].dbsize = new_dbsize;
     size_note(st, epoch, new_dbsize);
     uint64_t log_off = 0, log_end = 0;                           // log_end: the log's size after our record, taken under seq_mu (the compaction check below must not read db->log_off unlocked)
-    if (db->has_log) { log_off = db->log_off; db->log_off += mw_log_record_size(db, n); mw_log_reserve_space(db); log_end = db->log_off; }
+    if (db->has_log) { log_off = db->log_off; db->log_off += mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0); mw_log_reserve_space(db); log_end = db->log_off; }
     st->sizes[st->nsizes].log_off = log_off;
     st->nsizes++;
     atomic_store(&db->next_epoch, epoch);                        // assigned; NOT visible yet (db->epoch is untouched)
@@ -420,14 +420,14 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     // ---- outside the locks: persist, then become visible (in epoch order) --------------------------
     mw_fault_hit(MW_CRASH_BEFORE_LOG);
     uint64_t ta0 = MW_T0();
-    rc = db->has_log ? mw_log_append(db, log_off, epoch, new_dbsize, n, pgnos, images, sync) : SQLITE_OK;
+    rc = db->has_log ? mw_log_append(db, log_off, epoch, new_dbsize, n, pgnos, images, lane ? lane->cdc_ext : NULL, lane ? lane->cdc_ext_len : 0, sync) : SQLITE_OK;
     MW_T1(MW_ST_APPEND, ta0);
     if (rc != SQLITE_OK) {
         // The record never made it. If nothing was assigned after us we can take the commit back cleanly:
         // uninstall, return the log space. Otherwise a successor may already sit behind the hole: the
         // database is failed (sticky) and recovers by reopening (the log stops at the hole).
         mw_spinlock(&st->seq_mu);
-        bool latest = atomic_load(&db->next_epoch) == epoch && db->log_off == log_off + mw_log_record_size(db, n);
+        bool latest = atomic_load(&db->next_epoch) == epoch && db->log_off == log_off + mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0);
         if (latest) {
             st->nsizes--;
             atomic_store(&db->next_epoch, epoch - 1);
@@ -455,7 +455,7 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     if (sync && !db->mp) {                                       // (multi-process: the wrapper fsyncs after releasing the publication lock)
         uint64_t s0 = now_ns();
         uint64_t ts0 = MW_T0();
-        rc = mw_log_sync(db, epoch, log_off + mw_log_record_size(db, n));
+        rc = mw_log_sync(db, epoch, log_off + mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0));
         MW_T1(MW_ST_SYNC, ts0);
         atomic_fetch_add(&db->n_log_sync_ns, now_ns() - s0);
         if (rc != SQLITE_OK) {                                   // outcome uncertain: stop accepting commits

@@ -15,14 +15,18 @@ static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS mw_state(k TEXT PRIMARY KEY NOT NULL, v) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS mw_sites(ord INTEGER PRIMARY KEY, id BLOB NOT NULL);"
     "CREATE TABLE IF NOT EXISTS mw_cells(tbl INTEGER NOT NULL, pk BLOB NOT NULL, col INTEGER NOT NULL, cv INTEGER NOT NULL, dv INTEGER NOT NULL, seq INTEGER NOT NULL, site INTEGER NOT NULL, PRIMARY KEY(tbl, pk, col)) WITHOUT ROWID;"
-    "CREATE INDEX IF NOT EXISTS mw_cells_dv ON mw_cells(dv, seq);";
+    "CREATE INDEX IF NOT EXISTS mw_cells_sen ON mw_cells(tbl, pk) WHERE col = -1;";
 
 static uint64_t now_ns (void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 static bool busyish (int rc) { int p = rc & 0xff; return p == SQLITE_BUSY || p == SQLITE_LOCKED; }
 
+// The index that lets the export find the cells changed since a db_version costs a random insert per cell at every flush: it is created by the first export (the databases that never
+// synchronise do not pay for it), and the flush maintains it from then on.
+int mw_meta_export_index (sqlite3 *c) { return sqlite3_exec(c, "CREATE INDEX IF NOT EXISTS mw_cells_dv ON mw_cells(dv, seq)", NULL, NULL, NULL); }
+
 int mw_meta_schema (sqlite3 *c) {
     sqlite3_stmt *st = NULL; int have = 0;
-    if (sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_cells','mw_cells_dv')", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) have = sqlite3_column_int(st, 0);
+    if (sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_cells','mw_cells_sen')", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) have = sqlite3_column_int(st, 0);
     sqlite3_finalize(st);
     if (have == 4) return SQLITE_OK;
     int rc = SQLITE_BUSY;
@@ -103,6 +107,57 @@ locked:
     return rc;
 }
 
+// many rows, one read transaction (a read transaction per row costs more than the lookup: the page cache is dropped when the database changed)
+int mw_metafile_load_many (mw_meta *m, int n, const uint32_t *tbl, const uint8_t *const *pk, const size_t *pklen, mw_mcell **cells, int *ncells) {
+    for (int i = 0; i < n; i++) { cells[i] = NULL; ncells[i] = 0; }
+    if (!m->attached || !m->tables_ok) return 0;
+    int slot = (int)(((uintptr_t)pthread_self() >> 4) % MW_RDN);
+    for (int i = 0; i < MW_RDN; i++) { int k = (slot + i) % MW_RDN; if (pthread_mutex_trylock(&m->rdmu[k]) == 0) { slot = k; goto locked; } }
+    pthread_mutex_lock(&m->rdmu[slot]);
+locked:
+    if (!m->rd[slot]) m->rd[slot] = open_conn(m);
+    if (m->rd[slot] && !m->rds[slot]) sqlite3_prepare_v2(m->rd[slot], "SELECT col, cv, dv, seq, site FROM mw_cells WHERE tbl = ?1 AND pk = ?2", -1, &m->rds[slot], NULL);
+    int rc = 0;
+    if (m->rds[slot]) {
+        sqlite3_stmt *st = m->rds[slot];
+        bool txn = sqlite3_exec(m->rd[slot], "BEGIN", NULL, NULL, NULL) == SQLITE_OK;
+        for (int i = 0; i < n && rc == 0; i++) {
+            sqlite3_bind_int64(st, 1, tbl[i]); sqlite3_bind_blob(st, 2, pk[i], (int)pklen[i], SQLITE_STATIC);
+            int cap = 0, cnt = 0; mw_mcell *c = NULL; int r;
+            while ((r = sqlite3_step(st)) == SQLITE_ROW) {
+                if (cnt == cap) { cap = cap ? cap * 2 : 4; mw_mcell *nc = realloc(c, (size_t)cap * sizeof *c); if (!nc) { rc = -1; break; } c = nc; }
+                c[cnt++] = (mw_mcell){ sqlite3_column_int64(st, 1), sqlite3_column_int64(st, 2), (uint32_t)sqlite3_column_int64(st, 0), (uint32_t)sqlite3_column_int64(st, 4), (uint32_t)sqlite3_column_int64(st, 3) };
+            }
+            if (r != SQLITE_DONE && rc == 0) rc = -1;
+            sqlite3_reset(st); sqlite3_clear_bindings(st);
+            if (rc == 0) { cells[i] = c; ncells[i] = cnt; } else free(c);
+        }
+        if (txn) sqlite3_exec(m->rd[slot], "COMMIT", NULL, NULL, NULL);
+    }
+    pthread_mutex_unlock(&m->rdmu[slot]);
+    if (rc == 0) {                                                          // cells older than a drop of the table that the flush has not deleted yet are dead
+        for (int i = 0; i < n; i++) {
+            if (m->shared) { mw_shm *sh = m->db->shm; uint32_t np = atomic_load_explicit(&sh->npurge, memory_order_acquire);
+                for (uint32_t q = 0; q < np; q++) if (atomic_load(&sh->purge[q].tbl) == tbl[i]) { uint64_t ep = atomic_load(&sh->purge[q].epoch); int k = 0; for (int x = 0; x < ncells[i]; x++) if (cells[i][x].dv >= (int64_t)ep) cells[i][k++] = cells[i][x]; ncells[i] = k; } }
+            else { pthread_mutex_lock(&m->purge_mu);
+                for (int q = 0; q < m->npurge; q++) if (m->purge[q].tbl == tbl[i]) { int k = 0; for (int x = 0; x < ncells[i]; x++) if (cells[i][x].dv >= (int64_t)m->purge[q].epoch) cells[i][k++] = cells[i][x]; ncells[i] = k; }
+                pthread_mutex_unlock(&m->purge_mu); }
+        }
+    } else for (int i = 0; i < n; i++) { free(cells[i]); cells[i] = NULL; ncells[i] = 0; }
+    return rc;
+}
+
+// the filter of deleted rows from the file (the partial index over the causal-length entries makes this a scan of the deleted rows only)
+int mw_metafile_load_tombstones (mw_meta *m) {
+    if (!m->attached) return 0;
+    sqlite3 *c = open_conn(m); if (!c) return -1;
+    sqlite3_stmt *st = NULL; int n = 0;
+    if (sqlite3_prepare_v2(c, "SELECT tbl, pk FROM mw_cells WHERE col = -1", -1, &st, NULL) == SQLITE_OK)
+        while (sqlite3_step(st) == SQLITE_ROW) { mw_meta_bloom_add(m, (uint32_t)sqlite3_column_int64(st, 0), sqlite3_column_blob(st, 1), (size_t)sqlite3_column_bytes(st, 1)); n++; }
+    sqlite3_finalize(st); sqlite3_close(c);
+    return 0;
+}
+
 // ---- recovery / first use ----
 // What the file tables say: the epoch they cover, the site ids they hold (installed through mw_meta_site_install: ord 0 is this database's own id)
 void mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]) {
@@ -144,6 +199,7 @@ int mw_meta_ready (mw_meta *m) {
     m->origin = (int64_t)hwm;                                   // this incarnation's epochs start again at 1: its db_versions go on from the largest the file has seen
     atomic_store(&m->hwm, hwm);
     atomic_store(&m->flushed, F);
+    mw_metafile_load_tombstones(m);
     struct mw_db *db = m->db;
     for (int i = 0; i < db->nrext; i++) mw_meta_replay(m, db->rext[i].epoch, db->rext[i].data, db->rext[i].len);      // (all of them: the epochs of the log are of this incarnation, the file's flushed point is of an older one)
     for (int i = 0; i < db->nrext; i++) free(db->rext[i].data);
@@ -181,7 +237,51 @@ fail:
     free(v); return -1;
 }
 
-static int write_batch (mw_meta *m, fitem *v, int n, uint64_t V, uint64_t hwm, uint32_t nsites, uint32_t sflushed, const struct mw_purge *purge, int npurge) {
+// the batch in the order of the table's key (table, then key bytes): inserts into the b-tree then walk it instead of jumping about. Sorting fitems directly chases a pointer per
+// comparison; the sort is on a small array of (table, first 8 key bytes, item) and only keys that agree on those look at the rest.
+typedef struct { uint32_t tbl; uint64_t pfx; fitem *it; } skey;
+static int fitem_full (const fitem *x, const fitem *y) {
+    uint32_t m = x->pklen < y->pklen ? x->pklen : y->pklen; int c = memcmp(x->pk, y->pk, m);
+    return c ? c : (x->pklen < y->pklen ? -1 : x->pklen > y->pklen);
+}
+static int skey_cmp (const void *a, const void *b) {
+    const skey *x = a, *y = b;
+    if (x->tbl != y->tbl) return x->tbl < y->tbl ? -1 : 1;
+    if (x->pfx != y->pfx) return x->pfx < y->pfx ? -1 : 1;
+    return fitem_full(x->it, y->it);
+}
+static void sort_items (fitem *v, int n) {
+    if (n < 2) return;
+    skey *a = malloc((size_t)n * sizeof *a), *b = malloc((size_t)n * sizeof *b); fitem *copy = malloc((size_t)n * sizeof *copy);
+    if (!a || !b || !copy) { free(a); free(b); free(copy); return; }
+    for (int i = 0; i < n; i++) {
+        uint64_t p = 0; for (int q = 0; q < 8; q++) p = (p << 8) | (q < (int)v[i].pklen ? v[i].pk[q] : 0);
+        a[i] = (skey){ v[i].tbl, p, &v[i] };
+    }
+    // least significant digit first, a byte at a time (stable): the key bytes, then the table
+    for (int pass = 0; pass < 12; pass++) {
+        size_t cnt[257] = {0};
+        for (int i = 0; i < n; i++) { unsigned d = pass < 8 ? (unsigned)((a[i].pfx >> (8 * pass)) & 0xff) : (unsigned)((a[i].tbl >> (8 * (pass - 8))) & 0xff); cnt[d + 1]++; }
+        bool skip = false; for (int d = 0; d < 256; d++) if (cnt[d + 1] == (size_t)n) skip = true;      // (every item has this digit: nothing to move)
+        if (skip) continue;
+        for (int d = 0; d < 256; d++) cnt[d + 1] += cnt[d];
+        for (int i = 0; i < n; i++) { unsigned d = pass < 8 ? (unsigned)((a[i].pfx >> (8 * pass)) & 0xff) : (unsigned)((a[i].tbl >> (8 * (pass - 8))) & 0xff); b[cnt[d]++] = a[i]; }
+        skey *t = a; a = b; b = t;
+    }
+    for (int i = 0; i < n; ) {                                                  // runs that agree on table and first 8 bytes: the rest of the key decides (they are short)
+        int j = i + 1; while (j < n && a[j].tbl == a[i].tbl && a[j].pfx == a[i].pfx) j++;
+        if (j - i > 1) qsort(&a[i], (size_t)(j - i), sizeof *a, skey_cmp);
+        i = j;
+    }
+    for (int i = 0; i < n; i++) copy[i] = *a[i].it;
+    memcpy(v, copy, (size_t)n * sizeof *v);
+    free(a); free(b); free(copy);
+}
+
+// One transaction of the flush: the items [i0, i1) and, in the last one, the sites, the flushed point and the high-water mark. A flush is several of them (a transaction of hundreds of
+// thousands of cells would hold its whole write set in memory and in the log): the points move only with the last, and what the others wrote is what a replay would write again.
+static int write_batch (mw_meta *m, fitem *v, int i0, int i1, bool last, uint64_t V, uint64_t hwm, uint32_t nsites, uint32_t sflushed, const struct mw_purge *purge, int npurge) {
+    int n = i1;
     sqlite3 *c = m->wr; int rc;
     rc = mw_meta_schema(c); if (rc != SQLITE_OK) return rc;
     m->tables_ok = true;
@@ -193,9 +293,9 @@ static int write_batch (mw_meta *m, fitem *v, int n, uint64_t V, uint64_t hwm, u
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_state(k, v) VALUES('meta_epoch', ?1)", -1, &state, NULL);
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_state(k, v) VALUES('dv_hwm', ?1)", -1, &hw, NULL);
     rc = (del && ins && site && state && hw) ? SQLITE_OK : SQLITE_ERROR;
-    for (int i = 0; i < npurge && rc == SQLITE_OK; i++) { char q[80]; snprintf(q, sizeof q, "DELETE FROM mw_cells WHERE tbl = %u AND dv < %llu", purge[i].tbl, (unsigned long long)purge[i].epoch); rc = sqlite3_exec(c, q, NULL, NULL, NULL); }
+    for (int i = 0; i0 == 0 && i < npurge && rc == SQLITE_OK; i++) { char q[80]; snprintf(q, sizeof q, "DELETE FROM mw_cells WHERE tbl = %u AND dv < %llu", purge[i].tbl, (unsigned long long)purge[i].epoch); rc = sqlite3_exec(c, q, NULL, NULL, NULL); }
     uint64_t cells = 0;
-    for (int i = 0; i < n && rc == SQLITE_OK; i++) {
+    for (int i = i0; i < n && rc == SQLITE_OK; i++) {
         if (v[i].drop) { sqlite3_bind_int64(del, 1, v[i].tbl); sqlite3_bind_blob(del, 2, v[i].pk, (int)v[i].pklen, SQLITE_STATIC); if (sqlite3_step(del) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(del); }
         for (int k = 0; k < v[i].n && rc == SQLITE_OK; k++) {
             const mw_mcell *x = &v[i].c[k];
@@ -205,16 +305,16 @@ static int write_batch (mw_meta *m, fitem *v, int n, uint64_t V, uint64_t hwm, u
             if (sqlite3_step(ins) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(ins); cells++;
         }
     }
-    for (uint32_t o = sflushed; o < nsites && rc == SQLITE_OK; o++) {
+    for (uint32_t o = sflushed; last && o < nsites && rc == SQLITE_OK; o++) {
         uint8_t id[16]; if (!mw_meta_site_id(m, o, id)) continue;
         sqlite3_bind_int64(site, 1, o); sqlite3_bind_blob(site, 2, id, 16, SQLITE_STATIC);
         if (sqlite3_step(site) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(site);
     }
     for (int i = 0; i < n; i++) for (int k = 0; k < v[i].n; k++) if ((uint64_t)v[i].c[k].dv > hwm) hwm = (uint64_t)v[i].c[k].dv;
     if (V > hwm) hwm = V;
-    if (rc == SQLITE_OK) { sqlite3_bind_int64(state, 1, (int64_t)V); if (sqlite3_step(state) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(state); }
-    if (rc == SQLITE_OK) { sqlite3_bind_int64(hw, 1, (int64_t)hwm); if (sqlite3_step(hw) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(hw); }
-    m->new_hwm = hwm;
+    if (last && rc == SQLITE_OK) { sqlite3_bind_int64(state, 1, (int64_t)V); if (sqlite3_step(state) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(state); }
+    if (last && rc == SQLITE_OK) { sqlite3_bind_int64(hw, 1, (int64_t)hwm); if (sqlite3_step(hw) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(hw); }
+    if (last) m->new_hwm = hwm;
     sqlite3_finalize(del); sqlite3_finalize(ins); sqlite3_finalize(site); sqlite3_finalize(state); sqlite3_finalize(hw);
     if (rc == SQLITE_OK) rc = sqlite3_exec(c, "COMMIT", NULL, NULL, NULL);
     if (rc != SQLITE_OK) sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL);
@@ -248,10 +348,19 @@ static int flush_impl (mw_meta *m, bool wait) {
     if (!m->wr) { rc = SQLITE_CANTOPEN; goto out; }
     fitem *v = NULL; int n = 0;
     if ((sh ? mm_collect(m, F, Fe, &v, &n) : collect(m, F, &v, &n)) != 0) { rc = SQLITE_NOMEM; goto out; }
-    rc = SQLITE_BUSY;
-    for (int attempt = 0; attempt < 200 && busyish(rc); attempt++) {
-        rc = write_batch(m, v, n, V, sh ? atomic_load(&sh->dv_hwm) : atomic_load(&m->hwm), nsites, sflushed, purge, npurge);
-        if (busyish(rc)) { atomic_fetch_add(&m->flush_retries, 1); usleep(500 * (unsigned)(attempt < 20 ? attempt + 1 : 20)); }
+    sort_items(v, n);
+    uint64_t hw0 = sh ? atomic_load(&sh->dv_hwm) : atomic_load(&m->hwm);
+    rc = SQLITE_OK;
+    for (int i0 = 0; i0 <= n && rc == SQLITE_OK; ) {
+        int i1 = i0, cells = 0; while (i1 < n && cells < 20000) cells += v[i1++].n ? v[i1 - 1].n : 1;
+        bool last = i1 >= n;
+        rc = SQLITE_BUSY;
+        for (int attempt = 0; attempt < 200 && busyish(rc); attempt++) {
+            rc = write_batch(m, v, i0, i1, last, V, hw0, nsites, sflushed, purge, npurge);
+            if (busyish(rc)) { atomic_fetch_add(&m->flush_retries, 1); usleep(500 * (unsigned)(attempt < 20 ? attempt + 1 : 20)); }
+        }
+        if (last) break;
+        i0 = i1;
     }
     for (int i = 0; i < n; i++) { free(v[i].pk); free(v[i].c); }
     free(v);

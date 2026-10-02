@@ -31,6 +31,7 @@ typedef struct { pthread_mutex_t mu; mentry **b; size_t nb, n; mentry *dirty; si
 
 struct mw_meta {
     struct mw_db *db;
+    uint64_t *bloom;                                             // (one process) the filter of the keys that were ever deleted; in shared mode it is in the shared header
     bool shared;                                                 // multi-process shared mode: the state lives in the shared index and the log, not in this table
     stripe st[STRIPES];
     size_t cap_bytes;                                           // the cache budget before clean entries are dropped (URI mw_meta_cache_mb, default 64)
@@ -54,6 +55,10 @@ struct mw_meta {
 
 
 uint64_t mw_meta_hash (uint32_t tbl, const void *pk, size_t pklen);
+bool     mw_meta_bloom_maybe (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen);
+void     mw_meta_bloom_add (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen);
+int      mw_metafile_load_many (mw_meta *m, int n, const uint32_t *tbl, const uint8_t *const *pk, const size_t *pklen, mw_mcell **cells, int *ncells);   // one read transaction for all
+int      mw_metafile_load_tombstones (mw_meta *m);                              // fills the filter from the file's causal-length entries
 int      mw_metafile_load (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n);       // the row's cells from the file tables (n = 0: none / no tables)
 void     mw_meta_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]);
 void     mw_metafile_free (mw_meta *m);

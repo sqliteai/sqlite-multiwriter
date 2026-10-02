@@ -164,6 +164,7 @@ int mw_sync_export (sqlite3 *db, int64_t since, uint8_t **payload, size_t *len, 
     int rc = mw_meta_flush(m); if (rc != SQLITE_OK) return rc;
     if (upto) *upto = (int64_t)V;
     if (since >= (int64_t)V) return SQLITE_OK;
+    { int xr = SQLITE_BUSY; for (int i = 0; i < 200 && busyish(xr); i++) { xr = mw_meta_export_index(db); if (busyish(xr)) usleep(1000u * (unsigned)(i + 1)); } if (xr != SQLITE_OK) return xr; }       // (the first export builds the index the later ones use)
     sysch sc; buf tuples = {0}; uint32_t nrows = 0;
     rc = sqlite3_exec(db, "BEGIN", NULL, NULL, NULL); if (rc != SQLITE_OK) return rc;
     rc = sch_load(db, &sc); sc.meta = m;
@@ -254,8 +255,13 @@ static int group_delete (sqlite3 *db, group *g) {
 
 static int apply_changes (sqlite3 *db, sysch *sc, mw_ovl *ov, const chg *ch, int n, mw_sync_stats *st) {
     const crdt_ops *ops = mw_ovl_ops(); group g = {0}; int rc = SQLITE_OK;
+    mw_want *wants = malloc(512 * sizeof *wants);
     for (int i = 0; i < n && rc == SQLITE_OK; i++) {
         const chg *c = &ch[i];
+        if (wants && i % 512 == 0) {                                                  // the rows of the next changes, loaded together
+            int nw = 0; for (int k = i; k < n && k < i + 512; k++) { syt *tk = by_name(sc, ch[k].tbl, ch[k].tbllen); if (tk) wants[nw++] = (mw_want){ tk->tid, ch[k].pk, ch[k].pklen, false }; }
+            mw_ovl_prefetch(ov, wants, nw);
+        }
         syt *t = by_name(sc, c->tbl, c->tbllen);
         bool sentinel = c->collen == strlen(CRDT_SENTINEL) && !memcmp(c->col, CRDT_SENTINEL, c->collen);
         int cell = sentinel ? -1 : t ? cell_by_name(t, c->col, c->collen) : -1;
@@ -277,7 +283,7 @@ static int apply_changes (sqlite3 *db, sysch *sc, mw_ovl *ov, const chg *ch, int
         }
     }
     if (rc == SQLITE_OK) rc = group_flush(db, &g);
-    free(g.p);
+    free(g.p); free(wants);
     return rc;
 }
 

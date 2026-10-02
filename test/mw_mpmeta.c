@@ -106,5 +106,42 @@ int main (void) {
         { sqlite3 *r2; CHECK_RC(open_mp(path, &r2), SQLITE_OK); bad = check_rows(r2, &sum, &rows); CHECK(bad == 0); sqlite3_close(r2); }
         mw_rmdb(path);
     }
+    // ---- 4. schema changes while the others write: tables are created, filled and dropped by one process, the counters of another table keep going in the rest
+    for (int round = 0; round < 3; round++) {
+        mw_tmpdb(path, sizeof path, "mpmeta"); make_db(path);
+        sqlite3 *p; CHECK_RC(open_mp(path, &p), SQLITE_OK);
+        CHECK_RC(mw_exec(p, "BEGIN"), SQLITE_OK); for (int i = 1; i <= 100; i++) { char q[100]; snprintf(q, sizeof q, "INSERT INTO t VALUES(%d, 0, NULL)", i); mw_exec(p, q); } CHECK_RC(mw_exec(p, "COMMIT"), SQLITE_OK);
+        enum { W = 3 }; pid_t pid[W + 1]; int pfd[W][2];
+        for (int i = 0; i < W; i++) { CHECK(pipe(pfd[i]) == 0); pid[i] = fork(); if (pid[i] == 0) { close(pfd[i][0]); worker(path, i + 40 * round, 100, 1500, pfd[i][1]); } close(pfd[i][1]); }
+        pid[W] = fork();
+        if (pid[W] == 0) {                                                       // the schema changer
+            sqlite3 *d; if (open_mp(path, &d) != SQLITE_OK) _exit(1);
+            for (int k = 0; k < 12; k++) {
+                char q[300]; snprintf(q, sizeof q, "BEGIN; CREATE TABLE x%d(id INTEGER PRIMARY KEY, a TEXT, b INTEGER); INSERT INTO x%d VALUES(1,'a',1),(2,'b',2),(3,'c',3); COMMIT", k, k);
+                exec_retry(d, q);
+                snprintf(q, sizeof q, "UPDATE x%d SET b = b + 1 WHERE id = 2", k); exec_retry(d, q);
+                if (k % 3 == 2) { snprintf(q, sizeof q, "DROP TABLE x%d", k - 1); exec_retry(d, q); }
+                struct timespec t = { 0, 60 * 1000000L }; nanosleep(&t, NULL);
+            }
+            sqlite3_close(d); _exit(0);
+        }
+        long total = 0;
+        for (int i = 0; i < W; i++) { int stt; waitpid(pid[i], &stt, 0); long last = 0, v; while (read(pfd[i][0], &v, sizeof v) == sizeof v) last = v; close(pfd[i][0]); total += last; }
+        { int stt; waitpid(pid[W], &stt, 0); }
+        int64_t sum; int rows; int bad = check_rows(p, &sum, &rows);
+        // the surviving x tables: row 2 was updated once: its b has cv 3 and the other rows cv 1
+        int xbad = 0, xtables = 0; mw_meta *m = NULL; sqlite3_file_control(p, "main", MW_FCNTL_META, &m);
+        for (int k = 0; k < 12; k++) {
+            char q[100]; snprintf(q, sizeof q, "x%d", k); sqlite3_stmt *st; char sq[200]; snprintf(sq, sizeof sq, "SELECT count(*) FROM sqlite_schema WHERE name='%s'", q); sqlite3_prepare_v2(p, sq, -1, &st, NULL); sqlite3_step(st); int ex = sqlite3_column_int(st, 0); sqlite3_finalize(st);
+            for (int id = 1; id <= 3; id++) { uint8_t pk[32]; size_t pl; pk_int(id, pk, &pl); mw_mcell *c; int nc; mw_meta_row(m, mw_name_id(q), pk, pl, &c, &nc);
+                int64_t cvb = -1; for (int i = 0; i < nc; i++) if (c[i].col == mw_name_id("b")) cvb = c[i].cv;
+                if (ex) { if (cvb != (id == 2 ? 3 : 1)) xbad++; } else if (nc != 0) xbad++;                          // (a dropped table has no cells left)
+                free(c); }
+            xtables += ex;
+        }
+        printf("schema changes (round %d): %ld counter commits, counters disagreeing: %d, tables alive %d, their cells disagreeing: %d\n", round, total, bad, xtables, xbad);
+        CHECK(bad == 0); CHECK(sum == 2 * total); CHECK(xbad == 0); CHECK(integrity_ok(p));
+        sqlite3_close(p); mw_rmdb(path);
+    }
     MW_DONE();
 }

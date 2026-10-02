@@ -110,6 +110,7 @@ typedef struct mw_shm {
     _Atomic uint32_t  nsites;             // site ids known (ord -> id); ord 0 is this database
     _Atomic uint32_t  npurge;
     struct { _Atomic uint32_t tbl; _Atomic uint64_t epoch; } purge[MW_MAX_PURGE];     // dropped tables whose old cells in the file are dead and not yet deleted
+    uint64_t          sen_bloom[(1u << 23) / 64];     // a filter over the keys that have, or had, a causal-length entry (the rows that were deleted): a key that is not in it has no earlier life
     uint8_t           sites[MW_MAX_SITES][16];
     mw_mp_proc        procs[MW_MP_PROCS];
     mw_mp_slot        slots[MW_MP_SLOTS];
@@ -230,6 +231,7 @@ struct mw_lane {
     sqlite3    *rb_c, *rb_v;    // cached rebase helper connections (writer at the latest snapshot / overlay reader)
     // change capture (mw_cdc=1): the row changes of the transaction being committed, and the catalog they were decoded with
     mw_rd_result cdc_res; mw_cat *cdc_cat; int cdc_nfreed;
+    uint32_t    bp_wait_us;                      // back-pressure: sleep this long after the publication lock is released
     bool        cdc_vacuum;                      // a VACUUM statement is running on this connection (its commit rebuilds every table)
     const uint8_t *const *cdc_over;              // while the catalog of a schema-changing commit is read: the pages the commit wrote (they win over the snapshot's)
     const char *const *cdc_skip; int cdc_nskip;  // tables whose rows are not diffed in this commit (reshaped by DDL)

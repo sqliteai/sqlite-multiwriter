@@ -32,6 +32,10 @@ const crdt_ops *mw_ovl_ops (void);                                          // t
 typedef bool (*mw_value_fn) (void *arg, uint32_t tbl, const void *pk, size_t pklen, uint32_t col, crdt_value *out);
 void    mw_ovl_set_value_fn (mw_ovl *o, mw_value_fn fn, void *arg);         // the base-table value of a cell (the merge needs it when the versions tie)
 bool    mw_ovl_empty (const mw_ovl *o);
+typedef struct { uint32_t tbl; const void *pk; size_t pklen; bool is_new; } mw_want;      // a row the transaction is going to need: is_new: it did not exist before (an insert)
+void    mw_ovl_prefetch (mw_ovl *o, const mw_want *w, int n);
+void    mw_ovl_hint_new (mw_ovl *o, bool on);
+void    mw_ovl_bloom_update (mw_ovl *o);                                         // after a commit: its rows with a causal-length entry go into the filter of deleted rows                                  // the rows the CRDT asks for next are inserts (a key that was never deleted needs no look in the file)                  // loads them together (one read of the file for all the rows that are not in memory)
 void    mw_ovl_purge (mw_ovl *o, uint32_t tbl);                              // the table is gone: all its cells go (DROP TABLE)
 int     mw_ovl_encode (mw_ovl *o, uint8_t **ext, uint32_t *len);            // the delta as a record extension (malloc'd; len 0 and *ext NULL if there is nothing)
 
@@ -54,6 +58,7 @@ int mw_meta_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcel
 uint32_t mw_meta_site_ord (mw_meta *m, const uint8_t id[16]);
 bool     mw_meta_site_id (mw_meta *m, uint32_t ord, uint8_t out[16]);
 void     mw_meta_stats (mw_meta *m, uint64_t *rows, uint64_t *bytes, uint64_t *hits, uint64_t *misses);
+void     mw_meta_flush_stats (mw_meta *m, uint64_t *flushes, uint64_t *cells, uint64_t *ns, uint64_t *retries);
 
 // ---- the file tables and the flusher (multiwriter_metafile.c) ----
 int      mw_meta_attach (mw_meta *m, const char *path, int mode, int mpmode);      // where the database is (so the store can open its own connections to it)
@@ -62,7 +67,8 @@ int      mw_meta_flush (mw_meta *m);                                            
 void     mw_meta_kick (mw_meta *m);                                               // ask the flusher thread to flush soon
 uint64_t mw_meta_safe_epoch (mw_meta *m);                                         // the log may be compacted up to here without losing metadata (UINT64_MAX: no limit)
 void     mw_meta_quiesce (mw_meta *m);                                            // stop the flusher, flush, close the store's connections
-int      mw_meta_schema (sqlite3 *conn);                                          // create the file tables if they are missing
+int      mw_meta_schema (sqlite3 *conn);
+int      mw_meta_export_index (sqlite3 *conn);                                     // the index on db_version, for the export (created by the first one)                                          // create the file tables if they are missing
 uint64_t mw_meta_flushed (mw_meta *m);
 uint64_t mw_meta_dirty (mw_meta *m);
 uint64_t mw_meta_epoch (mw_meta *m);

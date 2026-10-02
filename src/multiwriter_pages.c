@@ -551,6 +551,7 @@ int mw_db_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uint32_
 }
 
 int mw_db_publish_finish (mw_db *db, mw_lane *lane, int rc, uint64_t my_epoch, int sync) {
+    if (lane && lane->bp_wait_us) { struct timespec bp = { 0, (long)lane->bp_wait_us * 1000L }; lane->bp_wait_us = 0; nanosleep(&bp, NULL); }      // back-pressure: the log is far ahead of its compaction; wait here, not under the publication lock
     if (rc == SQLITE_OK) {
         // Cross-process group commit: the record is already visible to the other processes; this commit is acknowledged
         // only after an fsync that started after it was written, which also covers every earlier record of the file.

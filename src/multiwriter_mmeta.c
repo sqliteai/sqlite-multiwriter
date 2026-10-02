@@ -146,6 +146,7 @@ int mm_install (mw_db *db, mw_lane *lane, uint64_t epoch, uint64_t ext_loc) {
         if (rc != 0) return SQLITE_FULL;
         if (atomic_fetch_add(&sh->meta_dirty, (uint64_t)ng) + (uint64_t)ng >= 2048) mw_cdc_kick_flush(db);
     }
+    mw_ovl_bloom_update(lane->cdc_decl ? lane->cdc_decl : lane->cdc_ovl);
     mw_ext_purges(lane->cdc_ext, lane->cdc_ext_len, purge_cb, epoch + atomic_load(&sh->dv_origin), sh);
     return SQLITE_OK;
 }
@@ -159,8 +160,13 @@ static int rep_group (void *arg, uint32_t bucket, uint32_t off) {
     return 0;
 }
 static void rep_site (void *arg, uint32_t ord, const uint8_t id[16]) { mm_site_install_db(arg, ord, id); }
+static int rep_row (void *arg, uint32_t bucket, uint32_t tbl, const uint8_t *pk, size_t pklen, const mw_mcell *c, int n) {
+    (void)bucket; mw_db *db = arg; extern mw_meta *mw_cdc_meta (mw_db *);
+    for (int k = 0; k < n; k++) if (c[k].col == CRDT_COL_SENTINEL) { mw_meta *m = mw_cdc_meta(db); if (m) mw_meta_bloom_add(m, tbl, pk, pklen); break; }
+    return 0;
+}
 int mm_replay (mw_db *db, uint64_t epoch, const uint8_t *ext, uint32_t len, uint64_t ext_loc) {
-    mw_ext_walk(ext, len, epoch, NULL, NULL, rep_site, db);
+    mw_ext_walk(ext, len, epoch, rep_row, NULL, rep_site, db);
     rep_ctx r = { db, epoch, ext_loc, NULL, NULL, 0, 0 };
     int rc = SQLITE_OK;
     if (mw_ext_groups(ext, len, rep_group, &r) != 0) rc = SQLITE_CORRUPT;
@@ -190,6 +196,7 @@ int mm_ready (mw_meta *m) {
         if (!have_own) { /* a fresh id: it is written with the first flush */ }
         atomic_store(&sh->sites_flushed, flushed_sites);
         atomic_store(&sh->meta_flushed, F);
+        mw_metafile_load_tombstones(m);
         atomic_store_explicit(&sh->meta_state, 2, memory_order_release);
     }
     mw_mp_meta_unlock(m->db, 1);

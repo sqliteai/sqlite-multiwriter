@@ -20,7 +20,7 @@ typedef struct {
 typedef struct { uint32_t id; uint64_t seen; mm_group g; } obk;      // a bucket as the transaction read it: its head epoch and the rows it held
 struct mw_ovl {
     mw_meta *m; orow *rows; int n, cap; int *hash; int hcap;
-    mw_value_fn vfn; void *varg;
+    mw_value_fn vfn; void *varg; bool hint_new;                  // hint_new: the rows the CRDT asks for next are inserts
     uint32_t *purge; int npurge, cappurge;
     obk *bk; int nbk, capbk; int *bkh; int bkhcap;               // the buckets the transaction read (hash: bucket id -> index)
     int ng; uint32_t *gbucket, *goff; uint64_t *gseen;           // after an encode: the groups of the extension (bucket, offset of the group in the extension, head epoch the state was read at)
@@ -52,7 +52,7 @@ mw_meta *mw_meta_new (struct mw_db *db) {
     for (int i = 0; i < MW_RDN; i++) pthread_mutex_init(&m->rdmu[i], NULL);
     m->capsites = 16; m->sites = calloc(m->capsites, 16); m->nsites = 1;
     if (!m->sites) { mw_meta_free(m); return NULL; }
-    if (!m->shared) arc4random_buf(m->sites[0], 16);             // this database's own id: replaced by the one in the file when it has one (shared mode: it is in the shared header)
+    if (!m->shared) { arc4random_buf(m->sites[0], 16); m->bloom = calloc((1u << 23) / 64, sizeof(uint64_t)); }             // this database's own id: replaced by the one in the file when it has one (shared mode: it is in the shared header)
     return m;
 }
 
@@ -62,7 +62,7 @@ void mw_meta_free (mw_meta *m) {
         for (size_t k = 0; m->st[i].b && k < m->st[i].nb; k++) for (mentry *e = m->st[i].b[k], *nx; e; e = nx) { nx = e->next; free(e->cells); free(e); }
         free(m->st[i].b); pthread_mutex_destroy(&m->st[i].mu);
     }
-    mw_metafile_free(m); free(m->purge);
+    mw_metafile_free(m); free(m->purge); free(m->bloom);
     pthread_mutex_destroy(&m->site_mu); free(m->sites); free(m);
 }
 
@@ -110,28 +110,49 @@ static void insert_entry (mw_meta *m, stripe *s, mentry *e) {
     atomic_fetch_add(&m->bytes, entry_bytes(e)); atomic_fetch_add(&m->rows, 1);
 }
 
-// a copy of the cells of a row: the table first, the file on a miss (and the row is cached)
-static int load_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **out, int *n) {
+// the filter of the keys that have, or had, a causal-length entry (a row that was deleted leaves one): a key that is not in it never had an earlier life, so an insert needs no
+// look in the file (false positives only cost that look)
+static uint64_t *bloom_of (mw_meta *m) { return m->shared ? m->db->shm->sen_bloom : m->bloom; }
+#define BLOOM_BITS (1u << 23)
+bool mw_meta_bloom_maybe (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen) {
+    uint64_t *b = bloom_of(m); if (!b) return true;
+    uint64_t h = mw_meta_hash(tbl, pk, pklen), h2 = (h >> 31) | (h << 33) | 1;
+    for (int k = 0; k < 3; k++) { uint64_t bit = (h + (uint64_t)k * h2) & (BLOOM_BITS - 1); if (!(__atomic_load_n(&b[bit >> 6], __ATOMIC_RELAXED) & (1ull << (bit & 63)))) return false; }
+    return true;
+}
+void mw_meta_bloom_add (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen) {
+    uint64_t *b = bloom_of(m); if (!b) return;
+    uint64_t h = mw_meta_hash(tbl, pk, pklen), h2 = (h >> 31) | (h << 33) | 1;
+    for (int k = 0; k < 3; k++) { uint64_t bit = (h + (uint64_t)k * h2) & (BLOOM_BITS - 1); __atomic_fetch_or(&b[bit >> 6], 1ull << (bit & 63), __ATOMIC_RELAXED); }
+}
+
+// the table's copy of a row (a hit), without looking at the file
+static int mem_peek (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **out, int *n) {
     uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
     pthread_mutex_lock(&s->mu);
     mentry *e = find(s, h, tbl, pk, pklen);
-    if (e) {
-        atomic_fetch_add(&m->hits, 1);
-        *n = e->n; *out = NULL;
-        if (e->n) { *out = malloc((size_t)e->n * sizeof **out); if (!*out) { pthread_mutex_unlock(&s->mu); return -1; } memcpy(*out, e->cells, (size_t)e->n * sizeof **out); }
-        pthread_mutex_unlock(&s->mu); return 0;
-    }
-    uint64_t gen = s->gen;
+    if (!e) { pthread_mutex_unlock(&s->mu); return 0; }
+    atomic_fetch_add(&m->hits, 1);
+    *n = e->n; *out = NULL;
+    if (e->n) { *out = malloc((size_t)e->n * sizeof **out); if (!*out) { pthread_mutex_unlock(&s->mu); return -1; } memcpy(*out, e->cells, (size_t)e->n * sizeof **out); }
+    pthread_mutex_unlock(&s->mu); return 1;
+}
+// what the file said about a row goes into the table as a clean entry (if nobody put one there meanwhile)
+static void mem_cache (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, const mw_mcell *c, int n) {
+    uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
+    pthread_mutex_lock(&s->mu);
+    if (!find(s, h, tbl, pk, pklen)) { mentry *ne = entry_new(h, tbl, pk, pklen, c, n); if (ne) { insert_entry(m, s, ne); evict(m, s); } }
     pthread_mutex_unlock(&s->mu);
+}
+
+// a copy of the cells of a row: the table first, the file on a miss (and the row is cached)
+static int load_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **out, int *n) {
+    int r = mem_peek(m, tbl, pk, pklen, out, n);
+    if (r != 0) return r < 0 ? -1 : 0;
     atomic_fetch_add(&m->misses, 1);
     mw_mcell *fc = NULL; int fn = 0;
     if (file_load(m, tbl, pk, pklen, &fc, &fn) != 0) return -1;
-    pthread_mutex_lock(&s->mu);
-    if (s->gen == gen && !find(s, h, tbl, pk, pklen)) {                  // nobody changed this stripe meanwhile: cache what the file said (a row without cells is cached too: "known empty")
-        mentry *ne = entry_new(h, tbl, pk, pklen, fc, fn);
-        if (ne) { insert_entry(m, s, ne); evict(m, s); }
-    }
-    pthread_mutex_unlock(&s->mu);
+    mem_cache(m, tbl, pk, pklen, fc, fn);
     *out = fc; *n = fn;
     return 0;
 }
@@ -190,6 +211,7 @@ void mw_ovl_clear (mw_ovl *o) {
 }
 void mw_ovl_free (mw_ovl *o) { if (!o) return; mw_ovl_clear(o); free(o->purge); free(o->bk); free(o->bkh); free(o->gbucket); free(o->goff); free(o->gseen); free(o->rows); free(o->hash); free(o); }
 void mw_ovl_set_value_fn (mw_ovl *o, mw_value_fn fn, void *arg) { o->vfn = fn; o->varg = arg; }
+void mw_ovl_hint_new (mw_ovl *o, bool on) { o->hint_new = on; }
 bool mw_ovl_empty (const mw_ovl *o) { return o->n == 0 && o->npurge == 0; }
 void mw_ovl_purge (mw_ovl *o, uint32_t tbl) {
     for (int i = 0; i < o->npurge; i++) if (o->purge[i] == tbl) return;
@@ -205,23 +227,25 @@ static void ovl_rehash (mw_ovl *o, int ncap) {
     free(o->hash); o->hash = nh; o->hcap = ncap;
 }
 
-// the overlay row of (tbl, pk): loaded from the store on first touch
-static orow *ovl_row (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen, bool create) {
+// The overlay row of (tbl, pk), created and filled from what is in memory (the table, or the bucket of the shared index). *need_file: the row is in neither and the file has to say.
+// is_new: the row did not exist (an insert): a key that is not in the filter of deleted rows has no earlier life, nothing to ask the file.
+static orow *ovl_row_make (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen, bool is_new, bool *need_file) {
+    *need_file = false;
     if (o->hcap == 0 || (o->n + 1) * 2 > o->hcap) ovl_rehash(o, o->hcap ? o->hcap * 2 : 64);
     if (!o->hash) return NULL;
     uint64_t h = mw_meta_hash(tbl, pk, pklen); size_t j = h & (size_t)(o->hcap - 1);
     while (o->hash[j] >= 0) { orow *r = &o->rows[o->hash[j]]; if (r->tbl == tbl && r->pklen == pklen && !memcmp(r->pk, pk, pklen)) return r; j = (j + 1) & (size_t)(o->hcap - 1); }
-    (void)create;
     if (o->n == o->cap) { int nc = o->cap ? o->cap * 2 : 64; orow *nr = realloc(o->rows, (size_t)nc * sizeof *nr); if (!nr) return NULL; o->rows = nr; o->cap = nc; }
     orow *r = &o->rows[o->n]; memset(r, 0, sizeof *r);
     r->tbl = tbl; r->pklen = (uint32_t)pklen; r->pk = malloc(pklen ? pklen : 1); if (!r->pk) return NULL; memcpy(r->pk, pk, pklen);
     r->bk = -1;
+    bool found = false;
     if (o->m->shared) {                                                    // shared mode: the row is in its bucket's newest state, or in the file
         uint32_t b = mw_bucket_of(tbl, pk, pklen); int bi = -1;
         if (o->bkhcap == 0 || (o->nbk + 1) * 2 > o->bkhcap) {                // (bucket id -> index in o->bk, open addressing)
             int nc = o->bkhcap ? o->bkhcap * 2 : 64; int *nh = malloc((size_t)nc * sizeof(int)); if (!nh) { free(r->pk); return NULL; }
             memset(nh, 0xff, (size_t)nc * sizeof(int));
-            for (int q = 0; q < o->nbk; q++) { size_t h = (size_t)(o->bk[q].id * 2654435761u) & (size_t)(nc - 1); while (nh[h] >= 0) h = (h + 1) & (size_t)(nc - 1); nh[h] = q; }
+            for (int q = 0; q < o->nbk; q++) { size_t hh = (size_t)(o->bk[q].id * 2654435761u) & (size_t)(nc - 1); while (nh[hh] >= 0) hh = (hh + 1) & (size_t)(nc - 1); nh[hh] = q; }
             free(o->bkh); o->bkh = nh; o->bkhcap = nc;
         }
         size_t hb = (size_t)(b * 2654435761u) & (size_t)(o->bkhcap - 1);
@@ -233,16 +257,59 @@ static orow *ovl_row (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen, boo
             x->seen = x->g.epoch; bi = o->nbk++; o->bkh[hb] = bi;
         }
         r->bk = bi;
-        const mm_group *g = &o->bk[bi].g; bool found = false;
+        const mm_group *g = &o->bk[bi].g;
         for (int q = 0; q < g->n && !found; q++) if (g->rows[q].tbl == tbl && g->rows[q].pklen == pklen && !memcmp(g->rows[q].pk, pk, pklen)) {
             r->n = g->rows[q].n; r->c = malloc((size_t)(r->n ? r->n : 1) * sizeof(mw_mcell)); if (!r->c) { free(r->pk); return NULL; }
             memcpy(r->c, g->rows[q].c, (size_t)r->n * sizeof(mw_mcell)); found = true;
         }
-        if (!found && file_load(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) { free(r->pk); return NULL; }
-    } else if (load_row(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) { free(r->pk); return NULL; }
+    } else {
+        int pr = mem_peek(o->m, tbl, pk, pklen, &r->c, &r->n);
+        if (pr < 0) { free(r->pk); return NULL; }
+        found = pr == 1;
+    }
+    if (!found) {
+        if (is_new && !mw_meta_bloom_maybe(o->m, tbl, pk, pklen)) { r->c = NULL; r->n = 0; }              // (no earlier life: nothing to load)
+        else *need_file = true;
+    }
     r->cap = r->n;
     o->hash[j] = o->n++;
     return r;
+}
+
+static orow *ovl_row (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen, bool create) {
+    (void)create;
+    bool need; orow *r = ovl_row_make(o, tbl, pk, pklen, o->hint_new, &need);
+    if (r && need) {
+        if (file_load(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) return NULL;
+        if (!o->m->shared) mem_cache(o->m, tbl, pk, pklen, r->c, r->n);
+        r->cap = r->n;
+    }
+    return r;
+}
+
+// the rows a transaction will need, loaded together: those in memory at once, the others by one read of the file
+void mw_ovl_prefetch (mw_ovl *o, const mw_want *w, int n) {
+    int *pend = NULL, np = 0; int cap = 0;
+    for (int i = 0; i < n; i++) {
+        bool need; int before = o->n; orow *r = ovl_row_make(o, w[i].tbl, w[i].pk, w[i].pklen, w[i].is_new, &need);
+        if (!r || !need || o->n == before) continue;                              // (a row that was there already is loaded already)
+        if (np == cap) { cap = cap ? cap * 2 : 128; int *np2 = realloc(pend, (size_t)cap * sizeof *pend); if (!np2) { free(pend); return; } pend = np2; }
+        pend[np++] = o->n - 1;
+    }
+    if (np) {
+        uint32_t *tb = malloc((size_t)np * sizeof *tb); const uint8_t **pk = malloc((size_t)np * sizeof *pk); size_t *pl = malloc((size_t)np * sizeof *pl);
+        mw_mcell **cells = calloc((size_t)np, sizeof *cells); int *nc = calloc((size_t)np, sizeof *nc);
+        if (tb && pk && pl && cells && nc) {
+            for (int i = 0; i < np; i++) { const orow *r = &o->rows[pend[i]]; tb[i] = r->tbl; pk[i] = r->pk; pl[i] = r->pklen; }
+            if (mw_metafile_load_many(o->m, np, tb, pk, pl, cells, nc) == 0) {
+                for (int i = 0; i < np; i++) { orow *r = &o->rows[pend[i]]; r->c = cells[i]; r->n = nc[i]; r->cap = nc[i]; if (!o->m->shared) mem_cache(o->m, r->tbl, r->pk, r->pklen, r->c, r->n); }
+                np = 0;                                                         // (all taken)
+            }
+        }
+        for (int i = 0; i < np; i++) free(cells ? cells[i] : NULL);
+        free(tb); free(pk); free(pl); free(cells); free(nc);
+    }
+    free(pend);
 }
 
 static mw_mcell *cell_find (orow *r, uint32_t col) { for (int i = 0; i < r->n; i++) if (r->c[i].col == col) return &r->c[i]; return NULL; }
@@ -382,8 +449,10 @@ static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pkle
     bool removed = false;                                              // a cell of the old state is not in the new one: the file has to forget it
     for (int i = 0; i < e->n && !removed; i++) { bool f = false; for (int k = 0; k < n; k++) if (c[k].col == e->cells[i].col) { f = true; break; } if (!f) removed = true; }
     if (n > e->cap) { mw_mcell *nm = realloc(e->cells, (size_t)n * sizeof *nm); if (!nm) { pthread_mutex_unlock(&s->mu); return -1; } e->cells = nm; e->cap = n; }
-    for (int k = 0; k < n; k++) { e->cells[k] = c[k]; if (c[k].dv == OV_CHG) e->cells[k].dv = (int64_t)epoch; }
+    bool sen = false;
+    for (int k = 0; k < n; k++) { e->cells[k] = c[k]; if (c[k].dv == OV_CHG) e->cells[k].dv = (int64_t)epoch; if (c[k].col == SEN) sen = true; }
     e->n = n;
+    if (sen) mw_meta_bloom_add(m, tbl, pk, pklen);
     if (removed) e->drop_ver = epoch;
     e->ver = epoch;
     if (!e->in_dirty) { e->in_dirty = true; e->dnext = s->dirty; s->dirty = e; atomic_fetch_add(&m->ndirty, 1); }
@@ -491,3 +560,10 @@ void mw_meta_stats (mw_meta *m, uint64_t *rows, uint64_t *bytes, uint64_t *hits,
 }
 
 void mw_meta_set_cache_mb (mw_meta *m, int mb) { m->cap_bytes = (size_t)mb << 20; }
+
+// the rows this commit touched that have a causal-length entry now: they join the filter of deleted rows
+void mw_ovl_bloom_update (mw_ovl *o) {
+    if (!o) return;
+    for (int i = 0; i < o->n; i++) { orow *r = &o->rows[i]; if (!touched(r)) continue; for (int k = 0; k < r->n; k++) if (r->c[k].col == SEN) { mw_meta_bloom_add(o->m, r->tbl, r->pk, r->pklen); break; } }
+}
+void mw_meta_flush_stats (mw_meta *m, uint64_t *flushes, uint64_t *cells, uint64_t *ns, uint64_t *retries) { *flushes = atomic_load(&m->n_flushes); *cells = atomic_load(&m->flushed_cells); *ns = atomic_load(&m->flush_ns); *retries = atomic_load(&m->flush_retries); }

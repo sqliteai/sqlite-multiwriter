@@ -59,6 +59,7 @@ void mw_cdc_close (mw_db *db) {
     if (!c) return;
     if (getenv("MW_CDC_STATS")) fprintf(stderr, "cdc: %llu commits, %llu row changes (%llu in pages of unknown owner), catalog/owner map built %llu times (%.1f ms), overflow map scanned %llu times, %llu overflow writes unattributed; prepare %.2f us per commit\n",
         (unsigned long long)c->commits, (unsigned long long)c->changes, (unsigned long long)c->unowned, (unsigned long long)c->builds, (double)c->ns_build / 1e6, (unsigned long long)c->ovfl_scans, (unsigned long long)c->ovfl_unattributed, c->commits ? (double)c->ns_prepare / 1000.0 / (double)c->commits : 0.0);
+    if (getenv("MW_CDC_STATS")) { uint64_t f, cl, ns, rt; mw_meta_flush_stats(c->meta, &f, &cl, &ns, &rt); fprintf(stderr, "meta flusher: %llu flushes, %llu cells written, %.1f ms (%.2f us per cell), %llu retries\n", (unsigned long long)f, (unsigned long long)cl, (double)ns / 1e6, cl ? (double)ns / 1000.0 / (double)cl : 0.0, (unsigned long long)rt); }
     mw_cat_free(c->cat); mw_meta_free(c->meta);
     if (db->shared) { if (c->owner) munmap((void *)c->owner, 2 * (size_t)OWNER_PAGES * sizeof(uint32_t)); }
     else { munmap((void *)c->owner, (size_t)OWNER_PAGES * sizeof(uint32_t)); munmap((void *)c->ovo, (size_t)OWNER_PAGES * sizeof(uint32_t)); }
@@ -324,6 +325,17 @@ static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int np
     const crdt_ops *ops = mw_ovl_ops();
     int64_t seq = 0; uint32_t *cols = NULL; int ccap = 0;
     for (int i = 0; i < npurge; i++) mw_ovl_purge(o, purge[i]);
+    {                                                                            // the rows the commit changed, loaded together (those in memory at once, the others by one read of the file)
+        mw_want *w = malloc(((size_t)lane->cdc_res.n * 2 + 1) * sizeof *w); int nw = 0;
+        for (int i = 0; w && i < lane->cdc_res.n; i++) {
+            const mw_chg *x = &lane->cdc_res.chg[i]; const mw_tab *t = x->tab;
+            if (!t || !t->synced || !x->pk) continue;
+            w[nw++] = (mw_want){ t->tid, x->pk, x->pklen, x->kind == 1 };
+            if (x->kind == 2 && x->oldpk) w[nw++] = (mw_want){ t->tid, x->oldpk, x->oldpklen, false };
+        }
+        if (w && nw) mw_ovl_prefetch(o, w, nw);
+        free(w);
+    }
     // order: deletes (a key that is deleted and written again in one commit is a new life of the row), key changes, inserts, updates
     for (int pass = 0; pass < 4; pass++) for (int i = 0; i < lane->cdc_res.n; i++) {
         const mw_chg *x = &lane->cdc_res.chg[i]; const mw_tab *t = x->tab;
@@ -337,7 +349,7 @@ static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int np
             if (!x->wide && t->ncells > 63 && (x->changed >> 63)) { nc = 0; for (int k = 0; k < t->ncells; k++) cols[nc++] = t->cell_id[k]; }     // (not decidable per cell)
         }
         if (x->kind == 3) crdt_local_delete(ops, o, t->tid, x->pk, x->pklen, 0, &seq, NULL, 0);
-        else if (x->kind == 1) crdt_local_insert(ops, o, t->tid, x->pk, x->pklen, t->cell_id, t->ncells, 0, &seq, NULL, 0);
+        else if (x->kind == 1) { mw_ovl_hint_new(o, true); crdt_local_insert(ops, o, t->tid, x->pk, x->pklen, t->cell_id, t->ncells, 0, &seq, NULL, 0); mw_ovl_hint_new(o, false); }
         else if (x->oldpk) crdt_local_rekey(ops, o, t->tid, x->oldpk, x->oldpklen, x->pk, x->pklen, t->cell_id, t->ncells, 0, &seq, NULL, 0);
         else if (nc) crdt_local_update(ops, o, t->tid, x->pk, x->pklen, cols, nc, 0, &seq, NULL, 0);
     }

@@ -159,8 +159,12 @@ static void shared_gc (mw_db *db) {
     shidx_gc_floor(db->ix, floor, atomic_load(&sh->base_epoch));
     if (db->rx) {
         uint64_t org = atomic_load(&sh->dv_origin), fl = atomic_load(&sh->meta_flushed), fle = fl > org ? fl - org : 0;      // (the flushed point as an epoch of this incarnation)
-        shidx_gc_floor(db->rx, floor, fle);                                          // (the buckets older than the last flush are in the file)
-        atomic_store(&sh->rx_gc_base, fl);
+        // the index of the metadata is collected when a flush moved the point it can forget to (a few times a second), or when it is filling up: the chains of the buckets are many and
+        // this runs under the publication lock
+        if (fl != atomic_load(&sh->rx_gc_base) || shidx_room(db->rx) < (1u << 20)) {
+            shidx_gc_floor(db->rx, floor, fle);                                      // (the buckets older than the last flush are in the file)
+            atomic_store(&sh->rx_gc_base, fl);
+        } else goto rx_done;
         uint32_t np = atomic_load(&sh->npurge), k = 0;                               // a dropped table is forgotten once the file and the index both are clean of it
         for (uint32_t q = 0; q < np; q++) {
             uint64_t e = atomic_load(&sh->purge[q].epoch);
@@ -169,6 +173,7 @@ static void shared_gc (mw_db *db) {
             k++;
         }
         if (k != np) atomic_store_explicit(&sh->npurge, k, memory_order_release);
+    rx_done:;
     }
 }
 
@@ -272,7 +277,11 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     if (db->gc_interval > 0 && (atomic_fetch_add(&db->publishes_since_gc, 1) + 1) >= (uint64_t)db->gc_interval) { atomic_store(&db->publishes_since_gc, 0); shared_gc(db); }
     if (db->log_max_bytes && mw_seglog_bytes(db) > mw_log_limit(db)) {
         mw_db_compactor_kick(db);
-        if (mw_seglog_bytes(db) > db->log_max_bytes * 16) { atomic_fetch_add(&db->n_backpressure, 1); struct timespec ts = { 0, 500000 }; nanosleep(&ts, NULL); }
+        if (mw_seglog_bytes(db) > db->log_max_bytes * 8) {                                         // the log is far ahead of its compaction: commits slow down in proportion to the overshoot (after the lock is released: mw_db_publish_finish)
+            atomic_fetch_add(&db->n_backpressure, 1);
+            uint64_t over = mw_seglog_bytes(db) / (db->log_max_bytes * 8);
+            if (lane) lane->bp_wait_us = (uint32_t)(over > 20 ? 20000 : over * 1000); else { struct timespec ts = { 0, 500000 }; nanosleep(&ts, NULL); }
+        }
     }
     atomic_fetch_add(&db->n_commits, 1);
     atomic_fetch_add(&db->n_fast_commits, 1);

@@ -88,3 +88,8 @@ $(DIST)/oracle_%: $(BUILD)/t_oracle_%.o $(LIB_OBJ) $(ORACLE_OBJ)
 .PHONY: oracle-test
 oracle-test: $(ORACLE_TEST_BIN)
 	@set -e; for t in $(ORACLE_TEST_BIN); do echo "== $$t"; ./$$t; done
+
+# the metadata tests again with the shared multi-process mode (mw_mp=1) in place of the thread mode
+.PHONY: test-mp
+test-mp: $(DIST)/mw_metastore $(DIST)/mw_ddl_meta $(DIST)/mw_sync $(DIST)/oracle_meta $(DIST)/oracle_sync $(DIST)/mw_mpmeta
+	@set -e; for t in mw_metastore mw_ddl_meta mw_sync oracle_meta oracle_sync mw_mpmeta; do echo "== $$t (mw_mp=1)"; MW_TEST_MP=1 ./$(DIST)/$$t; done

@@ -318,7 +318,7 @@ static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int np
     mw_ovl *o = lane->cdc_ovl; mw_ovl_clear(o);
     ensure_ready(lane->db, c);
     const crdt_ops *ops = mw_ovl_ops();
-    int64_t seq = 0;
+    int64_t seq = 0; uint32_t *cols = NULL; int ccap = 0;
     for (int i = 0; i < npurge; i++) mw_ovl_purge(o, purge[i]);
     // order: deletes (a key that is deleted and written again in one commit is a new life of the row), key changes, inserts, updates
     for (int pass = 0; pass < 4; pass++) for (int i = 0; i < lane->cdc_res.n; i++) {
@@ -326,13 +326,18 @@ static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int np
         if (!t || !t->synced || !x->pk) continue;
         int want = x->kind == 3 ? 0 : (x->kind == 2 && x->oldpk) ? 1 : x->kind == 1 ? 2 : 3;
         if (want != pass) continue;
-        uint32_t cols[64]; int nc = 0;
-        if (x->kind == 2 && !x->oldpk) { for (int k = 0; k < t->ncells && k < 63; k++) if (x->changed & (1ull << k)) cols[nc++] = t->cell_id[k]; if (t->ncells > 63 && (x->changed >> 63)) { nc = 0; for (int k = 0; k < t->ncells && nc < 64; k++) cols[nc++] = t->cell_id[k]; } }
+        int nc = 0; if (t->ncells > ccap) { ccap = t->ncells + 16; cols = realloc(cols, (size_t)ccap * sizeof *cols); if (!cols) return; }
+        if (x->kind == 2 && !x->oldpk) {
+            if (x->wide) { for (int k = 0; k < t->ncells; k++) if (x->wide[k / 64] & (1ull << (k % 64))) cols[nc++] = t->cell_id[k]; }
+            else for (int k = 0; k < t->ncells && k < 63; k++) if (x->changed & (1ull << k)) cols[nc++] = t->cell_id[k];
+            if (!x->wide && t->ncells > 63 && (x->changed >> 63)) { nc = 0; for (int k = 0; k < t->ncells; k++) cols[nc++] = t->cell_id[k]; }     // (not decidable per cell)
+        }
         if (x->kind == 3) crdt_local_delete(ops, o, t->tid, x->pk, x->pklen, 0, &seq, NULL, 0);
         else if (x->kind == 1) crdt_local_insert(ops, o, t->tid, x->pk, x->pklen, t->cell_id, t->ncells, 0, &seq, NULL, 0);
         else if (x->oldpk) crdt_local_rekey(ops, o, t->tid, x->oldpk, x->oldpklen, x->pk, x->pklen, t->cell_id, t->ncells, 0, &seq, NULL, 0);
         else if (nc) crdt_local_update(ops, o, t->tid, x->pk, x->pklen, cols, nc, 0, &seq, NULL, 0);
     }
+    free(cols);
     if (mw_ovl_encode(o, &lane->cdc_ext, &lane->cdc_ext_len) != 0) { lane->cdc_ext = NULL; lane->cdc_ext_len = 0; }
 }
 

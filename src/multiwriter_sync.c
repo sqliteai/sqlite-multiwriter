@@ -153,14 +153,14 @@ int mw_sync_site_id (sqlite3 *db, uint8_t out[16]) {
     mw_meta_ready(m);
     return mw_meta_site_id(m, 0, out) ? SQLITE_OK : SQLITE_ERROR;
 }
-int64_t mw_sync_db_version (sqlite3 *db) { mw_meta *m = meta_of(db); return m ? (int64_t)mw_meta_epoch(m) : -1; }
+int64_t mw_sync_db_version (sqlite3 *db) { mw_meta *m = meta_of(db); if (!m) return -1; mw_meta_ready(m); return (int64_t)mw_meta_dv(m, mw_meta_epoch(m)); }
 
 // ---- export ----
 int mw_sync_export (sqlite3 *db, int64_t since, uint8_t **payload, size_t *len, int64_t *upto) {
     *payload = NULL; *len = 0;
     mw_meta *m = meta_of(db); if (!m) return SQLITE_MISUSE;
     mw_meta_ready(m);
-    uint64_t V = mw_meta_epoch(m);                                           // every commit up to V is applied to the store; the flush puts them in the file
+    uint64_t V = mw_meta_dv(m, mw_meta_epoch(m));                            // every commit up to V is applied to the store; the flush puts them in the file
     int rc = mw_meta_flush(m); if (rc != SQLITE_OK) return rc;
     if (upto) *upto = (int64_t)V;
     if (since >= (int64_t)V) return SQLITE_OK;

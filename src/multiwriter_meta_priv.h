@@ -35,7 +35,8 @@ struct mw_meta {
     stripe st[STRIPES];
     size_t cap_rows;                                            // the cache budget (rows) before clean entries are dropped
     pthread_mutex_t site_mu; uint8_t (*sites)[16]; uint32_t nsites, capsites;     // ord -> site id (0 = this database)
-    _Atomic uint64_t flushed;                                    // epoch up to which the cells are in the file
+    int64_t origin; _Atomic uint64_t hwm; uint64_t new_hwm;                         // db_version = epoch + origin; the largest db_version in the file tables
+    _Atomic uint64_t flushed;                                    // db_version up to which the cells are in the file
     _Atomic uint64_t hits, misses, rows, bytes;
     _Atomic int quiescing;
     _Atomic uint64_t ndirty;                                     // rows changed since the last flush
@@ -56,7 +57,7 @@ uint64_t mw_meta_hash (uint32_t tbl, const void *pk, size_t pklen);
 int      mw_metafile_load (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n);       // the row's cells from the file tables (n = 0: none / no tables)
 void     mw_meta_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]);
 void     mw_metafile_free (mw_meta *m);
-void     mw_metafile_load_state (mw_meta *m, uint64_t *F, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]);
+void     mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]);
 #endif
 
 typedef struct { uint32_t tbl; uint8_t *pk; uint32_t pklen; bool drop; int n; mw_mcell *c; } fitem;       // a row to write to the file tables: its cells (drop: the file's other cells of the row go first)
@@ -76,5 +77,10 @@ int      mm_validate (struct mw_db *db, struct mw_lane *lane);
 int      mm_install (struct mw_db *db, struct mw_lane *lane, uint64_t epoch, uint64_t ext_loc);
 int      mm_replay (struct mw_db *db, uint64_t epoch, const uint8_t *ext, uint32_t len, uint64_t ext_loc);
 int      mm_ready (mw_meta *m);
+static inline int64_t mw_meta_origin (mw_meta *m);
 int      mm_flush (mw_meta *m);
-int      mm_collect (mw_meta *m, uint64_t F, uint64_t V, fitem **out, int *n);        // the rows whose newest state is in (F, V]: what the next flush writes
+int      mm_collect (mw_meta *m, uint64_t F, uint64_t Fe, fitem **out, int *n);        // the rows whose newest state is in (F, V]: what the next flush writes
+
+// the offset between the epochs of this incarnation of the database and the db_versions of the cells
+#include "multiwriter_internal.h"
+static inline int64_t mw_meta_origin (mw_meta *m) { return m->shared ? (int64_t)atomic_load_explicit(&m->db->shm->dv_origin, memory_order_acquire) : m->origin; }

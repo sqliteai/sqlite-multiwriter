@@ -67,9 +67,17 @@ static int rv (const uint8_t **p, const uint8_t *end, uint64_t *v) {
     return -1;
 }
 
+// the cells of a table that was dropped (and not yet forgotten by the index and the file) older than the drop are dead
+static int purge_filter (mw_db *db, uint32_t tbl, mw_mcell *c, int n) {
+    mw_shm *sh = db->shm; uint32_t np = atomic_load_explicit(&sh->npurge, memory_order_acquire);
+    for (uint32_t q = 0; q < np; q++) if (atomic_load(&sh->purge[q].tbl) == tbl) { uint64_t ep = atomic_load(&sh->purge[q].epoch); int k = 0; for (int i = 0; i < n; i++) if (c[i].dv >= (int64_t)ep) c[k++] = c[i]; n = k; }
+    return n;
+}
+
 // the group that starts at `loc` of the log (a version installed at `epoch`): its rows. false: the segment is gone (the state it held is older than the base, so it is in the file)
 static bool read_group (mw_meta *m, uint64_t loc, uint64_t epoch, uint32_t bucket_hint, mm_group *g) {
     mw_db *db = m->db; (void)bucket_hint;
+    const uint64_t dvres = epoch + (uint64_t)mw_meta_origin(m);                 // (the db_version of the commit whose cells say "this commit")
     uint8_t hb[5]; if (!mw_seglog_read(db, loc, 0, 5, hb)) return false;
     const uint8_t *p = hb; uint64_t glen; if (rv(&p, hb + 5, &glen) || glen > (64u << 20)) return false;
     size_t hl = (size_t)(p - hb), total = hl + (size_t)glen;
@@ -88,22 +96,25 @@ static bool read_group (mw_meta *m, uint64_t loc, uint64_t epoch, uint32_t bucke
         for (uint64_t k = 0; k < nc; k++) {
             uint64_t col, cv, dvp, site, seq;
             if (rv(&q, end, &col) || rv(&q, end, &cv) || rv(&q, end, &dvp) || rv(&q, end, &site) || rv(&q, end, &seq)) goto bad;
-            rows[i].c[k] = (mw_mcell){ (int64_t)cv, dvp ? (int64_t)(dvp - 1) : (int64_t)epoch, (uint32_t)col, (uint32_t)site, (uint32_t)seq };
+            rows[i].c[k] = (mw_mcell){ (int64_t)cv, dvp ? (int64_t)(dvp - 1) : (int64_t)dvres, (uint32_t)col, (uint32_t)site, (uint32_t)seq };
         }
+        if (nc) { int kept = purge_filter(db, rows[i].tbl, rows[i].c, (int)nc); if (kept == 0) { free(rows[i].c); rows[i].c = NULL; rows[i].tbl = 0xFFFFFFFFu; rows[i].n = 0; } else rows[i].n = kept; }
         continue;
     bad:
         for (uint64_t j = 0; j <= i; j++) free(rows[j].c);
         free(rows); free(raw); return false;
     }
-    g->raw = raw; g->rawlen = total; g->rows = rows; g->n = (int)nrows; g->bucket = (uint32_t)bucket; g->epoch = epoch;
+    int w = 0; for (uint64_t i = 0; i < nrows; i++) if (rows[i].tbl != 0xFFFFFFFFu) rows[w++] = rows[i];       // (the rows of dropped tables are gone)
+    g->raw = raw; g->rawlen = total; g->rows = rows; g->n = w; g->bucket = (uint32_t)bucket; g->epoch = epoch;
     return true;
 }
 
 int mm_head (mw_meta *m, uint32_t bucket, mm_group *g) {
     memset(g, 0, sizeof *g);
     uint64_t ep, loc;
-    if (!shidx_lookup(m->db->rx, bucket, UINT64_MAX, &ep, &loc)) return 0;
-    if (!read_group(m, loc, ep, bucket, g)) { memset(g, 0, sizeof *g); return 0; }
+    if (getenv("MW_MM_BUCKET") && (uint32_t)atoi(getenv("MW_MM_BUCKET")) == bucket) fprintf(stderr, "head read: bucket %u head_epoch %llu\n", bucket, (unsigned long long)shidx_head_epoch(m->db->rx, bucket));
+    if (!shidx_lookup(m->db->rx, bucket, UINT64_MAX, &ep, &loc)) { if (getenv("MW_MM_DEBUG3")) { uint64_t he = shidx_head_epoch(m->db->rx, bucket); if (he) fprintf(stderr, "mm_head: lookup missed bucket %u but head epoch is %llu\n", bucket, (unsigned long long)he); } return 0; }
+    if (!read_group(m, loc, ep, bucket, g)) { if (getenv("MW_MM_DEBUG")) fprintf(stderr, "mm_head: bucket %u version epoch %llu at %llx unreadable (base %llu flushed %llu)\n", bucket, (unsigned long long)ep, (unsigned long long)loc, (unsigned long long)atomic_load(&m->db->shm->base_epoch), (unsigned long long)atomic_load(&m->db->shm->meta_flushed)); memset(g, 0, sizeof *g); return 0; }
     return 0;
 }
 
@@ -125,17 +136,19 @@ static void purge_cb (void *arg, uint32_t tbl, uint64_t epoch) { shared_purge_ad
 int mm_install (mw_db *db, mw_lane *lane, uint64_t epoch, uint64_t ext_loc) {
     mw_shm *sh = db->shm;
     if (!lane || !lane->cdc_ext_len) return SQLITE_OK;
+    atomic_store(&sh->meta_last, epoch);
     int ng = lane->cdc_ng;
     if (ng) {
         uint64_t locs_small[16]; uint64_t *locs = ng <= 16 ? locs_small : malloc((size_t)ng * sizeof *locs);
         if (!locs) return SQLITE_NOMEM;
         for (int i = 0; i < ng; i++) locs[i] = MW_LOC(MW_LOC_SEG(ext_loc), MW_LOC_OFF(ext_loc) + lane->cdc_goff[i]);
         int rc = shidx_install(db->rx, epoch, 0, ng, lane->cdc_gbucket, locs);
+        if (getenv("MW_MM_BUCKET")) { uint32_t want = (uint32_t)atoi(getenv("MW_MM_BUCKET")); for (int i = 0; i < ng; i++) if (lane->cdc_gbucket[i] == want) fprintf(stderr, "install: bucket %u epoch %llu rc %d head_now %llu\n", want, (unsigned long long)epoch, rc, (unsigned long long)shidx_head_epoch(db->rx, want)); }
         if (ng > 16) free(locs);
         if (rc != 0) return SQLITE_FULL;
         if (atomic_fetch_add(&sh->meta_dirty, (uint64_t)ng) + (uint64_t)ng >= 2048) mw_cdc_kick_flush(db);
     }
-    mw_ext_purges(lane->cdc_ext, lane->cdc_ext_len, purge_cb, epoch, sh);
+    mw_ext_purges(lane->cdc_ext, lane->cdc_ext_len, purge_cb, epoch + atomic_load(&sh->dv_origin), sh);
     return SQLITE_OK;
 }
 
@@ -154,10 +167,11 @@ int mm_replay (mw_db *db, uint64_t epoch, const uint8_t *ext, uint32_t len, uint
     int rc = SQLITE_OK;
     if (mw_ext_groups(ext, len, rep_group, &r) != 0) rc = SQLITE_CORRUPT;
     else {
-        if (r.n && shidx_room(db->rx) < (uint32_t)r.n + 2) shidx_gc_floor(db->rx, epoch - 1, atomic_load(&db->shm->meta_flushed));
+        if (r.n && shidx_room(db->rx) < (uint32_t)r.n + 2) shidx_gc_floor(db->rx, epoch - 1, 0);
         if (r.n && shidx_install(db->rx, epoch, 0, r.n, r.b, r.l) != 0) rc = SQLITE_FULL;
-        mw_ext_purges(ext, len, purge_cb, epoch, db->shm);
+        mw_ext_purges(ext, len, purge_cb, epoch + atomic_load(&db->shm->dv_origin), db->shm);
         if (r.n) atomic_fetch_add(&db->shm->meta_dirty, (uint64_t)r.n);
+        atomic_store(&db->shm->meta_last, epoch);
     }
     free(r.b); free(r.l);
     return rc;
@@ -170,8 +184,9 @@ int mm_ready (mw_meta *m) {
     pthread_mutex_lock(&m->file_mu);
     mw_mp_meta_lock(m->db, 1, true);                                         // (the flusher's lock: nobody flushes before the file's state is known)
     if (atomic_load(&sh->meta_state) != 2) {
-        uint64_t F = 0; uint32_t flushed_sites = 0; uint8_t own[16]; bool have_own = false;
-        mw_metafile_load_state(m, &F, &flushed_sites, &have_own, own);
+        uint64_t F = 0, hwm = 0; uint32_t flushed_sites = 0; uint8_t own[16]; bool have_own = false;
+        mw_metafile_load_state(m, &F, &hwm, &flushed_sites, &have_own, own);
+        atomic_store(&sh->dv_origin, hwm); atomic_store(&sh->dv_hwm, hwm);
         if (!have_own) arc4random_buf(own, 16);
         mm_site_install_db(m->db, 0, own);
         if (!have_own) { /* a fresh id: it is written with the first flush */ }
@@ -205,9 +220,9 @@ static void col_cb (void *arg, uint32_t bucket, uint64_t epoch, uint64_t loc) {
     }
     mm_group_free(&g);
 }
-int mm_collect (mw_meta *m, uint64_t F, uint64_t V, fitem **out, int *n) {
+int mm_collect (mw_meta *m, uint64_t F, uint64_t Fe, fitem **out, int *n) {
     col_ctx c = { m, F, NULL, 0, 0, 0 };
-    (void)V; shidx_scan(m->db->rx, F, UINT64_MAX, col_cb, &c);                  // (the newest state of every bucket changed since F, whatever its epoch: it holds the older ones)
+    shidx_scan(m->db->rx, Fe, UINT64_MAX, col_cb, &c);                  // (the newest state of every bucket changed since F, whatever its epoch: it holds the older ones)
     if (c.err) { for (int i = 0; i < c.n; i++) { free(c.v[i].pk); free(c.v[i].c); } free(c.v); return -1; }
     *out = c.v; *n = c.n; return 0;
 }

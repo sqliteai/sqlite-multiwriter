@@ -64,6 +64,7 @@ void     mw_meta_quiesce (mw_meta *m);                                          
 int      mw_meta_schema (sqlite3 *conn);                                          // create the file tables if they are missing
 uint64_t mw_meta_flushed (mw_meta *m);
 uint64_t mw_meta_dirty (mw_meta *m);
-uint64_t mw_meta_epoch (mw_meta *m);                                              // the last commit made visible                                              // rows changed since the last flush
+uint64_t mw_meta_epoch (mw_meta *m);
+uint64_t mw_meta_dv (mw_meta *m, uint64_t epoch);                               // the db_version of an epoch of this incarnation                                              // the last commit made visible                                              // rows changed since the last flush
 
 #endif

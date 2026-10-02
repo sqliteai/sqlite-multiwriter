@@ -157,7 +157,19 @@ static void shared_gc (mw_db *db) {
     uint64_t busy = atomic_load(&sh->compact_busy_T);
     if (busy && busy < floor) floor = busy;
     shidx_gc_floor(db->ix, floor, atomic_load(&sh->base_epoch));
-    if (db->rx) shidx_gc_floor(db->rx, floor, atomic_load(&sh->meta_flushed));       // (the buckets older than the last flush are in the file)
+    if (db->rx) {
+        uint64_t org = atomic_load(&sh->dv_origin), fl = atomic_load(&sh->meta_flushed), fle = fl > org ? fl - org : 0;      // (the flushed point as an epoch of this incarnation)
+        shidx_gc_floor(db->rx, floor, fle);                                          // (the buckets older than the last flush are in the file)
+        atomic_store(&sh->rx_gc_base, fl);
+        uint32_t np = atomic_load(&sh->npurge), k = 0;                               // a dropped table is forgotten once the file and the index both are clean of it
+        for (uint32_t q = 0; q < np; q++) {
+            uint64_t e = atomic_load(&sh->purge[q].epoch);
+            if (e <= fl && e <= floor + org) continue;                                       // (the floor too: a head older than a snapshot's epoch stays in its chain until the snapshot is gone)
+            if (k != q) { atomic_store(&sh->purge[k].epoch, e); atomic_store(&sh->purge[k].tbl, atomic_load(&sh->purge[q].tbl)); }
+            k++;
+        }
+        if (k != np) atomic_store_explicit(&sh->npurge, k, memory_order_release);
+    }
 }
 
 // One commit, under the publication lock: validate against the index, append to the log, install in the index, publish.

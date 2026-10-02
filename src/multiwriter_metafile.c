@@ -75,7 +75,8 @@ int mw_metafile_load (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw
     pthread_mutex_lock(&m->rdmu[slot]);
 locked:
     if (!m->rd[slot]) m->rd[slot] = open_conn(m);
-    if (m->rd[slot] && !m->rds[slot]) sqlite3_prepare_v2(m->rd[slot], "SELECT col, cv, dv, seq, site FROM mw_cells WHERE tbl = ?1 AND pk = ?2", -1, &m->rds[slot], NULL);
+    if (m->rd[slot] && !m->rds[slot]) { int prc = sqlite3_prepare_v2(m->rd[slot], "SELECT col, cv, dv, seq, site FROM mw_cells WHERE tbl = ?1 AND pk = ?2", -1, &m->rds[slot], NULL); if (prc != SQLITE_OK && getenv("MW_MM_DEBUG")) fprintf(stderr, "metafile: prepare failed: %d %s\n", prc, sqlite3_errmsg(m->rd[slot])); }
+    if (!m->rd[slot] && getenv("MW_MM_DEBUG")) fprintf(stderr, "metafile: cannot open a reader connection\n");
     int rc = 0;                                                                 // (no table yet, or a statement that cannot be prepared: the row is not in the file)
     if (m->rds[slot]) {
         sqlite3_stmt *st = m->rds[slot];
@@ -105,8 +106,8 @@ locked:
 
 // ---- recovery / first use ----
 // What the file tables say: the epoch they cover, the site ids they hold (installed through mw_meta_site_install: ord 0 is this database's own id)
-void mw_metafile_load_state (mw_meta *m, uint64_t *F, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]) {
-    *F = 0; *sites_flushed = 0; *have_own = false;
+void mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]) {
+    *F = 0; *hwm = 0; *sites_flushed = 0; *have_own = false;
     if (!m->attached) return;
     sqlite3 *c = open_conn(m); if (!c) return;
     sqlite3_stmt *st = NULL; int have = 0;
@@ -116,6 +117,9 @@ void mw_metafile_load_state (mw_meta *m, uint64_t *F, uint32_t *sites_flushed, b
         m->tables_ok = true;
         if (sqlite3_prepare_v2(c, "SELECT v FROM mw_state WHERE k = 'meta_epoch'", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) *F = (uint64_t)sqlite3_column_int64(st, 0);
         sqlite3_finalize(st); st = NULL;
+        if (sqlite3_prepare_v2(c, "SELECT v FROM mw_state WHERE k = 'dv_hwm'", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) *hwm = (uint64_t)sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st); st = NULL;
+        if (*hwm < *F) *hwm = *F;
         if (sqlite3_prepare_v2(c, "SELECT ord, id FROM mw_sites ORDER BY ord", -1, &st, NULL) == SQLITE_OK) {
             while (sqlite3_step(st) == SQLITE_ROW) {
                 uint32_t ord = (uint32_t)sqlite3_column_int64(st, 0);
@@ -135,12 +139,14 @@ int mw_meta_ready (mw_meta *m) {
     if (atomic_load(&m->ready)) return 0;
     pthread_mutex_lock(&m->file_mu);
     if (atomic_load(&m->ready)) { pthread_mutex_unlock(&m->file_mu); return 0; }
-    uint64_t F; uint8_t own[16]; bool have_own;
-    mw_metafile_load_state(m, &F, &m->sites_flushed, &have_own, own);
+    uint64_t F, hwm; uint8_t own[16]; bool have_own;
+    mw_metafile_load_state(m, &F, &hwm, &m->sites_flushed, &have_own, own);
     if (have_own) memcpy(m->sites[0], own, 16);
+    m->origin = (int64_t)hwm;                                   // this incarnation's epochs start again at 1: its db_versions go on from the largest the file has seen
+    atomic_store(&m->hwm, hwm);
     atomic_store(&m->flushed, F);
     struct mw_db *db = m->db;
-    for (int i = 0; i < db->nrext; i++) if (db->rext[i].epoch > F) mw_meta_replay(m, db->rext[i].epoch, db->rext[i].data, db->rext[i].len);
+    for (int i = 0; i < db->nrext; i++) mw_meta_replay(m, db->rext[i].epoch, db->rext[i].data, db->rext[i].len);      // (all of them: the epochs of the log are of this incarnation, the file's flushed point is of an older one)
     for (int i = 0; i < db->nrext; i++) free(db->rext[i].data);
     free(db->rext); db->rext = NULL; db->nrext = db->caprext = 0;
     atomic_store(&m->ready, true);
@@ -176,17 +182,18 @@ fail:
     free(v); return -1;
 }
 
-static int write_batch (mw_meta *m, fitem *v, int n, uint64_t V, uint32_t nsites, uint32_t sflushed, const struct mw_purge *purge, int npurge) {
+static int write_batch (mw_meta *m, fitem *v, int n, uint64_t V, uint64_t hwm, uint32_t nsites, uint32_t sflushed, const struct mw_purge *purge, int npurge) {
     sqlite3 *c = m->wr; int rc;
     rc = mw_meta_schema(c); if (rc != SQLITE_OK) return rc;
     m->tables_ok = true;
     if ((rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL)) != SQLITE_OK) return rc;
-    sqlite3_stmt *del = NULL, *ins = NULL, *site = NULL, *state = NULL;
+    sqlite3_stmt *del = NULL, *ins = NULL, *site = NULL, *state = NULL, *hw = NULL;
     sqlite3_prepare_v2(c, "DELETE FROM mw_cells WHERE tbl = ?1 AND pk = ?2 AND col <> -1", -1, &del, NULL);
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_cells(tbl, pk, col, cv, dv, seq, site) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)", -1, &ins, NULL);
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_sites(ord, id) VALUES(?1, ?2)", -1, &site, NULL);
     sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_state(k, v) VALUES('meta_epoch', ?1)", -1, &state, NULL);
-    rc = (del && ins && site && state) ? SQLITE_OK : SQLITE_ERROR;
+    sqlite3_prepare_v2(c, "INSERT OR REPLACE INTO mw_state(k, v) VALUES('dv_hwm', ?1)", -1, &hw, NULL);
+    rc = (del && ins && site && state && hw) ? SQLITE_OK : SQLITE_ERROR;
     for (int i = 0; i < npurge && rc == SQLITE_OK; i++) { char q[80]; snprintf(q, sizeof q, "DELETE FROM mw_cells WHERE tbl = %u AND dv < %llu", purge[i].tbl, (unsigned long long)purge[i].epoch); rc = sqlite3_exec(c, q, NULL, NULL, NULL); }
     uint64_t cells = 0;
     for (int i = 0; i < n && rc == SQLITE_OK; i++) {
@@ -204,8 +211,12 @@ static int write_batch (mw_meta *m, fitem *v, int n, uint64_t V, uint32_t nsites
         sqlite3_bind_int64(site, 1, o); sqlite3_bind_blob(site, 2, id, 16, SQLITE_STATIC);
         if (sqlite3_step(site) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(site);
     }
+    for (int i = 0; i < n; i++) for (int k = 0; k < v[i].n; k++) if ((uint64_t)v[i].c[k].dv > hwm) hwm = (uint64_t)v[i].c[k].dv;
+    if (V > hwm) hwm = V;
     if (rc == SQLITE_OK) { sqlite3_bind_int64(state, 1, (int64_t)V); if (sqlite3_step(state) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(state); }
-    sqlite3_finalize(del); sqlite3_finalize(ins); sqlite3_finalize(site); sqlite3_finalize(state);
+    if (rc == SQLITE_OK) { sqlite3_bind_int64(hw, 1, (int64_t)hwm); if (sqlite3_step(hw) != SQLITE_DONE) rc = sqlite3_errcode(c); sqlite3_reset(hw); }
+    m->new_hwm = hwm;
+    sqlite3_finalize(del); sqlite3_finalize(ins); sqlite3_finalize(site); sqlite3_finalize(state); sqlite3_finalize(hw);
     if (rc == SQLITE_OK) rc = sqlite3_exec(c, "COMMIT", NULL, NULL, NULL);
     if (rc != SQLITE_OK) sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL);
     else atomic_fetch_add(&m->flushed_cells, cells);
@@ -221,41 +232,41 @@ static int flush_impl (mw_meta *m, bool wait) {
     pthread_mutex_lock(&m->file_mu);
     if (sh && !mw_mp_meta_lock(m->db, 1, wait)) { pthread_mutex_unlock(&m->file_mu); return 0; }
     uint64_t t0 = now_ns();
-    uint64_t V = sh ? atomic_load_explicit(&sh->committed_epoch, memory_order_acquire) : atomic_load(&m->db->epoch);
+    int64_t origin = mw_meta_origin(m);
+    uint64_t Ve = sh ? atomic_load_explicit(&sh->committed_epoch, memory_order_acquire) : atomic_load(&m->db->epoch);
+    uint64_t V = Ve + (uint64_t)origin;                                          // (db_versions from here on)
     uint64_t F = sh ? atomic_load(&sh->meta_flushed) : atomic_load(&m->flushed);
+    uint64_t Fe = F > (uint64_t)origin ? F - (uint64_t)origin : 0;               // the same point as an epoch of this incarnation
     uint32_t nsites = sh ? atomic_load(&sh->nsites) : 0, sflushed = sh ? atomic_load(&sh->sites_flushed) : m->sites_flushed;
     if (!sh) { pthread_mutex_lock(&m->site_mu); nsites = m->nsites; pthread_mutex_unlock(&m->site_mu); }
     int rc = SQLITE_OK;
     struct mw_purge *purge = NULL; int npurge = 0;
     if (sh) { uint32_t np = atomic_load_explicit(&sh->npurge, memory_order_acquire); if (np) { purge = malloc(np * sizeof *purge); if (purge) for (uint32_t i = 0; i < np; i++) purge[npurge++] = (struct mw_purge){ atomic_load(&sh->purge[i].tbl), atomic_load(&sh->purge[i].epoch) }; } }
     else { pthread_mutex_lock(&m->purge_mu); if (m->npurge) { purge = malloc((size_t)m->npurge * sizeof *purge); if (purge) { memcpy(purge, m->purge, (size_t)m->npurge * sizeof *purge); npurge = m->npurge; } } pthread_mutex_unlock(&m->purge_mu); }
-    bool dirty = sh ? V > F : atomic_load(&m->ndirty) != 0;
+    bool dirty = sh ? atomic_load(&sh->meta_last) > Fe : atomic_load(&m->ndirty) != 0;
     if (!dirty && nsites <= sflushed && npurge == 0) goto out;
     if (!m->wr) m->wr = open_conn(m);
     if (!m->wr) { rc = SQLITE_CANTOPEN; goto out; }
     fitem *v = NULL; int n = 0;
-    if ((sh ? mm_collect(m, F, V, &v, &n) : collect(m, F, &v, &n)) != 0) { rc = SQLITE_NOMEM; goto out; }
+    if ((sh ? mm_collect(m, F, Fe, &v, &n) : collect(m, F, &v, &n)) != 0) { rc = SQLITE_NOMEM; goto out; }
     rc = SQLITE_BUSY;
     for (int attempt = 0; attempt < 200 && busyish(rc); attempt++) {
-        rc = write_batch(m, v, n, V, nsites, sflushed, purge, npurge);
+        rc = write_batch(m, v, n, V, sh ? atomic_load(&sh->dv_hwm) : atomic_load(&m->hwm), nsites, sflushed, purge, npurge);
         if (busyish(rc)) { atomic_fetch_add(&m->flush_retries, 1); usleep(500 * (unsigned)(attempt < 20 ? attempt + 1 : 20)); }
     }
     for (int i = 0; i < n; i++) { free(v[i].pk); free(v[i].c); }
     free(v);
     if (rc == SQLITE_OK) {
         if (sh) {
-            if (npurge) { mw_mp_lock(m->db); uint32_t cnt = atomic_load(&sh->npurge), k = 0;                 // (under the publication lock: that is where entries are added)
-                for (uint32_t q = 0; q < cnt; q++) { bool done = false; for (int i = 0; i < npurge; i++) if (atomic_load(&sh->purge[q].tbl) == purge[i].tbl && atomic_load(&sh->purge[q].epoch) == purge[i].epoch) done = true;
-                    if (!done) { atomic_store(&sh->purge[k].epoch, atomic_load(&sh->purge[q].epoch)); atomic_store(&sh->purge[k].tbl, atomic_load(&sh->purge[q].tbl)); k++; } }
-                atomic_store_explicit(&sh->npurge, k, memory_order_release); mw_mp_unlock(m->db); }
-            atomic_store(&sh->sites_flushed, nsites);
+            atomic_store(&sh->sites_flushed, nsites); atomic_store(&sh->dv_hwm, m->new_hwm);
             atomic_store_explicit(&sh->meta_flushed, V, memory_order_release);
-            uint64_t d = atomic_load(&sh->meta_dirty); atomic_store(&sh->meta_dirty, d > (uint64_t)n ? d - (uint64_t)n : 0);
+            if (atomic_load(&sh->meta_last) <= Ve) atomic_store(&sh->meta_dirty, 0);
+            else { uint64_t d = atomic_load(&sh->meta_dirty); atomic_store(&sh->meta_dirty, d > (uint64_t)n ? d - (uint64_t)n : 1); }
         } else {
             pthread_mutex_lock(&m->purge_mu);                                         // (a drop that happened again meanwhile has a newer epoch and stays)
             for (int i = 0; i < npurge; i++) for (int q = 0; q < m->npurge; q++) if (m->purge[q].tbl == purge[i].tbl && m->purge[q].epoch == purge[i].epoch) { m->purge[q] = m->purge[--m->npurge]; break; }
             pthread_mutex_unlock(&m->purge_mu);
-            atomic_store(&m->flushed, V); m->sites_flushed = nsites;
+            atomic_store(&m->flushed, V); atomic_store(&m->hwm, m->new_hwm); m->sites_flushed = nsites;
             uint64_t cleaned = 0;
             for (int s = 0; s < STRIPES; s++) {
                 stripe *st = &m->st[s]; pthread_mutex_lock(&st->mu);
@@ -278,9 +289,19 @@ out:
 int mw_meta_flush (mw_meta *m) { return flush_impl(m, true); }
 
 uint64_t mw_meta_epoch (mw_meta *m) { return m->shared ? atomic_load_explicit(&m->db->shm->committed_epoch, memory_order_acquire) : atomic_load(&m->db->epoch); }
-uint64_t mw_meta_dirty (mw_meta *m) { return m->shared ? atomic_load(&m->db->shm->meta_dirty) : atomic_load(&m->ndirty); }
+uint64_t mw_meta_dirty (mw_meta *m) {
+    if (!m->shared) return atomic_load(&m->ndirty);
+    mw_shm *sh = m->db->shm;                                                   // dirty: a commit with metadata is newer than the last flush (the count is a measure for the flusher's pace only)
+    if (atomic_load(&sh->meta_last) <= atomic_load(&sh->meta_flushed)) return 0;
+    uint64_t d = atomic_load(&sh->meta_dirty); return d ? d : 1;
+}
 uint64_t mw_meta_flushed (mw_meta *m) { return m->shared ? atomic_load(&m->db->shm->meta_flushed) : atomic_load(&m->flushed); }
-uint64_t mw_meta_safe_epoch (mw_meta *m) { return mw_meta_dirty(m) == 0 ? UINT64_MAX : mw_meta_flushed(m); }
+uint64_t mw_meta_safe_epoch (mw_meta *m) {                                     // an epoch of this incarnation
+    if (mw_meta_dirty(m) == 0) return UINT64_MAX;
+    uint64_t F = mw_meta_flushed(m), o = (uint64_t)mw_meta_origin(m);
+    return F > o ? F - o : 0;
+}
+uint64_t mw_meta_dv (mw_meta *m, uint64_t epoch) { return epoch + (uint64_t)mw_meta_origin(m); }
 
 // ---- the flusher thread ----
 static void *flusher_main (void *arg) {

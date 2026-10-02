@@ -18,6 +18,8 @@
 #include "multiwriter_catalog.h"
 #include "crdt.h"
 
+#define MW_MAXCOLS 2048                                                       // columns of a record (SQLite's own limit is 2000)
+
 static mw_rowdiff_sink_fn g_sink;
 static void *g_sink_arg;
 void mw_rowdiff_set_sink (mw_rowdiff_sink_fn fn, void *arg) { g_sink_arg = arg; g_sink = fn; }
@@ -131,7 +133,7 @@ static bool row_pk (const mw_tab *t, const rd_row *r, uint8_t **out, size_t *out
     crdt_value v[MW_CAT_MAXPK]; int n = 0;
     if (t->alias_pk || !t->has_pk) { v[0] = (crdt_value){ CRDT_INTEGER, r->rowid, 0, NULL, 0 }; n = 1; }
     else {
-        uint64_t ty[256]; uint32_t off[256], len[256]; int nc = rec_cols(r->rec, r->reclen, ty, off, len, 256);
+        uint64_t ty[MW_MAXCOLS]; uint32_t off[MW_MAXCOLS], len[MW_MAXCOLS]; int nc = rec_cols(r->rec, r->reclen, ty, off, len, MW_MAXCOLS);
         if (nc < 0) return false;
         for (int k = 0; k < t->npk; k++) { int ri = t->pk_rec[k]; if (ri < 0 || ri >= nc || !rec_value(r->rec, ty[ri], off[ri], len[ri], &v[k])) return false; n++; }
     }
@@ -208,11 +210,11 @@ static void rows_free (rowset *rs) { for (int i = 0; i < rs->n; i++) { free(rs->
 
 // the cells that differ between two records of the row, as a bit mask over the cells of the new definition (bit 63: all of them / not decidable); *pk_changed: the key columns differ.
 // The two records may be laid out by different definitions of the table (ADD / DROP COLUMN in this commit): cells are matched by column name then.
-static uint64_t cells_differ (const mw_tab *t, const rd_row *a, const rd_row *b, bool *pk_changed) {
-    *pk_changed = false;
+static uint64_t cells_differ (const mw_tab *t, const rd_row *a, const rd_row *b, bool *pk_changed, uint64_t **wide) {
+    *pk_changed = false; *wide = NULL;
     if (a->reclen == b->reclen && memcmp(a->rec, b->rec, a->reclen) == 0 && a->tab == b->tab) return 0;
-    uint64_t ta[256], tb[256]; uint32_t oa[256], ob[256], la[256], lb[256];
-    int na = rec_cols(a->rec, a->reclen, ta, oa, la, 256), nb = rec_cols(b->rec, b->reclen, tb, ob, lb, 256);
+    uint64_t ta[MW_MAXCOLS], tb[MW_MAXCOLS]; uint32_t oa[MW_MAXCOLS], ob[MW_MAXCOLS], la[MW_MAXCOLS], lb[MW_MAXCOLS];
+    int na = rec_cols(a->rec, a->reclen, ta, oa, la, MW_MAXCOLS), nb = rec_cols(b->rec, b->reclen, tb, ob, lb, MW_MAXCOLS);
     if (na < 0 || nb < 0 || !t) return 1ull << 63;
     const mw_tab *ot = a->tab ? a->tab : t;
     bool same_layout = ot == t || (ot->ncells == t->ncells && ot->npk == t->npk && ot->without_rowid == t->without_rowid && ot->alias_pk == t->alias_pk);
@@ -227,7 +229,10 @@ static uint64_t cells_differ (const mw_tab *t, const rd_row *a, const rd_row *b,
         if (ha != hb) changed = hb ? !(tb[ri] == 0) : !(ta[rj] == 0);              // (an absent column reads as NULL)
         else if (!ha) changed = false;
         else changed = ta[rj] != tb[ri] || (la[rj] && memcmp(a->rec + oa[rj], b->rec + ob[ri], la[rj]) != 0);
-        if (changed) { if (i < 63) mask |= 1ull << i; else mask |= 1ull << 63; }
+        if (changed) {
+            if (i < 63) mask |= 1ull << i; else mask |= 1ull << 63;
+            if (t->ncells > 63) { if (!*wide) *wide = calloc(((size_t)t->ncells + 63) / 64, sizeof(uint64_t)); if (*wide) (*wide)[i / 64] |= 1ull << (i % 64); }
+        }
     }
     if (!t->alias_pk && t->has_pk && !t->without_rowid) {
         if (!same_layout && (ot->npk != t->npk || ot->alias_pk != t->alias_pk)) *pk_changed = true;
@@ -336,14 +341,15 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_o
             if (r->tab && !r->bad) { if (!row_pk(r->tab, r, &x->pk, &x->pklen)) x->pk = NULL; }
             nout++; if (c < 0) i++; else j++;
         } else {
-            bool pkc = false; uint64_t m = cells_differ(newr.a[j].tab, &oldr.a[i], &newr.a[j], &pkc);
+            bool pkc = false; uint64_t *wide = NULL; uint64_t m = cells_differ(newr.a[j].tab, &oldr.a[i], &newr.a[j], &pkc, &wide);
             if (getenv("MW_ROWDIFF_DEBUG") && (m || pkc)) { const rd_row *o = &oldr.a[i], *w = &newr.a[j]; fprintf(stderr, "rowdiff: update root %u rowid %lld mask %llx: old len %u new len %u; old:", r->root, (long long)o->rowid, (unsigned long long)m, o->reclen, w->reclen); for (uint32_t q = 0; q < o->reclen && q < 24; q++) fprintf(stderr, " %02x", o->rec[q]); fprintf(stderr, " | new:"); for (uint32_t q = 0; q < w->reclen && q < 24; q++) fprintf(stderr, " %02x", w->rec[q]); fprintf(stderr, "\n"); }
             if (m || pkc) {
-                x->kind = 2; x->tab = newr.a[j].tab; x->root = newr.a[j].root; x->rowid = newr.a[j].rowid; x->changed = m;
+                x->kind = 2; x->tab = newr.a[j].tab; x->root = newr.a[j].root; x->rowid = newr.a[j].rowid; x->changed = m; x->wide = wide; wide = NULL;
                 if (x->tab && !newr.a[j].bad) { if (!row_pk(x->tab, &newr.a[j], &x->pk, &x->pklen)) x->pk = NULL; }
                 if (pkc && x->tab && !oldr.a[i].bad) { if (!row_pk(x->tab, &oldr.a[i], &x->oldpk, &x->oldpklen)) x->oldpk = NULL; }
                 nout++;
             }
+            free(wide);
             i++; j++;
         }
     }
@@ -358,7 +364,7 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_o
 }
 
 void mw_rd_result_free (mw_rd_result *r) {
-    for (int i = 0; i < r->n; i++) { free(r->chg[i].pk); free(r->chg[i].oldpk); }
+    for (int i = 0; i < r->n; i++) { free(r->chg[i].pk); free(r->chg[i].oldpk); free(r->chg[i].wide); }
     free(r->chg); free(r->freed); free(r->ovupd); memset(r, 0, sizeof *r);
 }
 

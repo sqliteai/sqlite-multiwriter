@@ -23,7 +23,7 @@
 
 // One row of the net change of a commit. pk: the key as sqlite-sync encodes it (NULL if the row could not be decoded); oldpk: an update that changed the key; changed: bit i = cell i of
 // the table changed (bit 63 = all of them); tab NULL: a row in a page whose table is unknown.
-typedef struct { int kind; const mw_tab *tab; uint32_t root; int64_t rowid; uint8_t *pk; size_t pklen; uint8_t *oldpk; size_t oldpklen; uint64_t changed; } mw_chg;
+typedef struct { int kind; const mw_tab *tab; uint32_t root; int64_t rowid; uint8_t *pk; size_t pklen; uint8_t *oldpk; size_t oldpklen; uint64_t changed; uint64_t *wide; } mw_chg;     // wide: a table with more than 63 cells: one bit per cell (changed has bit 63 set)
 typedef struct { uint32_t page, leaf; } mw_ovupd;                    // overflow page -> the leaf page holding the cell whose record spills into it
 typedef struct { mw_chg *chg; int n; uint32_t *freed; int nfreed; mw_ovupd *ovupd; int novupd; int unknown_ovfl; mw_rowdiff_info info; } mw_rd_result;
 
@@ -95,7 +95,11 @@ typedef struct mw_shm {
     // the CRDT metadata in shared mode (multiwriter_mmeta.c)
 #define MW_MAX_SITES 16384
 #define MW_MAX_PURGE 64
-    _Atomic uint64_t  meta_flushed;       // epoch up to which the cells are in the file tables
+    _Atomic uint64_t  dv_origin;          // db_version = epoch + dv_origin (an incarnation of the database starts its epochs again at 1; the db_versions go on from the largest one the file has seen)
+    _Atomic uint64_t  dv_hwm;             // the largest db_version written to the file tables
+    _Atomic uint64_t  meta_flushed;       // db_version up to which the cells are in the file tables
+    _Atomic uint64_t  rx_gc_base;          // the last garbage collection of the metadata index ran with this base (nothing older than it is in a chain's head any more)
+    _Atomic uint64_t  meta_last;          // epoch of the newest commit that carried metadata
     _Atomic uint64_t  meta_dirty;         // row buckets installed since the last flush (approximate)
     _Atomic uint64_t  own_cookie;         // the owner maps were built for this schema cookie: (1 << 32) | cookie, 0 = not built
     _Atomic uint32_t  cdc_on;             // the database captures metadata (set by the first opener; every process then does)

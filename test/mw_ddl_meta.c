@@ -24,7 +24,7 @@ int main (void) {
     char path[256]; mw_tmpdb(path, sizeof path, "ddlmeta");
     sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL"), SQLITE_OK); sqlite3_close(s);
-    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_cdc=1", path);
+    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_cdc=1%s", path, getenv("MW_TEST_MP") ? "&mw_mp=1" : "");
     sqlite3 *db; CHECK_RC(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL), SQLITE_OK);
     CHECK_RC(sqlite3_file_control(db, "main", MW_FCNTL_META, &g_m), SQLITE_OK);
 

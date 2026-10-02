@@ -23,7 +23,7 @@ static uint64_t gr = 0x2545F4914F6CDD1Dull;
 static uint64_t grnd (void) { gr ^= gr << 13; gr ^= gr >> 7; gr ^= gr << 17; return gr; }
 
 static int open_peer (const char *path, sqlite3 **db) {
-    char uri[400]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_cdc=1", path);
+    char uri[400]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_cdc=1%s", path, getenv("MW_TEST_MP") ? "&mw_mp=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;
@@ -89,7 +89,7 @@ static int64_t since[NP][NP];
 static void exchange (sqlite3 **p, int from, int to, bool repeat_old) {
     uint8_t *pl; size_t n; int64_t upto; int64_t s = repeat_old ? 0 : since[to][from];
     CHECK_RC(mw_sync_export(p[from], s, &pl, &n, &upto), SQLITE_OK);
-    if (pl) { mw_sync_stats st; CHECK_RC(mw_sync_apply(p[to], pl, n, &st), SQLITE_OK); if (!repeat_old) since[to][from] = upto; mw_sync_free(pl); }
+    if (pl) { mw_sync_stats st; int arc = mw_sync_apply(p[to], pl, n, &st); if (arc != SQLITE_OK) printf("  apply %d -> %d failed: rc %d after %lld retries (%s)\n", from, to, arc, (long long)st.retries, sqlite3_errmsg(p[to])); CHECK_RC(arc, SQLITE_OK); if (!repeat_old) since[to][from] = upto; mw_sync_free(pl); }
     else if (!repeat_old) since[to][from] = upto;
 }
 

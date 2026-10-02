@@ -4,6 +4,7 @@
 //  See multiwriter_meta.h. The store is a hash table of rows in memory, striped by row; an entry holds the cells of one row. Rows that changed after the last flush to the file are
 //  "dirty" (never evicted); the others are a cache that is filled from the file when a row is asked for and dropped when the table grows over its budget.
 //
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -238,6 +239,8 @@ static orow *ovl_row (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen, boo
             memcpy(r->c, g->rows[q].c, (size_t)r->n * sizeof(mw_mcell)); found = true;
         }
         if (!found && file_load(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) { free(r->pk); return NULL; }
+        if (getenv("MW_MM_DEBUG2") && pklen == 3 && ((const uint8_t *)pk)[2] == 0x1a) { int ncv = -1; long long dvv = -1; for (int q = 0; q < r->n; q++) if (r->c[q].col != 0xFFFFFFFFu) { ncv = (int)r->c[q].cv; dvv = r->c[q].dv; break; } fprintf(stderr, "row26 load: found_in_head=%d head_epoch=%llu head_rows=%d cells=%d cv=%d dv=%lld flushed=%llu\n", found, (unsigned long long)o->bk[bi].g.epoch, o->bk[bi].g.n, r->n, ncv, dvv, (unsigned long long)atomic_load(&o->m->db->shm->meta_flushed)); }
+        if (getenv("MW_MM_DEBUG") && !found) fprintf(stderr, "ovl_row: tbl %08x pk %02x%02x bucket %u: head rows %d, found in head %d, file cells %d\n", tbl, ((const uint8_t *)pk)[0], pklen > 1 ? ((const uint8_t *)pk)[1] : 0, b, o->bk[bi].g.n, found, r->n);
     } else if (load_row(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) { free(r->pk); return NULL; }
     r->cap = r->n;
     o->hash[j] = o->n++;
@@ -408,7 +411,8 @@ static void purge_table (mw_meta *m, uint32_t tbl, uint64_t epoch) {
 }
 
 int mw_meta_apply (mw_meta *m, mw_ovl *o, uint64_t epoch) {
-    if (m->shared) return 0;                                           // (the publisher installed the commit's buckets in the shared index)
+    if (m->shared) return 0;
+    epoch += (uint64_t)m->origin;                                       // (from here on: the db_version of the commit)                                           // (the publisher installed the commit's buckets in the shared index)
     for (int i = 0; i < o->npurge; i++) purge_table(m, o->purge[i], epoch);
     for (int i = 0; i < o->n; i++) { orow *r = &o->rows[i]; if (!touched(r)) continue; if (install_row(m, r->tbl, r->pk, r->pklen, r->c, r->n, epoch) != 0) return -1; }
     return 0;
@@ -478,6 +482,7 @@ static void replay_purge (void *arg, uint32_t tbl, uint64_t epoch) { purge_table
 static void replay_site (void *arg, uint32_t ord, const uint8_t id[16]) { mw_meta_site_install(((rctx *)arg)->m, ord, id); }
 
 int mw_meta_replay (mw_meta *m, uint64_t epoch, const uint8_t *ext, uint32_t len) {
+    epoch += (uint64_t)mw_meta_origin(m);
     rctx r = { m, epoch };
     return mw_ext_walk(ext, len, epoch, replay_row, replay_purge, replay_site, &r);
 }

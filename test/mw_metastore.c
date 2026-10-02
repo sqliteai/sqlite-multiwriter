@@ -12,10 +12,11 @@
 #include "multiwriter.h"
 #include "multiwriter_meta.h"
 #include "multiwriter_catalog.h"
+#include "multiwriter_sync.h"
 #include "crdt.h"
 
 static int open_cdc (const char *path, sqlite3 **db, const char *extra) {
-    char uri[400]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_cdc=1%s", path, extra ? extra : "");
+    char uri[400]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_cdc=1%s%s", path, getenv("MW_TEST_MP") ? "&mw_mp=1" : "", extra ? extra : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;
@@ -84,6 +85,18 @@ int main (void) {
       CHECK(rows == 3000 - 60);
       CHECK(integrity_ok(db)); sqlite3_close(db); }
     mw_rmdb(path);
+
+    // ---- 1b. several incarnations of the database: each open starts its epochs again, the db_versions of the cells must keep growing and no update may be taken for an old one
+    { mw_tmpdb(path, sizeof path, "mstore"); make_db(path); int64_t last_dv = 0; long expect_sum = 0;
+      for (int inc = 0; inc < 6; inc++) {
+          sqlite3 *db; CHECK_RC(open_cdc(path, &db, ""), SQLITE_OK);
+          if (inc == 0) { CHECK_RC(mw_exec(db, "BEGIN"), SQLITE_OK); for (int i = 1; i <= 50; i++) { char q[100]; snprintf(q, sizeof q, "INSERT INTO t VALUES(%d, 0, NULL)", i); mw_exec(db, q); } CHECK_RC(mw_exec(db, "COMMIT"), SQLITE_OK); }
+          for (int k = 0; k < 40; k++) { char q[100]; snprintf(q, sizeof q, "UPDATE t SET n = n + 1 WHERE id = %d", 1 + (inc * 7 + k) % 50); CHECK_RC(mw_exec(db, q), SQLITE_OK); expect_sum++; }
+          int64_t sum; int rows; int bad = check_rows(db, &sum, &rows); CHECK(bad == 0); CHECK(sum == expect_sum);
+          int64_t dv = mw_sync_db_version(db); CHECK(dv > last_dv); last_dv = dv;
+          sqlite3_close(db);
+      }
+      printf("1b. six incarnations: db_version grew to %lld, every cell agreed after each\n", (long long)last_dv); mw_rmdb(path); }
 
     // ---- 2. SIGKILL under load
     static const char *ENVS[][2] = { { "1", "1" }, { "7", "5" }, { "50", "30" }, { "100000", "100000" } };      // flush after N rows / M ms: constantly ... practically never

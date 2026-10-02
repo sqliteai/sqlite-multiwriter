@@ -13,6 +13,7 @@
 #define STRIPES 64
 #define SEN CRDT_COL_SENTINEL
 #define OV_CHG INT64_MIN                 // in an overlay cell: written by this commit (its db_version is the commit's epoch, not known yet)
+#define EXT_VERSION 0x4e                // the format of the extension of a commit record (bumped when it changes)
 #define F_DROP 1                         // the non-sentinel cells of the row are removed
 #define F_ZERO 2                         // the non-sentinel cells get version 0 and the db_version of the commit
 

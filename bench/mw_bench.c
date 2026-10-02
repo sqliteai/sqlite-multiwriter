@@ -46,7 +46,6 @@
 #define thread_t bench_thread_t     /* (the benchmark's own thread_t must not clash with mach's) */
 #endif
 
-extern int sqlite3_cloudsync_init (sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi);
 
 typedef enum { M_STOCK, M_STOCK_WAL, M_MW } bmode_t;
 enum { W_INDEPENDENT, W_READONLY, W_SAMEPAGE, W_COLS, W_SAMECOL, W_CRDTINSERT, W_MIXED, W_LONGTX, W_HOT, W_LONGREADER, W_INS_UUID, W_INS_INT, W_INS_AUTO, W_BULK, W_SLOWTX, W_SLOWHOT, W_SLOWPAGE, W_COUNT };
@@ -92,7 +91,7 @@ static char *text_ (sqlite3 *db, const char *sql) {
 static int open_agent (agent_t *a) {
     int rc;
     if (cfg.mode == M_MW) {
-        char uri[600]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=64&mw_mp=%d%s", cfg.path, cfg.mp, getenv("MW_BENCH_URI_EXTRA") ? getenv("MW_BENCH_URI_EXTRA") : "");
+        char uri[600]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=64&mw_mp=%d%s%s", cfg.path, cfg.mp, cfg.tracked ? "&mw_cdc=1" : "", getenv("MW_BENCH_URI_EXTRA") ? getenv("MW_BENCH_URI_EXTRA") : "");
         rc = sqlite3_open_v2(uri, &a->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX, NULL);
     } else {
         rc = sqlite3_open_v2(cfg.path, &a->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX, "unix");   // no wrapper in the baselines
@@ -381,10 +380,8 @@ int main (int argc, char **argv) {
     if (!cfg.no_setup && cfg.verify_sum < 0) for (int i = 0; i < 5; i++) { snprintf(p2, sizeof p2, "%s%s", path, sfx[i]); unlink(p2); }
     int64_t ct_rows0 = 0;
     char sql[700];
-    if (cfg.tracked && cfg.no_setup) mw_vfs_set_autoload_cloudsync(1);      // (a process joining a database that another one set up)
     if (!cfg.no_setup && cfg.verify_sum < 0) {
     // ---- setup with a stock connection. Untracked: t = one row per page (3000-byte pad). Tracked: ct with 4 int columns, small rows.
-    if (cfg.tracked) mw_vfs_set_autoload_cloudsync(1);
     sqlite3 *s;
     if (sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix") != SQLITE_OK) die("setup open");
     exec_(s, cfg.mode == M_STOCK ? "PRAGMA journal_mode=DELETE" : "PRAGMA journal_mode=WAL");
@@ -397,14 +394,10 @@ int main (int argc, char **argv) {
         exec_(s, "CREATE TABLE ct(id TEXT PRIMARY KEY NOT NULL, a INTEGER, b INTEGER, c INTEGER, d INTEGER, pad TEXT)");
         snprintf(sql, sizeof sql, "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<%d) INSERT INTO ct SELECT 'r'||i, 0, 0, 0, 0, 'p' FROM n", cfg.rows);
         exec_(s, sql);
-        if (!getenv("MW_BENCH_CT_UNTRACKED") && exec_(s, "SELECT cloudsync_init('ct')") != SQLITE_OK) die("cloudsync_init failed");      // (MW_BENCH_CT_UNTRACKED: the same table, no sqlite-sync tracking)
-        if (getenv("MW_BENCH_TRACK_BK") && exec_(s, "SELECT cloudsync_init('bk')") != SQLITE_OK) die("cloudsync_init(bk) failed");     // (the bulk table tracked)
-        if (getenv("MW_BENCH_DROP_DBIDX")) exec_(s, "DROP INDEX IF EXISTS ct_cloudsync_db_idx");   // experiment: no hot (db_version) index
     }
     if (cfg.wl == W_LONGREADER) { /* t has cfg.rows rows */ }
     int64_t seed_rows = scalar_(s, "SELECT count(*) FROM tu") + scalar_(s, "SELECT count(*) FROM ti") + scalar_(s, "SELECT count(*) FROM ta");
     ct_rows0 = cfg.tracked ? scalar_(s, "SELECT count(*) FROM ct") : 0;
-    if (cfg.tracked) exec_(s, "SELECT cloudsync_terminate()");
     sqlite3_close(s);
     (void)seed_rows;
     if (cfg.setup_only) { printf("setup done: %s rows=%d\n", path, cfg.rows); return 0; }
@@ -429,7 +422,6 @@ int main (int argc, char **argv) {
         agents[i].id = cfg.agent_base + i;
         agents[i].rng = 0x9E3779B97F4A7C15ull * (uint64_t)(cfg.seed * 1000003 + i + 1);
         { int orc = open_agent(&agents[i]); if (orc != SQLITE_OK) { fprintf(stderr, "agent open rc=%d %s\n", orc, agents[i].db ? sqlite3_errmsg(agents[i].db) : ""); die("agent open"); } }
-        if (cfg.tracked && cfg.mode != M_MW) sqlite3_cloudsync_init(agents[i].db, NULL, NULL);   // (MW lanes get it from the auto-load hook)
     }
     static const char *pragmas[] = { "journal_mode", "synchronous", "page_size", "cache_size", "mmap_size", "locking_mode", "wal_autocheckpoint", "busy_timeout", "auto_vacuum", "temp_store" };
     printf("== mw_bench: mode=%s workload=%s agents=%d threads=%d duration=%ds warmup=%ds seed=%d rows=%d tracked=%d read_pct=%d\n",
@@ -603,7 +595,6 @@ int main (int argc, char **argv) {
     }
 
     for (int i = 0; i < cfg.threads; i++) for (int j = 0; j < th[i].n; j++) {
-        if (cfg.tracked) exec_(th[i].agents[j].db, "SELECT cloudsync_terminate()");
         sqlite3_close(th[i].agents[j].db);
     }
     if (getenv("MW_BENCH_KEEP") && cfg.mode == M_MW) { mw_compact_result cr; memset(&cr, 0, sizeof cr); sqlite3_file_control(th[0].agents[0].db, "main", MW_FCNTL_COMPACT, &cr); }   // (inspect the database afterwards: the file holds the final state)

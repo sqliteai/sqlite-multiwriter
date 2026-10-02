@@ -225,7 +225,7 @@ static void ops_drop_cols (void *st, uint32_t tbl, const void *pk, size_t pklen)
 static void ops_zero_cols (void *st, uint32_t tbl, const void *pk, size_t pklen, int64_t dv) {
     (void)dv;
     orow *r = ovl_row(st, tbl, pk, pklen, true); if (!r) return;
-    for (int i = 0; i < r->n; i++) if (r->c[i].col != SEN) r->c[i].cv = 0;
+    for (int i = 0; i < r->n; i++) if (r->c[i].col != SEN) { r->c[i].cv = 0; r->c[i].dv = OV_CHG; }         // (version 0 and the db_version of this commit)
     r->flags |= F_ZERO;
 }
 static bool ops_row_known (void *st, uint32_t tbl, const void *pk, size_t pklen) { orow *r = ovl_row(st, tbl, pk, pklen, true); return r && r->n > 0; }
@@ -250,34 +250,35 @@ static int r_var (const uint8_t **p, const uint8_t *end, uint64_t *v) {
     return -1;
 }
 
+static bool touched (const orow *r) { if (r->flags) return true; for (int k = 0; k < r->n; k++) if (r->c[k].dv == OV_CHG) return true; return false; }
+
+// The extension of a commit: the sites its cells name, the tables it drops, then the rows it touched with their complete new state (an application of it is idempotent and needs
+// nothing else: not the old state, not the order). The rows come in groups (the buckets of the shared index in multi-process mode; one group here).
 int mw_ovl_encode (mw_ovl *o, uint8_t **ext, uint32_t *len) {
     *ext = NULL; *len = 0;
-    int nrows = 0; for (int i = 0; i < o->n; i++) { orow *r = &o->rows[i]; bool any = r->flags != 0; for (int k = 0; k < r->n && !any; k++) if (r->c[k].dv == OV_CHG) any = true; if (any) nrows++; }
+    int nrows = 0; for (int i = 0; i < o->n; i++) if (touched(&o->rows[i])) nrows++;
     if (!nrows && !o->npurge) return 0;
     wbuf w = {0};
-    uint8_t ver = 0x4d; w_bytes(&w, &ver, 1);
-    // the sites the cells name (the extension carries their ids: a replay must be able to rebuild the ord -> id map)
-    // collect the ords > 0 used by puts (a small set: linear)
-    uint32_t *ords = NULL; int no = 0, cap = 0;
-    for (int i = 0; i < o->n; i++) for (int k = 0; k < o->rows[i].n; k++) {
-        mw_mcell *c = &o->rows[i].c[k]; if (c->dv != OV_CHG || c->site == 0) continue;
-        int f = 0; for (int q = 0; q < no; q++) if (ords[q] == c->site) { f = 1; break; }
-        if (!f) { if (no == cap) { cap = cap ? cap * 2 : 8; ords = realloc(ords, (size_t)cap * sizeof *ords); if (!ords) { free(w.p); return -1; } } ords[no++] = c->site; }
-    }
+    uint8_t ver = EXT_VERSION; w_bytes(&w, &ver, 1);
+    uint32_t *ords = NULL; int no = 0, cap = 0;                                       // the ords > 0 the cells of the touched rows use (a small set: linear)
+    for (int i = 0; i < o->n; i++) { if (!touched(&o->rows[i])) continue; for (int k = 0; k < o->rows[i].n; k++) {
+        uint32_t site = o->rows[i].c[k].site; if (site == 0) continue;
+        int f = 0; for (int q = 0; q < no; q++) if (ords[q] == site) { f = 1; break; }
+        if (!f) { if (no == cap) { cap = cap ? cap * 2 : 8; uint32_t *nw = realloc(ords, (size_t)cap * sizeof *ords); if (!nw) { free(ords); free(w.p); return -1; } ords = nw; } ords[no++] = site; }
+    } }
     w_var(&w, (uint64_t)no);
     for (int q = 0; q < no; q++) { uint8_t id[16]; if (!mw_meta_site_id(o->m, ords[q], id)) memset(id, 0, 16); w_var(&w, ords[q]); w_bytes(&w, id, 16); }
     free(ords);
     w_var(&w, (uint64_t)o->npurge);                                       // (dropped tables first: a table dropped and created again in one commit starts empty)
     for (int i = 0; i < o->npurge; i++) w_var(&w, o->purge[i]);
-    w_var(&w, (uint64_t)nrows);
-    for (int i = 0; i < o->n; i++) {
-        orow *r = &o->rows[i]; int np = 0;
-        for (int k = 0; k < r->n; k++) if (r->c[k].dv == OV_CHG) np++;
-        if (!np && !r->flags) continue;
-        w_var(&w, r->tbl); w_var(&w, r->pklen); w_bytes(&w, r->pk, r->pklen);
-        uint8_t fl = r->flags; w_bytes(&w, &fl, 1);
-        w_var(&w, (uint64_t)np);
-        for (int k = 0; k < r->n; k++) { mw_mcell *c = &r->c[k]; if (c->dv != OV_CHG) continue; w_var(&w, c->col); w_var(&w, (uint64_t)c->cv); w_var(&w, c->site); w_var(&w, c->seq); }
+    w_var(&w, nrows ? 1 : 0);                                             // one group
+    if (nrows) {
+        w_var(&w, 0xFFFFFFFFu); w_var(&w, (uint64_t)nrows);
+        for (int i = 0; i < o->n; i++) {
+            orow *r = &o->rows[i]; if (!touched(r)) continue;
+            w_var(&w, r->tbl); w_var(&w, r->pklen); w_bytes(&w, r->pk, r->pklen); w_var(&w, (uint64_t)r->n);
+            for (int k = 0; k < r->n; k++) { mw_mcell *c = &r->c[k]; w_var(&w, c->col); w_var(&w, (uint64_t)c->cv); w_var(&w, c->dv == OV_CHG ? 0 : (uint64_t)c->dv + 1); w_var(&w, c->site); w_var(&w, c->seq); }
+        }
     }
     if (w.bad) { free(w.p); return -1; }
     *ext = w.p; *len = (uint32_t)w.n;
@@ -285,40 +286,25 @@ int mw_ovl_encode (mw_ovl *o, uint8_t **ext, uint32_t *len) {
 }
 
 // ---- applying ----
-typedef struct { uint32_t col, site, seq; int64_t cv; } put;
-
-static int apply_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pklen, uint8_t flags, const put *puts, int np, uint64_t epoch) {
+// the row's state becomes `c` (n cells; those with dv == OV_CHG are of this commit: epoch)
+static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pklen, const mw_mcell *c, int n, uint64_t epoch) {
     uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
-    {
-        pthread_mutex_lock(&s->mu);
-        mentry *e = find(s, h, tbl, pk, pklen);
-        if (!e) {                                                      // (evicted since the transaction read it, or a replay): bring the file's state in first
-            pthread_mutex_unlock(&s->mu);
-            mw_mcell *fc = NULL; int fn = 0;
-            if (file_load(m, tbl, pk, pklen, &fc, &fn) != 0) return -1;
-            pthread_mutex_lock(&s->mu);
-            if (!find(s, h, tbl, pk, pklen)) { mentry *ne = entry_new(h, tbl, pk, pklen, fc, fn); if (!ne) { free(fc); pthread_mutex_unlock(&s->mu); return -1; } insert_entry(m, s, ne); }
-            free(fc);
-            e = find(s, h, tbl, pk, pklen);
-        }
-        size_t before = entry_bytes(e);
-        if (flags & F_DROP) { int k = 0; for (int i = 0; i < e->n; i++) if (e->cells[i].col == SEN) e->cells[k++] = e->cells[i]; e->n = k; e->drop_ver = epoch; }
-        if (flags & F_ZERO) for (int i = 0; i < e->n; i++) if (e->cells[i].col != SEN) { e->cells[i].cv = 0; e->cells[i].dv = (int64_t)epoch; }
-        for (int q = 0; q < np; q++) {
-            mw_mcell *c = NULL; for (int i = 0; i < e->n; i++) if (e->cells[i].col == puts[q].col) { c = &e->cells[i]; break; }
-            if (!c) {
-                if (e->n == e->cap) { int nc = e->cap ? e->cap * 2 : 4; mw_mcell *nm = realloc(e->cells, (size_t)nc * sizeof *nm); if (!nm) { pthread_mutex_unlock(&s->mu); return -1; } e->cells = nm; e->cap = nc; }
-                c = &e->cells[e->n++];
-            }
-            *c = (mw_mcell){ puts[q].cv, (int64_t)epoch, puts[q].col, puts[q].site, puts[q].seq };
-        }
-        e->ver = epoch;
-        if (!e->in_dirty) { e->in_dirty = true; e->dnext = s->dirty; s->dirty = e; atomic_fetch_add(&m->ndirty, 1); }
-        size_t after = entry_bytes(e); s->bytes += after - before; atomic_fetch_add(&m->bytes, after - before);
-        evict(m, s);
-        pthread_mutex_unlock(&s->mu);
-        return 0;
-    }
+    pthread_mutex_lock(&s->mu);
+    mentry *e = find(s, h, tbl, pk, pklen);
+    if (!e) { e = entry_new(h, tbl, pk, pklen, NULL, 0); if (!e) { pthread_mutex_unlock(&s->mu); return -1; } insert_entry(m, s, e); }
+    size_t before = entry_bytes(e);
+    bool removed = false;                                              // a cell of the old state is not in the new one: the file has to forget it
+    for (int i = 0; i < e->n && !removed; i++) { bool f = false; for (int k = 0; k < n; k++) if (c[k].col == e->cells[i].col) { f = true; break; } if (!f) removed = true; }
+    if (n > e->cap) { mw_mcell *nm = realloc(e->cells, (size_t)n * sizeof *nm); if (!nm) { pthread_mutex_unlock(&s->mu); return -1; } e->cells = nm; e->cap = n; }
+    for (int k = 0; k < n; k++) { e->cells[k] = c[k]; if (c[k].dv == OV_CHG) e->cells[k].dv = (int64_t)epoch; }
+    e->n = n;
+    if (removed) e->drop_ver = epoch;
+    e->ver = epoch;
+    if (!e->in_dirty) { e->in_dirty = true; e->dnext = s->dirty; s->dirty = e; atomic_fetch_add(&m->ndirty, 1); }
+    size_t after = entry_bytes(e); s->bytes += after - before; atomic_fetch_add(&m->bytes, after - before);
+    evict(m, s);
+    pthread_mutex_unlock(&s->mu);
+    return 0;
 }
 
 static void purge_table (mw_meta *m, uint32_t tbl, uint64_t epoch) {
@@ -337,41 +323,48 @@ static void purge_table (mw_meta *m, uint32_t tbl, uint64_t epoch) {
 }
 
 int mw_meta_apply (mw_meta *m, mw_ovl *o, uint64_t epoch) {
-    put *puts = NULL; int pcap = 0, rc = 0;
     for (int i = 0; i < o->npurge; i++) purge_table(m, o->purge[i], epoch);
-    for (int i = 0; i < o->n && rc == 0; i++) {
-        orow *r = &o->rows[i]; int np = 0;
-        for (int k = 0; k < r->n; k++) if (r->c[k].dv == OV_CHG) { if (np == pcap) { pcap = pcap ? pcap * 2 : 16; puts = realloc(puts, (size_t)pcap * sizeof *puts); if (!puts) return -1; } puts[np++] = (put){ r->c[k].col, r->c[k].site, r->c[k].seq, r->c[k].cv }; }
-        if (!np && !r->flags) continue;
-        rc = apply_row(m, r->tbl, r->pk, r->pklen, r->flags, puts, np, epoch);
-    }
-    free(puts);
-    return rc;
+    for (int i = 0; i < o->n; i++) { orow *r = &o->rows[i]; if (!touched(r)) continue; if (install_row(m, r->tbl, r->pk, r->pklen, r->c, r->n, epoch) != 0) return -1; }
+    return 0;
 }
 
-int mw_meta_replay (mw_meta *m, uint64_t epoch, const uint8_t *ext, uint32_t len) {
+// Walks an extension: sites, purges, rows (with the cells they carry, dv resolved to `epoch`). Any callback may be NULL.
+int mw_ext_walk (const uint8_t *ext, uint32_t len, uint64_t epoch, mw_ext_row_fn row_cb, mw_ext_purge_fn purge_cb, mw_ext_site_fn site_cb, void *arg) {
     const uint8_t *p = ext, *end = ext + len; uint64_t v;
-    if (len < 1 || *p++ != 0x4d) return -1;
+    if (len < 1 || *p++ != EXT_VERSION) return -1;
     if (r_var(&p, end, &v)) return -1;
-    for (uint64_t i = 0; i < v; i++) { uint64_t ord; if (r_var(&p, end, &ord) || p + 16 > end) return -1; mw_meta_site_install(m, (uint32_t)ord, p); p += 16; }
+    for (uint64_t i = 0; i < v; i++) { uint64_t ord; if (r_var(&p, end, &ord) || p + 16 > end) return -1; if (site_cb) site_cb(arg, (uint32_t)ord, p); p += 16; }
     uint64_t npg; if (r_var(&p, end, &npg)) return -1;
-    for (uint64_t i = 0; i < npg; i++) { uint64_t t; if (r_var(&p, end, &t)) return -1; purge_table(m, (uint32_t)t, epoch); }
-    uint64_t nrows; if (r_var(&p, end, &nrows)) return -1;
-    put *puts = NULL; int pcap = 0;
-    for (uint64_t i = 0; i < nrows; i++) {
-        uint64_t tbl, pklen, np; if (r_var(&p, end, &tbl) || r_var(&p, end, &pklen) || p + pklen + 1 > end) { free(puts); return -1; }
-        const uint8_t *pk = p; p += pklen; uint8_t fl = *p++;
-        if (r_var(&p, end, &np)) { free(puts); return -1; }
-        if ((int)np > pcap) { pcap = (int)np * 2; puts = realloc(puts, (size_t)pcap * sizeof *puts); if (!puts) return -1; }
-        for (uint64_t k = 0; k < np; k++) {
-            uint64_t col, cv, site, seq;
-            if (r_var(&p, end, &col) || r_var(&p, end, &cv) || r_var(&p, end, &site) || r_var(&p, end, &seq)) { free(puts); return -1; }
-            puts[k] = (put){ (uint32_t)col, (uint32_t)site, (uint32_t)seq, (int64_t)cv };
+    for (uint64_t i = 0; i < npg; i++) { uint64_t t; if (r_var(&p, end, &t)) return -1; if (purge_cb) purge_cb(arg, (uint32_t)t, epoch); }
+    uint64_t ngroups; if (r_var(&p, end, &ngroups)) return -1;
+    mw_mcell *cells = NULL; int ccap = 0;
+    for (uint64_t g = 0; g < ngroups; g++) {
+        uint64_t bucket, nrows; if (r_var(&p, end, &bucket) || r_var(&p, end, &nrows)) { free(cells); return -1; }
+        for (uint64_t i = 0; i < nrows; i++) {
+            uint64_t tbl, pklen, nc; if (r_var(&p, end, &tbl) || r_var(&p, end, &pklen) || p + pklen > end) { free(cells); return -1; }
+            const uint8_t *pk = p; p += pklen;
+            if (r_var(&p, end, &nc) || nc > (1u << 20)) { free(cells); return -1; }
+            if ((int)nc > ccap) { ccap = (int)nc * 2 + 4; mw_mcell *nm = realloc(cells, (size_t)ccap * sizeof *nm); if (!nm) { free(cells); return -1; } cells = nm; }
+            for (uint64_t k = 0; k < nc; k++) {
+                uint64_t col, cv, dvp, site, seq;
+                if (r_var(&p, end, &col) || r_var(&p, end, &cv) || r_var(&p, end, &dvp) || r_var(&p, end, &site) || r_var(&p, end, &seq)) { free(cells); return -1; }
+                cells[k] = (mw_mcell){ (int64_t)cv, dvp ? (int64_t)(dvp - 1) : (int64_t)epoch, (uint32_t)col, (uint32_t)site, (uint32_t)seq };
+            }
+            if (row_cb && row_cb(arg, (uint32_t)bucket, (uint32_t)tbl, pk, (size_t)pklen, cells, (int)nc) != 0) { free(cells); return -1; }
         }
-        if (apply_row(m, (uint32_t)tbl, pk, (size_t)pklen, fl, puts, (int)np, epoch) != 0) { free(puts); return -1; }
     }
-    free(puts);
+    free(cells);
     return 0;
+}
+
+typedef struct { mw_meta *m; uint64_t epoch; } rctx;
+static int replay_row (void *arg, uint32_t bucket, uint32_t tbl, const uint8_t *pk, size_t pklen, const mw_mcell *c, int n) { (void)bucket; rctx *r = arg; return install_row(r->m, tbl, pk, pklen, c, n, r->epoch); }
+static void replay_purge (void *arg, uint32_t tbl, uint64_t epoch) { purge_table(((rctx *)arg)->m, tbl, epoch); }
+static void replay_site (void *arg, uint32_t ord, const uint8_t id[16]) { mw_meta_site_install(((rctx *)arg)->m, ord, id); }
+
+int mw_meta_replay (mw_meta *m, uint64_t epoch, const uint8_t *ext, uint32_t len) {
+    rctx r = { m, epoch };
+    return mw_ext_walk(ext, len, epoch, replay_row, replay_purge, replay_site, &r);
 }
 
 void mw_meta_stats (mw_meta *m, uint64_t *rows, uint64_t *bytes, uint64_t *hits, uint64_t *misses) {

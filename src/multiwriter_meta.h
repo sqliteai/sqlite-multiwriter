@@ -38,6 +38,12 @@ int     mw_ovl_encode (mw_ovl *o, uint8_t **ext, uint32_t *len);            // t
 int mw_meta_apply (mw_meta *m, mw_ovl *o, uint64_t epoch);                  // the commit `epoch` made by this process
 int mw_meta_replay (mw_meta *m, uint64_t epoch, const uint8_t *ext, uint32_t len);   // a commit seen in the log (recovery, another process): the same effect from the bytes
 
+// ---- the extension, as a stream ----
+typedef int  (*mw_ext_row_fn) (void *arg, uint32_t bucket, uint32_t tbl, const uint8_t *pk, size_t pklen, const mw_mcell *cells, int n);   // non-zero stops the walk
+typedef void (*mw_ext_purge_fn) (void *arg, uint32_t tbl, uint64_t epoch);
+typedef void (*mw_ext_site_fn) (void *arg, uint32_t ord, const uint8_t id[16]);
+int mw_ext_walk (const uint8_t *ext, uint32_t len, uint64_t epoch, mw_ext_row_fn row_cb, mw_ext_purge_fn purge_cb, mw_ext_site_fn site_cb, void *arg);
+
 // ---- reading ----
 int mw_meta_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n);   // a copy of the row's cells (free() it); n = 0 for an unknown row
 uint32_t mw_meta_site_ord (mw_meta *m, const uint8_t id[16]);

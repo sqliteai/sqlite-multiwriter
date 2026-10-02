@@ -244,6 +244,7 @@ int mw_meta_flush (mw_meta *m) {
     return rc;
 }
 
+uint64_t mw_meta_epoch (mw_meta *m) { return atomic_load(&m->db->epoch); }
 uint64_t mw_meta_dirty (mw_meta *m) { return atomic_load(&m->ndirty); }
 uint64_t mw_meta_flushed (mw_meta *m) { return atomic_load(&m->flushed); }
 uint64_t mw_meta_safe_epoch (mw_meta *m) { return atomic_load(&m->ndirty) == 0 ? UINT64_MAX : atomic_load(&m->flushed); }

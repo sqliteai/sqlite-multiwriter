@@ -11,7 +11,7 @@ SRC_DIR := src
 BUILD := build
 DIST := dist
 
-CFLAGS += -O2 -g -Wall -Wno-unused-function -I$(SRC_DIR) -I$(SRC_DIR)/crdt -I$(SQLITE_DIR) -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS
+CFLAGS += -O2 -g -Wall -Wno-unused-function -I$(SRC_DIR) -I$(SRC_DIR)/crdt -I$(SQLITE_DIR) -Ideps/sqlite-sync/src -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS
 SQLITE_FLAGS := -DSQLITE_EXTRA_INIT=mw_extra_init -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DSQLITE_CORE
 LDFLAGS += -lpthread -lm
 ifeq ($(shell uname -s),Darwin)
@@ -23,7 +23,8 @@ CRDT_SRC := $(wildcard $(SRC_DIR)/crdt/*.c)
 CRDT_OBJ := $(patsubst $(SRC_DIR)/crdt/%.c,$(BUILD)/crdt_%.o,$(CRDT_SRC))
 ENGINE_OBJ := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(ENGINE_SRC))
 HEADERS := $(wildcard $(SRC_DIR)/*.h) $(wildcard $(SRC_DIR)/crdt/*.h)
-LIB_OBJ := $(ENGINE_OBJ) $(CRDT_OBJ) $(BUILD)/sqlite3.o
+LZ4_OBJ := $(BUILD)/lz4.o                      # (the payload container of sqlite-sync compresses with LZ4: the submodule's own copy)
+LIB_OBJ := $(ENGINE_OBJ) $(CRDT_OBJ) $(LZ4_OBJ) $(BUILD)/sqlite3.o
 
 TEST_SRC := $(wildcard test/mw_*.c)
 TEST_BIN := $(patsubst test/%.c,$(DIST)/%,$(TEST_SRC))
@@ -34,6 +35,9 @@ all: $(TEST_BIN)
 $(BUILD)/sqlite3.o: $(SQLITE_DIR)/sqlite3.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(SQLITE_FLAGS) -w -c $< -o $@
+$(BUILD)/lz4.o: deps/sqlite-sync/src/lz4.c
+	@mkdir -p $(BUILD)
+	$(CC) -O2 -w -c $< -o $@
 $(BUILD)/crdt_%.o: $(SRC_DIR)/crdt/%.c $(wildcard $(SRC_DIR)/crdt/*.h)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -64,7 +68,7 @@ clean:
 
 # ---- the oracle: sqlite-sync itself (the submodule), linked into the differential tests (test/oracle_*.c) -----------------------------------------------------
 SS := deps/sqlite-sync
-ORACLE_SRC := $(SS)/src/cloudsync.c $(SS)/src/dbutils.c $(SS)/src/lz4.c $(SS)/src/pk.c $(SS)/src/utils.c $(SS)/src/block.c $(wildcard $(SS)/src/network/*.c) \
+ORACLE_SRC := $(SS)/src/cloudsync.c $(SS)/src/dbutils.c $(SS)/src/pk.c $(SS)/src/utils.c $(SS)/src/block.c $(wildcard $(SS)/src/network/*.c) \
               $(SS)/src/sqlite/cloudsync_changes_sqlite.c $(SS)/src/sqlite/cloudsync_sqlite.c $(SS)/src/sqlite/database_sqlite.c $(SS)/src/sqlite/sql_sqlite.c \
               $(SS)/modules/fractional-indexing/fractional_indexing.c
 ORACLE_OBJ := $(patsubst %.c,$(BUILD)/oracle/%.o,$(notdir $(ORACLE_SRC)))

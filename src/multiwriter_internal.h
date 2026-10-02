@@ -215,6 +215,7 @@ struct mw_lane {
     const uint8_t *const *cdc_over;              // while the catalog of a schema-changing commit is read: the pages the commit wrote (they win over the snapshot's)
     const char *const *cdc_skip; int cdc_nskip;  // tables whose rows are not diffed in this commit (reshaped by DDL)
     const char *const *cdc_skip_old; int cdc_nskip_old;   // tables whose rows are not diffed on the old side only (dropped and created again: the old rows are gone, the new ones are inserts)
+    struct mw_ovl *cdc_decl;                     // set by the sync layer around the transaction that applies remote changes: its metadata is declared, not derived
     struct mw_ovl *cdc_ovl;                      // the metadata delta of the commit being published (multiwriter_meta.c)
     uint8_t *cdc_ext; uint32_t cdc_ext_len;      // the commit's change-capture extension, written in the log record next to the pages
     int64_t     min_reserved;   // lowest db_version reserved by the current transaction, 0 = none (protected by db->mu)

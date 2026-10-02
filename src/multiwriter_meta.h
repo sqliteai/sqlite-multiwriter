@@ -53,6 +53,7 @@ uint64_t mw_meta_safe_epoch (mw_meta *m);                                       
 void     mw_meta_quiesce (mw_meta *m);                                            // stop the flusher, flush, close the store's connections
 int      mw_meta_schema (sqlite3 *conn);                                          // create the file tables if they are missing
 uint64_t mw_meta_flushed (mw_meta *m);
-uint64_t mw_meta_dirty (mw_meta *m);                                              // rows changed since the last flush
+uint64_t mw_meta_dirty (mw_meta *m);
+uint64_t mw_meta_epoch (mw_meta *m);                                              // the last commit made visible                                              // rows changed since the last flush
 
 #endif

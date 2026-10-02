@@ -19,6 +19,10 @@ typedef struct { crdt_type type; int64_t i; double d; const void *p; size_t n; }
 
 // ---- primary keys: the byte format of sqlite-sync's cloudsync_pk_encode (one count byte, then per value a type byte with the length of its length/integer field) ----
 size_t crdt_pk_encode (const crdt_value *v, int n, uint8_t *out, size_t cap);        // bytes written, or the bytes needed if out == NULL / too small (> cap); 0 on error (more than 255 values)
+int    crdt_pk_decode_n (const uint8_t *buf, size_t len, crdt_value *out, int max, size_t *used);   // the same, and the bytes the tuple took (a payload is a sequence of tuples)
+// payload tuples: the same values without the count byte (the header of the payload says how many there are)
+size_t crdt_tuple_encode (const crdt_value *v, int n, uint8_t *out, size_t cap);
+int    crdt_tuple_decode (const uint8_t *buf, size_t len, int count, crdt_value *out, size_t *used);
 int    crdt_pk_decode (const uint8_t *buf, size_t len, crdt_value *out, int max);    // number of values (<= max), -1 if malformed; TEXT/BLOB values point into buf
 
 

@@ -8,6 +8,7 @@
 //    TEXT / BLOB: types 3 / 4, the length in 1..8 big-endian bytes, the data; NULL: type 5.
 //
 #include <string.h>
+#include <stdlib.h>
 #include "crdt.h"
 
 enum { T_NEG_INT = 0, T_MAX_NEG_INT = 6, T_NEG_FLOAT = 7 };
@@ -60,10 +61,22 @@ size_t crdt_pk_encode (const crdt_value *v, int n, uint8_t *out, size_t cap) {
     return o;
 }
 
-int crdt_pk_decode (const uint8_t *b, size_t len, crdt_value *out, int max) {
+static int decode_values (const uint8_t *b, size_t len, int count, size_t o, crdt_value *out, size_t *used);
+int crdt_pk_decode_n (const uint8_t *b, size_t len, crdt_value *out, int max, size_t *used) {
     if (len < 1) return -1;
-    int count = b[0]; size_t o = 1;
+    int count = b[0];
     if (count > max) return -1;
+    return decode_values(b, len, count, 1, out, used);
+}
+int crdt_tuple_decode (const uint8_t *b, size_t len, int count, crdt_value *out, size_t *used) { return decode_values(b, len, count, 0, out, used); }
+size_t crdt_tuple_encode (const crdt_value *v, int n, uint8_t *out, size_t cap) {
+    size_t need = crdt_pk_encode(v, n, NULL, 0); if (!need) return 0;
+    if (!out || cap < need - 1) return need - 1;
+    uint8_t *t = malloc(need); if (!t) return 0;
+    crdt_pk_encode(v, n, t, need); memcpy(out, t + 1, need - 1); free(t);
+    return need - 1;
+}
+static int decode_values (const uint8_t *b, size_t len, int count, size_t o, crdt_value *out, size_t *used) {
     for (int i = 0; i < count; i++) {
         if (o >= len) return -1;
         uint8_t tb = b[o++]; unsigned type = tb & 7; size_t nb = (tb >> 3) & 0x1F;
@@ -90,5 +103,8 @@ int crdt_pk_decode (const uint8_t *b, size_t len, crdt_value *out, int max) {
             default: return -1;
         }
     }
+    if (used) *used = o;
     return count;
 }
+
+int crdt_pk_decode (const uint8_t *b, size_t len, crdt_value *out, int max) { return crdt_pk_decode_n(b, len, out, max, NULL); }

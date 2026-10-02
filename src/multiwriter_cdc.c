@@ -163,6 +163,7 @@ static mw_cat *catalog_for (mw_cdc *c, mw_lane *lane) {
 }
 
 static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int npurge);
+static void ensure_ready (mw_db *db, mw_cdc *c);
 
 // ---- DDL in the commit ----
 typedef struct { const char **skip; int nskip; const char **skip_old; int nskip_old; uint32_t *purge; int npurge; } ddl_plan;
@@ -202,7 +203,11 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
     atomic_fetch_add(&c->commits, 1); atomic_fetch_add(&c->changes, (uint64_t)lane->cdc_res.n);
     for (int i = 0; i < lane->cdc_res.n; i++) if (!lane->cdc_res.chg[i].tab) atomic_fetch_add(&c->unowned, 1);
     if (c->sink) c->sink(c->sink_arg, lane->cdc_res.chg, lane->cdc_res.n, &lane->cdc_res.info);
-    build_delta(lane, c, plan.purge, plan.npurge);
+    if (lane->cdc_decl) {                                                      // a merge of remote changes: the metadata is the one the merge produced
+        free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
+        ensure_ready(lane->db, c);
+        if (mw_ovl_encode(lane->cdc_decl, &lane->cdc_ext, &lane->cdc_ext_len) != 0) { lane->cdc_ext = NULL; lane->cdc_ext_len = 0; }
+    } else build_delta(lane, c, plan.purge, plan.npurge);
     free(plan.skip); free(plan.skip_old); free(plan.purge);
     // the rows point into the catalog they were decoded with: it stays alive until the apply step of the same commit
     if (newcat) { mw_cat_free(cat); lane->cdc_cat = newcat; } else lane->cdc_cat = cat;
@@ -255,7 +260,8 @@ static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int np
 
 void mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch) {
     mw_cdc *c = db->cdc;
-    if (lane->cdc_ovl && lane->cdc_ext_len) { mw_meta_apply(c->meta, lane->cdc_ovl, epoch); if (mw_meta_dirty(c->meta) >= 2048) mw_meta_kick(c->meta); }
+    mw_ovl *act = lane->cdc_decl ? lane->cdc_decl : lane->cdc_ovl;
+    if (act && lane->cdc_ext_len) { mw_meta_apply(c->meta, act, epoch); if (mw_meta_dirty(c->meta) >= 2048) mw_meta_kick(c->meta); }
     if (lane->cdc_ovl) mw_ovl_clear(lane->cdc_ovl);
     free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
     mw_cat_free(lane->cdc_cat); lane->cdc_cat = NULL;

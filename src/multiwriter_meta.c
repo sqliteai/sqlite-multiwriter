@@ -10,16 +10,19 @@
 #include <unistd.h>
 #include <stdatomic.h>
 #include "multiwriter_meta_priv.h"
+#include "multiwriter_internal.h"
 
 typedef struct { mw_mcell *c; int n, cap; } cellvec;
 typedef struct {
-    uint32_t tbl; uint8_t *pk; uint32_t pklen; uint8_t flags; mw_mcell *c; int n, cap;
+    uint32_t tbl; uint8_t *pk; uint32_t pklen; uint8_t flags; mw_mcell *c; int n, cap; int bk;      // bk: index in the overlay's buckets (shared mode), -1 otherwise
 } orow;
+typedef struct { uint32_t id; uint64_t seen; mm_group g; } obk;      // a bucket as the transaction read it: its head epoch and the rows it held
 struct mw_ovl {
     mw_meta *m; orow *rows; int n, cap; int *hash; int hcap;
     mw_value_fn vfn; void *varg;
     uint32_t *purge; int npurge, cappurge;
-    uint32_t new_sites_lo;                                       // ords >= this are not in the file yet: the extension names them
+    obk *bk; int nbk, capbk; int *bkh; int bkhcap;               // the buckets the transaction read (hash: bucket id -> index)
+    int ng; uint32_t *gbucket, *goff; uint64_t *gseen;           // after an encode: the groups of the extension (bucket, offset of the group in the extension, head epoch the state was read at)
 };
 
 uint64_t mw_meta_hash (uint32_t tbl, const void *pk, size_t n) {
@@ -37,7 +40,7 @@ uint64_t mw_meta_hash (uint32_t tbl, const void *pk, size_t n) {
 mw_meta *mw_meta_new (struct mw_db *db) {
     mw_meta *m = calloc(1, sizeof *m);
     if (!m) return NULL;
-    m->db = db; m->cap_rows = 1u << 20;
+    m->db = db; m->shared = db->shared; m->cap_rows = 1u << 20;
     const char *e = getenv("MW_META_CACHE_ROWS"); if (e && atol(e) > 0) m->cap_rows = (size_t)atol(e);
     for (int i = 0; i < STRIPES; i++) {
         pthread_mutex_init(&m->st[i].mu, NULL);
@@ -48,7 +51,7 @@ mw_meta *mw_meta_new (struct mw_db *db) {
     for (int i = 0; i < MW_RDN; i++) pthread_mutex_init(&m->rdmu[i], NULL);
     m->capsites = 16; m->sites = calloc(m->capsites, 16); m->nsites = 1;
     if (!m->sites) { mw_meta_free(m); return NULL; }
-    arc4random_buf(m->sites[0], 16);                             // this database's own id: replaced by the one in the file when it has one
+    if (!m->shared) arc4random_buf(m->sites[0], 16);             // this database's own id: replaced by the one in the file when it has one (shared mode: it is in the shared header)
     return m;
 }
 
@@ -132,10 +135,24 @@ static int load_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_
     return 0;
 }
 
-int mw_meta_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n) { if (!atomic_load(&m->ready)) mw_meta_ready(m); return load_row(m, tbl, pk, pklen, cells, n); }
+int mw_meta_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n) {
+    if (m->shared) {
+        mw_meta_ready(m);
+        mm_group g; mm_head(m, mw_bucket_of(tbl, pk, pklen), &g);
+        for (int q = 0; q < g.n; q++) if (g.rows[q].tbl == tbl && g.rows[q].pklen == pklen && !memcmp(g.rows[q].pk, pk, pklen)) {
+            *n = g.rows[q].n; *cells = malloc((size_t)(*n ? *n : 1) * sizeof(mw_mcell)); if (!*cells) { mm_group_free(&g); return -1; }
+            memcpy(*cells, g.rows[q].c, (size_t)*n * sizeof(mw_mcell)); mm_group_free(&g); return 0;
+        }
+        mm_group_free(&g);
+        return file_load(m, tbl, pk, pklen, cells, n);
+    }
+    if (!atomic_load(&m->ready)) mw_meta_ready(m);
+    return load_row(m, tbl, pk, pklen, cells, n);
+}
 
 // ---- sites ----
 uint32_t mw_meta_site_ord (mw_meta *m, const uint8_t id[16]) {
+    if (m->shared) return mm_site_ord(m, id);
     pthread_mutex_lock(&m->site_mu);
     uint32_t r = 0;
     for (uint32_t i = 0; i < m->nsites; i++) if (!memcmp(m->sites[i], id, 16)) { r = i; goto out; }
@@ -146,12 +163,14 @@ out:
     return r;
 }
 bool mw_meta_site_id (mw_meta *m, uint32_t ord, uint8_t out[16]) {
+    if (m->shared) return mm_site_id(m, ord, out);
     pthread_mutex_lock(&m->site_mu);
     bool ok = ord < m->nsites; if (ok) memcpy(out, m->sites[ord], 16);
     pthread_mutex_unlock(&m->site_mu);
     return ok;
 }
 void mw_meta_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]) {          // replay: the ord is the one the commit used
+    if (m->shared) { mm_site_install(m, ord, id); return; }
     pthread_mutex_lock(&m->site_mu);
     while (ord >= m->capsites) { uint8_t (*ns)[16] = realloc(m->sites, (size_t)m->capsites * 2 * 16); if (!ns) { pthread_mutex_unlock(&m->site_mu); return; } m->sites = ns; m->capsites *= 2; }
     while (m->nsites <= ord) { memset(m->sites[m->nsites], 0, 16); m->nsites++; }
@@ -163,11 +182,12 @@ void mw_meta_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]) {    
 mw_ovl *mw_ovl_new (mw_meta *m) { mw_ovl *o = calloc(1, sizeof *o); if (o) o->m = m; return o; }
 void mw_ovl_clear (mw_ovl *o) {
     for (int i = 0; i < o->n; i++) { free(o->rows[i].pk); free(o->rows[i].c); }
+    for (int i = 0; i < o->nbk; i++) mm_group_free(&o->bk[i].g);
+    o->nbk = 0; o->ng = 0; if (o->bkh) memset(o->bkh, 0xff, (size_t)o->bkhcap * sizeof(int));
     o->npurge = 0;
     o->n = 0; if (o->hash) memset(o->hash, 0xff, (size_t)o->hcap * sizeof(int));
-    o->new_sites_lo = 0;
 }
-void mw_ovl_free (mw_ovl *o) { if (!o) return; mw_ovl_clear(o); free(o->purge); free(o->rows); free(o->hash); free(o); }
+void mw_ovl_free (mw_ovl *o) { if (!o) return; mw_ovl_clear(o); free(o->purge); free(o->bk); free(o->bkh); free(o->gbucket); free(o->goff); free(o->gseen); free(o->rows); free(o->hash); free(o); }
 void mw_ovl_set_value_fn (mw_ovl *o, mw_value_fn fn, void *arg) { o->vfn = fn; o->varg = arg; }
 bool mw_ovl_empty (const mw_ovl *o) { return o->n == 0 && o->npurge == 0; }
 void mw_ovl_purge (mw_ovl *o, uint32_t tbl) {
@@ -194,7 +214,31 @@ static orow *ovl_row (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen, boo
     if (o->n == o->cap) { int nc = o->cap ? o->cap * 2 : 64; orow *nr = realloc(o->rows, (size_t)nc * sizeof *nr); if (!nr) return NULL; o->rows = nr; o->cap = nc; }
     orow *r = &o->rows[o->n]; memset(r, 0, sizeof *r);
     r->tbl = tbl; r->pklen = (uint32_t)pklen; r->pk = malloc(pklen ? pklen : 1); if (!r->pk) return NULL; memcpy(r->pk, pk, pklen);
-    if (load_row(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) { free(r->pk); return NULL; }
+    r->bk = -1;
+    if (o->m->shared) {                                                    // shared mode: the row is in its bucket's newest state, or in the file
+        uint32_t b = mw_bucket_of(tbl, pk, pklen); int bi = -1;
+        if (o->bkhcap == 0 || (o->nbk + 1) * 2 > o->bkhcap) {                // (bucket id -> index in o->bk, open addressing)
+            int nc = o->bkhcap ? o->bkhcap * 2 : 64; int *nh = malloc((size_t)nc * sizeof(int)); if (!nh) { free(r->pk); return NULL; }
+            memset(nh, 0xff, (size_t)nc * sizeof(int));
+            for (int q = 0; q < o->nbk; q++) { size_t h = (size_t)(o->bk[q].id * 2654435761u) & (size_t)(nc - 1); while (nh[h] >= 0) h = (h + 1) & (size_t)(nc - 1); nh[h] = q; }
+            free(o->bkh); o->bkh = nh; o->bkhcap = nc;
+        }
+        size_t hb = (size_t)(b * 2654435761u) & (size_t)(o->bkhcap - 1);
+        while (o->bkh[hb] >= 0) { if (o->bk[o->bkh[hb]].id == b) { bi = o->bkh[hb]; break; } hb = (hb + 1) & (size_t)(o->bkhcap - 1); }
+        if (bi < 0) {
+            if (o->nbk == o->capbk) { int nc = o->capbk ? o->capbk * 2 : 8; obk *nb = realloc(o->bk, (size_t)nc * sizeof *nb); if (!nb) { free(r->pk); return NULL; } o->bk = nb; o->capbk = nc; }
+            obk *x = &o->bk[o->nbk]; memset(x, 0, sizeof *x); x->id = b;
+            if (mm_head(o->m, b, &x->g) != 0) { free(r->pk); return NULL; }
+            x->seen = x->g.epoch; bi = o->nbk++; o->bkh[hb] = bi;
+        }
+        r->bk = bi;
+        const mm_group *g = &o->bk[bi].g; bool found = false;
+        for (int q = 0; q < g->n && !found; q++) if (g->rows[q].tbl == tbl && g->rows[q].pklen == pklen && !memcmp(g->rows[q].pk, pk, pklen)) {
+            r->n = g->rows[q].n; r->c = malloc((size_t)(r->n ? r->n : 1) * sizeof(mw_mcell)); if (!r->c) { free(r->pk); return NULL; }
+            memcpy(r->c, g->rows[q].c, (size_t)r->n * sizeof(mw_mcell)); found = true;
+        }
+        if (!found && file_load(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) { free(r->pk); return NULL; }
+    } else if (load_row(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) { free(r->pk); return NULL; }
     r->cap = r->n;
     o->hash[j] = o->n++;
     return r;
@@ -253,9 +297,20 @@ static int r_var (const uint8_t **p, const uint8_t *end, uint64_t *v) {
 static bool touched (const orow *r) { if (r->flags) return true; for (int k = 0; k < r->n; k++) if (r->c[k].dv == OV_CHG) return true; return false; }
 
 // The extension of a commit: the sites its cells name, the tables it drops, then the rows it touched with their complete new state (an application of it is idempotent and needs
-// nothing else: not the old state, not the order). The rows come in groups (the buckets of the shared index in multi-process mode; one group here).
+// nothing else: not the old state, not the order). The rows come in groups, each framed by its length: in shared mode a group is one bucket of the shared index with all the rows
+// the bucket holds (the touched ones in their new state, the others as the transaction read them); otherwise there is one group.
+static void put_row (wbuf *w, const uint32_t tbl, const uint8_t *pk, uint32_t pklen, const mw_mcell *c, int n) {
+    w_var(w, tbl); w_var(w, pklen); w_bytes(w, pk, pklen); w_var(w, (uint64_t)n);
+    for (int k = 0; k < n; k++) { w_var(w, c[k].col); w_var(w, (uint64_t)c[k].cv); w_var(w, c[k].dv == OV_CHG ? 0 : (uint64_t)c[k].dv + 1); w_var(w, c[k].site); w_var(w, c[k].seq); }
+}
+static void put_group (wbuf *w, uint32_t bucket, wbuf *body, int nrows) {            // body: the rows; framed as [length][bucket][nrows][rows]
+    wbuf h = {0}; w_var(&h, bucket); w_var(&h, (uint64_t)nrows);
+    w_var(w, h.n + body->n); w_bytes(w, h.p, h.n); w_bytes(w, body->p, body->n);
+    free(h.p);
+}
+
 int mw_ovl_encode (mw_ovl *o, uint8_t **ext, uint32_t *len) {
-    *ext = NULL; *len = 0;
+    *ext = NULL; *len = 0; o->ng = 0;
     int nrows = 0; for (int i = 0; i < o->n; i++) if (touched(&o->rows[i])) nrows++;
     if (!nrows && !o->npurge) return 0;
     wbuf w = {0};
@@ -271,19 +326,49 @@ int mw_ovl_encode (mw_ovl *o, uint8_t **ext, uint32_t *len) {
     free(ords);
     w_var(&w, (uint64_t)o->npurge);                                       // (dropped tables first: a table dropped and created again in one commit starts empty)
     for (int i = 0; i < o->npurge; i++) w_var(&w, o->purge[i]);
-    w_var(&w, nrows ? 1 : 0);                                             // one group
-    if (nrows) {
-        w_var(&w, 0xFFFFFFFFu); w_var(&w, (uint64_t)nrows);
-        for (int i = 0; i < o->n; i++) {
-            orow *r = &o->rows[i]; if (!touched(r)) continue;
-            w_var(&w, r->tbl); w_var(&w, r->pklen); w_bytes(&w, r->pk, r->pklen); w_var(&w, (uint64_t)r->n);
-            for (int k = 0; k < r->n; k++) { mw_mcell *c = &r->c[k]; w_var(&w, c->col); w_var(&w, (uint64_t)c->cv); w_var(&w, c->dv == OV_CHG ? 0 : (uint64_t)c->dv + 1); w_var(&w, c->site); w_var(&w, c->seq); }
+    if (!o->m->shared) {
+        w_var(&w, nrows ? 1 : 0);
+        if (nrows) {
+            wbuf body = {0};
+            for (int i = 0; i < o->n; i++) { orow *r = &o->rows[i]; if (touched(r)) put_row(&body, r->tbl, r->pk, r->pklen, r->c, r->n); }
+            if (body.bad) { free(body.p); free(w.p); return -1; }
+            put_group(&w, 0xFFFFFFFFu, &body, nrows); free(body.p);
         }
+    } else {
+        // the touched rows by bucket (counting sort on the bucket index), so that building the groups is linear in the number of rows
+        int *start = calloc((size_t)o->nbk + 1, sizeof(int)), *ord = malloc((size_t)(nrows ? nrows : 1) * sizeof(int));
+        if (!start || !ord) { free(start); free(ord); free(w.p); return -1; }
+        for (int i = 0; i < o->n; i++) if (touched(&o->rows[i])) start[o->rows[i].bk + 1]++;
+        int ngroups = 0; for (int b = 0; b < o->nbk; b++) { if (start[b + 1]) ngroups++; start[b + 1] += start[b]; }
+        { int *fill = malloc(((size_t)o->nbk + 1) * sizeof(int)); if (!fill) { free(start); free(ord); free(w.p); return -1; } memcpy(fill, start, ((size_t)o->nbk + 1) * sizeof(int));
+          for (int i = 0; i < o->n; i++) if (touched(&o->rows[i])) ord[fill[o->rows[i].bk]++] = i; free(fill); }
+        w_var(&w, (uint64_t)ngroups);
+        if (ngroups) { o->gbucket = realloc(o->gbucket, (size_t)ngroups * 4); o->goff = realloc(o->goff, (size_t)ngroups * 4); o->gseen = realloc(o->gseen, (size_t)ngroups * 8); }
+        for (int b = 0; b < o->nbk; b++) {
+            if (start[b] == start[b + 1]) continue;
+            wbuf body = {0}; int cnt = 0; const mm_group *g = &o->bk[b].g;
+            for (int q = 0; q < g->n; q++) {                                    // the rows the bucket held: the transaction's version of them if it has one
+                const orow *r = NULL;
+                for (int k = start[b]; k < start[b + 1]; k++) { const orow *x = &o->rows[ord[k]]; if (x->tbl == g->rows[q].tbl && x->pklen == g->rows[q].pklen && !memcmp(x->pk, g->rows[q].pk, x->pklen)) { r = x; break; } }
+                if (r) put_row(&body, r->tbl, r->pk, r->pklen, r->c, r->n); else put_row(&body, g->rows[q].tbl, g->rows[q].pk, g->rows[q].pklen, g->rows[q].c, g->rows[q].n);
+                cnt++;
+            }
+            for (int k = start[b]; k < start[b + 1]; k++) {                     // touched rows that were not in the bucket yet
+                const orow *r = &o->rows[ord[k]];
+                bool in = false; for (int q = 0; q < g->n && !in; q++) if (g->rows[q].tbl == r->tbl && g->rows[q].pklen == r->pklen && !memcmp(g->rows[q].pk, r->pk, r->pklen)) in = true;
+                if (!in) { put_row(&body, r->tbl, r->pk, r->pklen, r->c, r->n); cnt++; }
+            }
+            if (body.bad) { free(body.p); free(start); free(ord); free(w.p); return -1; }
+            o->gbucket[o->ng] = o->bk[b].id; o->gseen[o->ng] = o->bk[b].seen; o->goff[o->ng] = (uint32_t)w.n; o->ng++;
+            put_group(&w, o->bk[b].id, &body, cnt); free(body.p);
+        }
+        free(start); free(ord);
     }
     if (w.bad) { free(w.p); return -1; }
     *ext = w.p; *len = (uint32_t)w.n;
     return 0;
 }
+int mw_ovl_groups (const mw_ovl *o, const uint32_t **bucket, const uint32_t **off, const uint64_t **seen) { *bucket = o->gbucket; *off = o->goff; *seen = o->gseen; return o->ng; }
 
 // ---- applying ----
 // the row's state becomes `c` (n cells; those with dv == OV_CHG are of this commit: epoch)
@@ -323,6 +408,7 @@ static void purge_table (mw_meta *m, uint32_t tbl, uint64_t epoch) {
 }
 
 int mw_meta_apply (mw_meta *m, mw_ovl *o, uint64_t epoch) {
+    if (m->shared) return 0;                                           // (the publisher installed the commit's buckets in the shared index)
     for (int i = 0; i < o->npurge; i++) purge_table(m, o->purge[i], epoch);
     for (int i = 0; i < o->n; i++) { orow *r = &o->rows[i]; if (!touched(r)) continue; if (install_row(m, r->tbl, r->pk, r->pklen, r->c, r->n, epoch) != 0) return -1; }
     return 0;
@@ -339,7 +425,9 @@ int mw_ext_walk (const uint8_t *ext, uint32_t len, uint64_t epoch, mw_ext_row_fn
     uint64_t ngroups; if (r_var(&p, end, &ngroups)) return -1;
     mw_mcell *cells = NULL; int ccap = 0;
     for (uint64_t g = 0; g < ngroups; g++) {
-        uint64_t bucket, nrows; if (r_var(&p, end, &bucket) || r_var(&p, end, &nrows)) { free(cells); return -1; }
+        uint64_t glen, bucket, nrows; if (r_var(&p, end, &glen) || glen > (uint64_t)(end - p)) { free(cells); return -1; }
+        if (!row_cb) { p += glen; continue; }
+        if (r_var(&p, end, &bucket) || r_var(&p, end, &nrows)) { free(cells); return -1; }
         for (uint64_t i = 0; i < nrows; i++) {
             uint64_t tbl, pklen, nc; if (r_var(&p, end, &tbl) || r_var(&p, end, &pklen) || p + pklen > end) { free(cells); return -1; }
             const uint8_t *pk = p; p += pklen;
@@ -354,6 +442,33 @@ int mw_ext_walk (const uint8_t *ext, uint32_t len, uint64_t epoch, mw_ext_row_fn
         }
     }
     free(cells);
+    return 0;
+}
+
+int mw_ext_groups (const uint8_t *ext, uint32_t len, mw_ext_group_fn cb, void *arg) {
+    const uint8_t *p = ext, *end = ext + len; uint64_t v;
+    if (len < 1 || *p++ != EXT_VERSION) return -1;
+    if (r_var(&p, end, &v)) return -1;
+    for (uint64_t i = 0; i < v; i++) { uint64_t ord; if (r_var(&p, end, &ord) || p + 16 > end) return -1; p += 16; }
+    uint64_t npg; if (r_var(&p, end, &npg)) return -1;
+    for (uint64_t i = 0; i < npg; i++) { uint64_t t; if (r_var(&p, end, &t)) return -1; }
+    uint64_t ngroups; if (r_var(&p, end, &ngroups)) return -1;
+    for (uint64_t g = 0; g < ngroups; g++) {
+        const uint8_t *start = p; uint64_t glen, bucket; if (r_var(&p, end, &glen) || glen > (uint64_t)(end - p)) return -1;
+        const uint8_t *q = p; if (r_var(&q, end, &bucket)) return -1;
+        if (cb(arg, (uint32_t)bucket, (uint32_t)(start - ext)) != 0) return -1;
+        p += glen;
+    }
+    return 0;
+}
+
+int mw_ext_purges (const uint8_t *ext, uint32_t len, mw_ext_purge_fn cb, uint64_t epoch, void *arg) {
+    const uint8_t *p = ext, *end = ext + len; uint64_t v;
+    if (len < 1 || *p++ != EXT_VERSION) return -1;
+    if (r_var(&p, end, &v)) return -1;
+    for (uint64_t i = 0; i < v; i++) { uint64_t ord; if (r_var(&p, end, &ord) || p + 16 > end) return -1; p += 16; }
+    uint64_t npg; if (r_var(&p, end, &npg)) return -1;
+    for (uint64_t i = 0; i < npg; i++) { uint64_t t; if (r_var(&p, end, &t)) return -1; cb(arg, (uint32_t)t, epoch); }
     return 0;
 }
 

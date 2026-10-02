@@ -10,6 +10,8 @@
 #include "sqlite3.h"
 #include "multiwriter_meta.h"
 
+struct mw_db; struct mw_lane;
+
 #define STRIPES 64
 #define SEN CRDT_COL_SENTINEL
 #define OV_CHG INT64_MIN                 // in an overlay cell: written by this commit (its db_version is the commit's epoch, not known yet)
@@ -29,6 +31,7 @@ typedef struct { pthread_mutex_t mu; mentry **b; size_t nb, n; mentry *dirty; si
 
 struct mw_meta {
     struct mw_db *db;
+    bool shared;                                                 // multi-process shared mode: the state lives in the shared index and the log, not in this table
     stripe st[STRIPES];
     size_t cap_rows;                                            // the cache budget (rows) before clean entries are dropped
     pthread_mutex_t site_mu; uint8_t (*sites)[16]; uint32_t nsites, capsites;     // ord -> site id (0 = this database)
@@ -53,4 +56,25 @@ uint64_t mw_meta_hash (uint32_t tbl, const void *pk, size_t pklen);
 int      mw_metafile_load (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n);       // the row's cells from the file tables (n = 0: none / no tables)
 void     mw_meta_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]);
 void     mw_metafile_free (mw_meta *m);
+void     mw_metafile_load_state (mw_meta *m, uint64_t *F, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]);
 #endif
+
+typedef struct { uint32_t tbl; uint8_t *pk; uint32_t pklen; bool drop; int n; mw_mcell *c; } fitem;       // a row to write to the file tables: its cells (drop: the file's other cells of the row go first)
+
+// ---- the shared-mode backend (multiwriter_mmeta.c) ----
+#define MW_NBUCKETS ((1u << 21) - 1)
+typedef struct { uint32_t tbl; const uint8_t *pk; uint32_t pklen; mw_mcell *c; int n; } mm_row;                 // pk points into the group's bytes
+typedef struct { uint8_t *raw; size_t rawlen; mm_row *rows; int n; uint32_t bucket; uint64_t epoch; } mm_group;     // the newest state of a bucket
+static inline uint32_t mw_bucket_of (uint32_t tbl, const void *pk, size_t pklen) { return 1 + (uint32_t)((mw_meta_hash(tbl, pk, pklen) >> 7) % MW_NBUCKETS); }
+int      mm_head (mw_meta *m, uint32_t bucket, mm_group *g);                       // the head version of a bucket: its rows (n = 0, epoch = 0 when there is none)
+void     mm_group_free (mm_group *g);
+uint32_t mm_site_ord (mw_meta *m, const uint8_t id[16]);
+bool     mm_site_id (mw_meta *m, uint32_t ord, uint8_t out[16]);
+void     mm_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]);
+void     mm_site_install_db (struct mw_db *db, uint32_t ord, const uint8_t id[16]);
+int      mm_validate (struct mw_db *db, struct mw_lane *lane);
+int      mm_install (struct mw_db *db, struct mw_lane *lane, uint64_t epoch, uint64_t ext_loc);
+int      mm_replay (struct mw_db *db, uint64_t epoch, const uint8_t *ext, uint32_t len, uint64_t ext_loc);
+int      mm_ready (mw_meta *m);
+int      mm_flush (mw_meta *m);
+int      mm_collect (mw_meta *m, uint64_t F, uint64_t V, fitem **out, int *n);        // the rows whose newest state is in (F, V]: what the next flush writes

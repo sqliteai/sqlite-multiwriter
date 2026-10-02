@@ -22,6 +22,7 @@
 #include <time.h>
 #include "multiwriter_internal.h"
 #include "multiwriter_seglog.h"
+#include "multiwriter_meta_priv.h"
 
 static uint64_t now_ns (void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 
@@ -69,7 +70,8 @@ bool mw_shared_head_image (mw_db *db, uint32_t pgno, uint8_t *dst, uint64_t *epo
 
 typedef struct { mw_db *db; } replay_ctx;
 
-static int replay_cb (void *ctx, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *locs) {
+static int replay_cb (void *ctx, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *locs, const uint8_t *ext, uint32_t ext_len, uint64_t ext_loc) {
+    if (ext_len && ((replay_ctx *)ctx)->db->rx) { int mrc = mm_replay(((replay_ctx *)ctx)->db, epoch, ext, ext_len, ext_loc); if (mrc != SQLITE_OK) return mrc; }
     mw_db *db = ((replay_ctx *)ctx)->db;
     if (shidx_room(db->ix) < (uint32_t)n + 2) shidx_gc_floor(db->ix, epoch - 1, db->base_epoch);        // (nobody else exists yet)
     int rc = shidx_install(db->ix, epoch, dbsize, n, pgnos, locs);
@@ -89,6 +91,17 @@ int mw_shared_open (mw_db *db) {
     sqlite3_free(ixp);
     if (!db->ix) return SQLITE_CANTOPEN;
     db->store->shared_db = db;
+    if (db->mp_first) atomic_store(&db->shm->cdc_on, db->cdc ? 1u : 0u);
+    else if (atomic_load(&db->shm->cdc_on) && !db->cdc) { int crc = mw_cdc_open(db); if (crc != SQLITE_OK) return crc; }           // the database captures metadata: so does every process
+    else if (db->cdc && !atomic_load(&db->shm->cdc_on)) return SQLITE_MISUSE;                                                   // ... and one that was opened without cannot start to
+    if (db->cdc) {                                                              // the shared index of the CRDT metadata (volatile: rebuilt from the log below), and the owner maps
+        char *rxp = sqlite3_mprintf("%s-mwrow", db->path); if (!rxp) return SQLITE_NOMEM;
+        if (db->mp_first) { shidx_unlink(rxp); int crc = mw_cdc_shared_create(db); if (crc != SQLITE_OK) { sqlite3_free(rxp); return crc; } }
+        shidx_params rp = { 21, 4u << 20, 16, 0 };
+        const char *re = getenv("MW_ROWIDX_ENTRIES"); if (re && atoi(re) > 1000) rp.max_entries = (uint32_t)atoi(re);
+        db->rx = shidx_open(rxp, &rp); sqlite3_free(rxp);
+        if (!db->rx) return SQLITE_CANTOPEN;
+    }
     uint64_t base = 1, last = 1;
     replay_ctx rc_ctx = { db };
     if (db->mp_first) db->base_epoch = 1;
@@ -97,6 +110,7 @@ int mw_shared_open (mw_db *db) {
     if (db->mp_first) {
         db->base_epoch = base;
         if (shidx_committed(db->ix) < last) shidx_publish(db->ix, last);
+        if (db->rx && shidx_committed(db->rx) < last) shidx_publish(db->rx, last);
         atomic_store(&db->epoch, last);                                          // (mw_mp_finish_open copies these into the shared header)
         atomic_store(&db->next_epoch, last);
         atomic_store(&db->shm->base_dbsize, db->store->base_dbsize);
@@ -127,7 +141,8 @@ void mw_shared_close (mw_db *db, bool sole) {
         } else mw_seglog_close(db);
     }
     if (db->ix) { shidx_close(db->ix); db->ix = NULL; }
-    if (ixp) { shidx_unlink(ixp); sqlite3_free(ixp); }
+    if (db->rx) { shidx_close(db->rx); db->rx = NULL; }
+    if (ixp) { shidx_unlink(ixp); sqlite3_free(ixp); char *rxp = sqlite3_mprintf("%s-mwrow", db->path); if (rxp) { shidx_unlink(rxp); sqlite3_free(rxp); } mw_cdc_shared_unlink(db); }
 }
 
 // MARK: - publishing -
@@ -142,6 +157,7 @@ static void shared_gc (mw_db *db) {
     uint64_t busy = atomic_load(&sh->compact_busy_T);
     if (busy && busy < floor) floor = busy;
     shidx_gc_floor(db->ix, floor, atomic_load(&sh->base_epoch));
+    if (db->rx) shidx_gc_floor(db->rx, floor, atomic_load(&sh->meta_flushed));       // (the buckets older than the last flush are in the file)
 }
 
 // One commit, under the publication lock: validate against the index, append to the log, install in the index, publish.
@@ -195,6 +211,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
             uint32_t latest = ((uint32_t)c[0] << 24) | ((uint32_t)c[1] << 16) | ((uint32_t)c[2] << 8) | c[3];
             if (latest != v->cookie) { atomic_fetch_add(&db->n_schema_conflicts, 1); rc = MW_CONFLICT_SCHEMA; }
         }
+        if (rc == SQLITE_OK && db->rx) rc = mm_validate(db, lane);               // the buckets of the metadata this commit writes: unchanged since the transaction read them
         if (rc != SQLITE_OK) { ADOPT_FREE(); return rc; }
     }
 
@@ -204,6 +221,10 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
         if (shidx_room(ix) < (uint32_t)n + 2) { mw_db_compactor_kick(db); ADOPT_FREE(); return SQLITE_FULL; }
     }
 
+    if (db->rx && lane && lane->cdc_ng && shidx_room(db->rx) < (uint32_t)lane->cdc_ng + 2) {            // the metadata index is full: only a flush frees it (the flusher is asked; this commit waits for it a little)
+        for (int w = 0; w < 4000 && shidx_room(db->rx) < (uint32_t)lane->cdc_ng + 2; w++) { shared_gc(db); mw_cdc_kick_flush(db); if (shidx_room(db->rx) >= (uint32_t)lane->cdc_ng + 2) break; struct timespec ts = { 0, 500000 }; nanosleep(&ts, NULL); }
+        if (shidx_room(db->rx) < (uint32_t)lane->cdc_ng + 2) { ADOPT_FREE(); return SQLITE_FULL; }
+    }
     // ---- assign the epoch, append to the log, install, publish ------------------------------------------
     uint64_t epoch = atomic_load_explicit(&sh->committed_epoch, memory_order_acquire) + 1;
     uint32_t last_size = mw_shared_dbsize(db, epoch - 1);
@@ -213,16 +234,23 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     mw_fault_hit(MW_CRASH_BEFORE_LOG);
     uint64_t ta0 = MW_T0();
     uint32_t seg = 0; uint64_t end = 0;
-    rc = mw_seglog_append(db, epoch, new_dbsize, n, pgnos, images, locs, &seg, &end);
+    uint64_t ext_loc = 0;
+    rc = mw_seglog_append(db, epoch, new_dbsize, n, pgnos, images, lane ? lane->cdc_ext : NULL, lane ? lane->cdc_ext_len : 0, locs, &ext_loc, &seg, &end);
     MW_T1(MW_ST_APPEND, ta0);
     if (rc != SQLITE_OK) { if (n > 16) free(locs); ADOPT_FREE(); atomic_store(&db->failed, 1); return rc; }
     if (shidx_install(ix, epoch, new_dbsize, n, pgnos, locs) != 0) { if (n > 16) free(locs); ADOPT_FREE(); atomic_store(&db->failed, 1); return SQLITE_FULL; }
     if (n > 16) free(locs);
+    if (db->cdc && lane) {                                                       // the metadata of the commit: its buckets in the shared index, the owner maps follow the commit's pages
+        mw_cdc_apply_owner(db, lane, pgnos, images, n);
+        if (db->rx) { int mrc = mm_install(db, lane, epoch, ext_loc); if (mrc != SQLITE_OK) { ADOPT_FREE(); atomic_store(&db->failed, 1); return mrc; } }
+    }
     ADOPT_FREE();
     if (lane) { lane->sl_seg = seg; lane->sl_end = end; }
     atomic_store(&db->next_epoch, epoch);
     atomic_store_explicit(&sh->log_pos, MW_LOG_POS(seg, end), memory_order_release);
     shidx_publish(ix, epoch);
+    if (db->rx) shidx_publish(db->rx, epoch);
+    if (db->cdc && lane) mw_cdc_apply_cells(db, lane, epoch);
     atomic_store_explicit(&sh->committed_epoch, epoch, memory_order_release);        // (the record is visible to the other processes before it is durable: as in the other mode, an acknowledged commit is never lost)
     atomic_store(&db->epoch, epoch);
     mw_fault_hit(MW_CRASH_AFTER_LOG);
@@ -305,6 +333,7 @@ int mw_shared_compact (mw_db *db, mw_compact_result *out) {
     T = mw_mp_compaction_target(db);
     uint64_t visible = atomic_load(&sh->committed_epoch);
     if (T > visible) T = visible;
+    if (db->cdc) { uint64_t lim = mw_cdc_safe_epoch(db); if (T > lim) T = lim; }       // (the metadata of the commits above the last flush lives in the log records only)
     base = atomic_load(&sh->base_epoch);
     if (T > base) atomic_store(&sh->compact_busy_T, T);
     mw_mp_unlock(db);

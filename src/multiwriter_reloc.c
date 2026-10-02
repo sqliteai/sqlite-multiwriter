@@ -280,6 +280,7 @@ int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgno
                 v.own_pgnos = own_pg; v.own_epochs = own_ep; v.own_n = nown;    // page 1 and the merged pages were merged against the state at their epochs
                 v.adopt_images = true;                                          // the store keeps our private copies (and frees them on failure)
                 if (rc == SQLITE_OK) {
+                    if (db->cdc) mw_cdc_relocated(lane);
                     rc = mw_db_publish(db, lane, &v, npg, (const uint8_t *const *)nim, n, new_size, cur, sync, out_epoch);
                     made = 0;                                                   // (ownership went to the publisher whatever the outcome)
                     if (rc == SQLITE_OK) { atomic_fetch_add(&db->n_relocations, 1); if (nmerged) atomic_fetch_add(&db->n_merges, (uint64_t)nmerged); }

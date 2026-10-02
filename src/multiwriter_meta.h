@@ -42,6 +42,10 @@ int mw_meta_replay (mw_meta *m, uint64_t epoch, const uint8_t *ext, uint32_t len
 typedef int  (*mw_ext_row_fn) (void *arg, uint32_t bucket, uint32_t tbl, const uint8_t *pk, size_t pklen, const mw_mcell *cells, int n);   // non-zero stops the walk
 typedef void (*mw_ext_purge_fn) (void *arg, uint32_t tbl, uint64_t epoch);
 typedef void (*mw_ext_site_fn) (void *arg, uint32_t ord, const uint8_t id[16]);
+typedef int (*mw_ext_group_fn) (void *arg, uint32_t bucket, uint32_t off);              // off: where the group starts in the extension
+int mw_ext_groups (const uint8_t *ext, uint32_t len, mw_ext_group_fn cb, void *arg);
+int mw_ext_purges (const uint8_t *ext, uint32_t len, mw_ext_purge_fn cb, uint64_t epoch, void *arg);
+int mw_ovl_groups (const mw_ovl *o, const uint32_t **bucket, const uint32_t **off, const uint64_t **seen);   // after mw_ovl_encode in shared mode: the groups (count returned)
 int mw_ext_walk (const uint8_t *ext, uint32_t len, uint64_t epoch, mw_ext_row_fn row_cb, mw_ext_purge_fn purge_cb, mw_ext_site_fn site_cb, void *arg);
 
 // ---- reading ----

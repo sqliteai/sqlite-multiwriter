@@ -92,6 +92,21 @@ typedef struct mw_shm {
     _Atomic uint64_t  compact_req_ns;     // shared mode: a process has claimed the next compaction at this time (0 = none; a claim older than 2 s is void)
     _Atomic uint64_t  compact_end_ns;     // when the last compaction ended (periodic compactions of all processes share one interval)
     _Atomic uint64_t  compact_busy_T;     // a compaction is reading versions <= this: the index GC must not free them (0 = none)
+    // the CRDT metadata in shared mode (multiwriter_mmeta.c)
+#define MW_MAX_SITES 16384
+#define MW_MAX_PURGE 64
+    _Atomic uint64_t  meta_flushed;       // epoch up to which the cells are in the file tables
+    _Atomic uint64_t  meta_dirty;         // row buckets installed since the last flush (approximate)
+    _Atomic uint64_t  own_cookie;         // the owner maps were built for this schema cookie: (1 << 32) | cookie, 0 = not built
+    _Atomic uint32_t  cdc_on;             // the database captures metadata (set by the first opener; every process then does)
+    _Atomic uint32_t  own_ovfl_complete;  // the overflow owner map covers every record with overflow
+    _Atomic uint32_t  meta_state;         // 0 = not loaded from the file, 1 = being loaded, 2 = ready
+    _Atomic int32_t   flush_pid;          // process flushing the metadata (0 = none)
+    _Atomic uint32_t  sites_flushed;      // site ids [0, sites_flushed) are in the file table
+    _Atomic uint32_t  nsites;             // site ids known (ord -> id); ord 0 is this database
+    _Atomic uint32_t  npurge;
+    struct { _Atomic uint32_t tbl; _Atomic uint64_t epoch; } purge[MW_MAX_PURGE];     // dropped tables whose old cells in the file are dead and not yet deleted
+    uint8_t           sites[MW_MAX_SITES][16];
     mw_mp_proc        procs[MW_MP_PROCS];
     mw_mp_slot        slots[MW_MP_SLOTS];
 } mw_shm;
@@ -216,7 +231,9 @@ struct mw_lane {
     const char *const *cdc_skip; int cdc_nskip;  // tables whose rows are not diffed in this commit (reshaped by DDL)
     const char *const *cdc_skip_old; int cdc_nskip_old;   // tables whose rows are not diffed on the old side only (dropped and created again: the old rows are gone, the new ones are inserts)
     struct mw_ovl *cdc_decl;                     // set by the sync layer around the transaction that applies remote changes: its metadata is declared, not derived
-    struct mw_ovl *cdc_ovl;                      // the metadata delta of the commit being published (multiwriter_meta.c)
+    struct mw_ovl *cdc_ovl;
+    int          cdc_ng; uint32_t *cdc_gbucket, *cdc_goff; uint64_t *cdc_gseen;      // the groups of the extension (shared mode): bucket, offset in the extension, the head epoch of the bucket when its state was read
+                         // the metadata delta of the commit being published (multiwriter_meta.c)
     uint8_t *cdc_ext; uint32_t cdc_ext_len;      // the commit's change-capture extension, written in the log record next to the pages
     int64_t     min_reserved;   // lowest db_version reserved by the current transaction, 0 = none (protected by db->mu)
     uint64_t    writer_id;      // unique per connection (lane) in this process; NOT the sqlite-sync site_id
@@ -349,6 +366,7 @@ struct mw_db {
     bool              shared;              // multi-process in shared mode (mw_mp=2): shared version index + segmented log, no private store
     struct mw_seglog *sl;                  // the segmented log (shared mode)
     shidx            *ix;                  // the shared version index (shared mode)
+    shidx            *rx;                  // the shared index of the CRDT metadata (row buckets -> where their newest state is in the log; mw_cdc=1)
     bool              mp_lazy;             // multi-process catch-up installs lazy versions (set once the database is open; MW_MP_LAZY enables, off by default)
     bool              mp_first;            // this process initialised the shared state
     bool              orphaned;            // inherited through fork(): the child must not use (or tear down) the parent's state; it opens its own
@@ -512,6 +530,8 @@ void      mw_mp_ddl_end (mw_db *db);
 bool      mw_mp_ddl_blocked (mw_db *db);               // another live process owns the schema barrier
 void      mw_mp_writing (mw_lane *lane, bool on);
 bool      mw_mp_compaction_lock (mw_db *db);
+bool      mw_mp_meta_lock (mw_db *db, int which, bool wait);     // cross-process byte locks of the metadata store: 0 = sites, 1 = flusher
+void      mw_mp_meta_unlock (mw_db *db, int which);
 void      mw_mp_compaction_unlock (mw_db *db);
 uint64_t  mw_mp_compaction_target (mw_db *db);
 void      mw_mp_reap_dead_slots (mw_db *db);          // frees the registry slots of dead processes (their snapshots no longer hold anything back)
@@ -553,10 +573,14 @@ void     mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs);
 typedef void (*mw_cdc_sink_fn) (void *arg, const mw_chg *chg, int n, const mw_rowdiff_info *info);
 void     mw_cdc_set_sink (mw_db *db, mw_cdc_sink_fn fn, void *arg);
 void     mw_cdc_lane_free (mw_lane *lane);
+void     mw_cdc_relocated (mw_lane *lane);
 void     mw_cdc_apply_owner (mw_db *db, mw_lane *lane, const uint32_t *pgnos, const uint8_t *const *images, int n);
 void     mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch);
 struct mw_meta *mw_cdc_meta (mw_db *db);
 void     mw_cdc_quiesce (mw_db *db);
+void     mw_cdc_kick_flush (mw_db *db);
+int      mw_cdc_shared_create (mw_db *db);
+void     mw_cdc_shared_unlink (mw_db *db);
 uint64_t mw_cdc_safe_epoch (mw_db *db);
 void     mw_cdc_ensure_schema (sqlite3 *conn, mw_db *db);
 bool     mw_rowdiff_enabled (void);

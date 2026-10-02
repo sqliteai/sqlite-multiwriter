@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <strings.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "multiwriter_internal.h"
 #include "multiwriter_meta.h"
 
@@ -39,9 +41,11 @@ static int be16 (const uint8_t *p) { return (p[0] << 8) | p[1]; }
 int mw_cdc_open (mw_db *db) {
     mw_cdc *c = calloc(1, sizeof *c);
     if (!c) return SQLITE_NOMEM;
-    c->owner = mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    c->ovo = mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (c->owner == MAP_FAILED || c->ovo == MAP_FAILED) { free(c); return SQLITE_NOMEM; }
+    if (!db->shared) {                                                       // (shared mode: the maps are a file mapped by every process, attached at the first use)
+        c->owner = mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        c->ovo = mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (c->owner == MAP_FAILED || c->ovo == MAP_FAILED) { free(c); return SQLITE_NOMEM; }
+    }
     pthread_mutex_init(&c->mu, NULL);
     c->meta = mw_meta_new(db);
     if (!c->meta) { free(c); return SQLITE_NOMEM; }
@@ -56,11 +60,36 @@ void mw_cdc_close (mw_db *db) {
     if (getenv("MW_CDC_STATS")) fprintf(stderr, "cdc: %llu commits, %llu row changes (%llu in pages of unknown owner), catalog/owner map built %llu times (%.1f ms), overflow map scanned %llu times, %llu overflow writes unattributed; prepare %.2f us per commit\n",
         (unsigned long long)c->commits, (unsigned long long)c->changes, (unsigned long long)c->unowned, (unsigned long long)c->builds, (double)c->ns_build / 1e6, (unsigned long long)c->ovfl_scans, (unsigned long long)c->ovfl_unattributed, c->commits ? (double)c->ns_prepare / 1000.0 / (double)c->commits : 0.0);
     mw_cat_free(c->cat); mw_meta_free(c->meta);
-    munmap((void *)c->owner, (size_t)OWNER_PAGES * sizeof(uint32_t)); munmap((void *)c->ovo, (size_t)OWNER_PAGES * sizeof(uint32_t));
+    if (db->shared) { if (c->owner) munmap((void *)c->owner, 2 * (size_t)OWNER_PAGES * sizeof(uint32_t)); }
+    else { munmap((void *)c->owner, (size_t)OWNER_PAGES * sizeof(uint32_t)); munmap((void *)c->ovo, (size_t)OWNER_PAGES * sizeof(uint32_t)); }
     pthread_mutex_destroy(&c->mu);
     free(c);
     db->cdc = NULL;
 }
+
+// ---- the owner maps in shared mode: one file, mapped by every process; reset by the first opener ----
+#define OWN_FILE_BYTES (2 * (size_t)OWNER_PAGES * sizeof(uint32_t))
+int mw_cdc_shared_create (mw_db *db) {                                      // the first opener of the database
+    char *p = sqlite3_mprintf("%s-mwown", db->path); if (!p) return SQLITE_NOMEM;
+    unlink(p);
+    int fd = open(p, O_RDWR | O_CREAT, 0644); sqlite3_free(p);
+    if (fd < 0) return SQLITE_CANTOPEN;
+    int rc = ftruncate(fd, (off_t)OWN_FILE_BYTES) == 0 ? SQLITE_OK : SQLITE_IOERR;
+    close(fd); return rc;
+}
+void mw_cdc_shared_unlink (mw_db *db) { char *p = sqlite3_mprintf("%s-mwown", db->path); if (p) { unlink(p); sqlite3_free(p); } }
+static int maps_attach (mw_db *db, mw_cdc *c) {
+    if (c->owner) return SQLITE_OK;
+    pthread_mutex_lock(&c->mu);
+    if (!c->owner) {
+        char *p = sqlite3_mprintf("%s-mwown", db->path); int fd = p ? open(p, O_RDWR) : -1; sqlite3_free(p);
+        if (fd >= 0) { void *m = mmap(NULL, OWN_FILE_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0); close(fd); if (m != MAP_FAILED) { c->ovo = (_Atomic uint32_t *)m + OWNER_PAGES; c->owner = m; } }
+    }
+    pthread_mutex_unlock(&c->mu);
+    return c->owner ? SQLITE_OK : SQLITE_CANTOPEN;
+}
+static bool ovfl_done (mw_db *db, mw_cdc *c) { return db->shared ? atomic_load(&db->shm->own_ovfl_complete) != 0 : c->ovfl_complete; }
+static void ovfl_set (mw_db *db, mw_cdc *c, bool v) { if (db->shared) atomic_store(&db->shm->own_ovfl_complete, v ? 1u : 0u); else c->ovfl_complete = v; }
 
 void mw_cdc_set_sink (mw_db *db, mw_cdc_sink_fn fn, void *arg) { mw_cdc *c = db->cdc; if (c) { c->sink = fn; c->sink_arg = arg; } }
 
@@ -89,9 +118,17 @@ static void tree_walk (mw_cdc *c, mw_lane *lane, uint32_t root, uint32_t levels_
     for (int i = 0; i <= nc; i++) { if (levels_left == 1) own_set(c, kids[i], root); else tree_walk(c, lane, root, levels_left - 1, kids[i], pg); }
     free(kids);
 }
+static void owner_walk (mw_cdc *c, mw_lane *lane, const mw_cat *cat);
 static void build (mw_cdc *c, mw_lane *lane) {
-    uint64_t t0 = now_ns(); uint32_t pgsz = (uint32_t)lane->db->store->pgsz;
+    uint64_t t0 = now_ns();
     mw_cat *cat = mw_cat_build(lane); if (!cat) return;
+    if (!lane->db->shared) owner_walk(c, lane, cat);
+    mw_cat_free(c->cat); c->cat = cat; c->cookie = cat->cookie; c->built = true;
+    atomic_fetch_add(&c->builds, 1); atomic_fetch_add(&c->ns_build, now_ns() - t0);
+}
+// the owner map of the committed state of the lane (the lane's snapshot): every table b-tree, interior pages only
+static void owner_walk (mw_cdc *c, mw_lane *lane, const mw_cat *cat) {
+    uint32_t pgsz = (uint32_t)lane->db->store->pgsz;
     size_t n = (size_t)lane->dsz_val * sizeof(uint32_t) + 4096; if (n > (size_t)OWNER_PAGES * 4) n = (size_t)OWNER_PAGES * 4;
     memset((void *)c->owner, 0, n);
     uint8_t *pg = malloc(pgsz);
@@ -101,8 +138,6 @@ static void build (mw_cdc *c, mw_lane *lane) {
         tree_walk(c, lane, cat->tabs[t].root, depth, cat->tabs[t].root, pg);
     }
     free(pg);
-    mw_cat_free(c->cat); c->cat = cat; c->cookie = cat->cookie; c->built = true;
-    atomic_fetch_add(&c->builds, 1); atomic_fetch_add(&c->ns_build, now_ns() - t0);
 }
 
 // the overflow owner map by a scan: every record with overflow in every table b-tree, at the lane's snapshot
@@ -138,18 +173,55 @@ static void scan_tree (mw_cdc *c, mw_lane *lane, const mw_tab *t, uint32_t pgno,
     }
     free(pg);
 }
-static void build_ovfl (mw_cdc *c, mw_lane *lane) {
+static void build_ovfl (mw_cdc *c, mw_lane *lane, const mw_cat *cat) {
     uint32_t pgsz = (uint32_t)lane->db->store->pgsz;
     size_t n = (size_t)lane->dsz_val * sizeof(uint32_t) + 4096; if (n > (size_t)OWNER_PAGES * 4) n = (size_t)OWNER_PAGES * 4;
     memset((void *)c->ovo, 0, n);
-    for (int t = 0; t < c->cat->n; t++) if (c->cat->tabs[t].tracked) scan_tree(c, lane, &c->cat->tabs[t], c->cat->tabs[t].root, pgsz, 0);
-    c->ovfl_complete = true; atomic_fetch_add(&c->ovfl_scans, 1);
+    for (int t = 0; t < cat->n; t++) if (cat->tabs[t].tracked) scan_tree(c, lane, &cat->tabs[t], cat->tabs[t].root, pgsz, 0);
+    ovfl_set(lane->db, c, true); atomic_fetch_add(&c->ovfl_scans, 1);
 }
 
 static uint32_t cookie_of (mw_lane *lane) {
     uint8_t *p1 = malloc((size_t)lane->db->store->pgsz); uint32_t k = 0;
     if (p1 && mw_rd_snap_page(lane, 1, p1)) k = be32(p1 + 40);
     free(p1); return k;
+}
+
+// Shared mode: the maps are one for everybody and describe the newest committed state; they are rebuilt (by whoever needs it first) under the publication lock, so that no commit
+// updates them meanwhile. The lane's schema must be the maps' schema: an older one (a transaction that started before a schema change) cannot commit anyway.
+typedef struct { uint64_t snap, dsz_epoch; uint32_t dsz_val; bool dsz_valid; } snap_save;
+static void snap_latest (mw_lane *lane, snap_save *sv) {
+    sv->snap = lane->tx.snapshot_epoch; sv->dsz_epoch = lane->dsz_epoch; sv->dsz_val = lane->dsz_val; sv->dsz_valid = lane->dsz_valid;
+    uint64_t E = mw_shared_visible_epoch(lane->db);
+    lane->tx.snapshot_epoch = E; lane->dsz_val = mw_store_dbsize(lane->db->store, E); lane->dsz_epoch = E; lane->dsz_valid = true;
+}
+static void snap_restore (mw_lane *lane, const snap_save *sv) { lane->tx.snapshot_epoch = sv->snap; lane->dsz_epoch = sv->dsz_epoch; lane->dsz_val = sv->dsz_val; lane->dsz_valid = sv->dsz_valid; }
+
+static bool shared_maps (mw_cdc *c, mw_lane *lane, const mw_cat *cat) {
+    mw_db *db = lane->db; mw_shm *sh = db->shm;
+    if (maps_attach(db, c) != SQLITE_OK) return false;
+    uint64_t want = (1ull << 32) | cat->cookie, cur = atomic_load_explicit(&sh->own_cookie, memory_order_acquire);
+    if (cur == want) return true;
+    if (cur != 0 && (int32_t)(cat->cookie - (uint32_t)cur) < 0) return false;
+    mw_mp_lock(db);
+    cur = atomic_load(&sh->own_cookie); bool ok = true;
+    if (cur != want) {
+        if (cur != 0 && (int32_t)(cat->cookie - (uint32_t)cur) < 0) ok = false;
+        else {
+            uint64_t t0 = now_ns(); snap_save sv; snap_latest(lane, &sv);
+            if (cookie_of(lane) != cat->cookie) ok = false;                  // the schema moved on since this lane's snapshot
+            else { owner_walk(c, lane, cat); ovfl_set(db, c, false); atomic_store_explicit(&sh->own_cookie, want, memory_order_release); atomic_fetch_add(&c->builds, 1); atomic_fetch_add(&c->ns_build, now_ns() - t0); }
+            snap_restore(lane, &sv);
+        }
+    }
+    mw_mp_unlock(db);
+    return ok;
+}
+static void shared_build_ovfl (mw_cdc *c, mw_lane *lane, const mw_cat *cat) {
+    mw_db *db = lane->db;
+    mw_mp_lock(db);
+    if (!ovfl_done(db, c)) { snap_save sv; snap_latest(lane, &sv); build_ovfl(c, lane, cat); snap_restore(lane, &sv); }
+    mw_mp_unlock(db);
 }
 
 // the catalog current for this lane's snapshot (a reference the caller drops)
@@ -182,6 +254,9 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
     mw_cdc *c = lane->db->cdc; uint64_t t0 = now_ns();
     mw_rd_result_free(&lane->cdc_res); lane->cdc_nfreed = 0;
     mw_cat *cat = catalog_for(c, lane), *newcat = NULL;
+    lane->cdc_ng = 0;
+    free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
+    if (lane->db->shared && cat && !shared_maps(c, lane, cat)) { mw_cat_free(cat); lane->cdc_cat = NULL; return; }       // (this lane's schema is stale: its commit is refused)
     ddl_plan plan = {0};
     const uint8_t *p1new = NULL; for (int i = 0; i < lane->ws_n; i++) if (lane->ws_pgnos[i] == 1) p1new = imgs[i];
     if (p1new && cat && be32(p1new + 40) != cat->cookie) {                       // the schema changes in this commit: the rows of the new tables, the dropped tables, VACUUM
@@ -194,8 +269,9 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
     mw_rd_owner own = { c, old_owner, ovfl_owner, newcat ? newcat : cat, newcat ? cat : NULL, NULL, 0 };
     lane->cdc_skip = plan.skip; lane->cdc_nskip = plan.nskip; lane->cdc_skip_old = plan.skip_old; lane->cdc_nskip_old = plan.nskip_old;
     mw_rowdiff_compute(lane, imgs, &own, &lane->cdc_res);
-    if (lane->cdc_res.unknown_ovfl && !c->ovfl_complete) {                                // an overflow page written without its cell and nobody to ask: scan once, then ask again
-        pthread_mutex_lock(&c->mu); if (!c->ovfl_complete) build_ovfl(c, lane); pthread_mutex_unlock(&c->mu);
+    if (lane->cdc_res.unknown_ovfl && !ovfl_done(lane->db, c)) {                          // an overflow page written without its cell and nobody to ask: scan once, then ask again
+        if (lane->db->shared) shared_build_ovfl(c, lane, newcat ? newcat : cat);
+        else { pthread_mutex_lock(&c->mu); if (!c->ovfl_complete) build_ovfl(c, lane, newcat ? newcat : cat); pthread_mutex_unlock(&c->mu); }
         mw_rd_result_free(&lane->cdc_res); mw_rowdiff_compute(lane, imgs, &own, &lane->cdc_res);
     }
     lane->cdc_skip = NULL; lane->cdc_nskip = 0; lane->cdc_skip_old = NULL; lane->cdc_nskip_old = 0;
@@ -208,6 +284,7 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
         ensure_ready(lane->db, c);
         if (mw_ovl_encode(lane->cdc_decl, &lane->cdc_ext, &lane->cdc_ext_len) != 0) { lane->cdc_ext = NULL; lane->cdc_ext_len = 0; }
     } else build_delta(lane, c, plan.purge, plan.npurge);
+    { mw_ovl *act = lane->cdc_decl ? lane->cdc_decl : lane->cdc_ovl; if (act && lane->cdc_ext_len) lane->cdc_ng = mw_ovl_groups(act, (const uint32_t **)&lane->cdc_gbucket, (const uint32_t **)&lane->cdc_goff, (const uint64_t **)&lane->cdc_gseen); }
     free(plan.skip); free(plan.skip_old); free(plan.purge);
     // the rows point into the catalog they were decoded with: it stays alive until the apply step of the same commit
     if (newcat) { mw_cat_free(cat); lane->cdc_cat = newcat; } else lane->cdc_cat = cat;
@@ -217,6 +294,7 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
 // under the stripe locks of the pages: the owner map follows the commit
 void mw_cdc_apply_owner (mw_db *db, mw_lane *lane, const uint32_t *pgnos, const uint8_t *const *images, int n) {
     mw_cdc *c = db->cdc;
+    if (!c->owner && maps_attach(db, c) != SQLITE_OK) return;
     uint32_t pgsz = (uint32_t)db->store->pgsz;
     for (int i = 0; i < n; i++) {                                                       // the interior pages this commit wrote: their children belong to the table of the page
         const uint8_t *pg = images[i]; if (pgnos[i] == 1 || (pg[0] != 0x05 && pg[0] != 0x02)) continue;
@@ -261,7 +339,8 @@ static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int np
 void mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch) {
     mw_cdc *c = db->cdc;
     mw_ovl *act = lane->cdc_decl ? lane->cdc_decl : lane->cdc_ovl;
-    if (act && lane->cdc_ext_len) { mw_meta_apply(c->meta, act, epoch); if (mw_meta_dirty(c->meta) >= 2048) mw_meta_kick(c->meta); }
+    lane->cdc_ng = 0;
+    if (act && lane->cdc_ext_len && !db->shared) { mw_meta_apply(c->meta, act, epoch); if (mw_meta_dirty(c->meta) >= 2048) mw_meta_kick(c->meta); }
     if (lane->cdc_ovl) mw_ovl_clear(lane->cdc_ovl);
     free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
     mw_cat_free(lane->cdc_cat); lane->cdc_cat = NULL;
@@ -279,5 +358,16 @@ mw_meta *mw_cdc_meta (mw_db *db) { mw_cdc *c = db->cdc; return c ? c->meta : NUL
 // the last user connection is closing: the metadata goes to the file now (the log is about to be dropped), and the store's own connections close
 void mw_cdc_quiesce (mw_db *db) { mw_cdc *c = db->cdc; if (c) { if (!c->ready) { mw_meta_ready(c->meta); c->ready = true; } mw_meta_quiesce(c->meta); } }
 // the point up to which the log may be compacted without losing metadata
-uint64_t mw_cdc_safe_epoch (mw_db *db) { mw_cdc *c = db->cdc; if (!c || !c->ready) return c ? 0 : UINT64_MAX; uint64_t e = mw_meta_safe_epoch(c->meta); if (e != UINT64_MAX) mw_meta_kick(c->meta); return e; }
+void mw_cdc_kick_flush (mw_db *db) { mw_cdc *c = db->cdc; if (c) mw_meta_kick(c->meta); }
+uint64_t mw_cdc_safe_epoch (mw_db *db) { mw_cdc *c = db->cdc; if (c && !c->ready) { mw_meta_ready(c->meta); c->ready = true; } if (!c || !c->ready) return c ? 0 : UINT64_MAX; uint64_t e = mw_meta_safe_epoch(c->meta); if (e != UINT64_MAX) mw_meta_kick(c->meta); return e; }
 void mw_cdc_ensure_schema (sqlite3 *conn, mw_db *db) { if (db->cdc) (void)mw_meta_schema(conn); }
+
+// The commit's new pages were renumbered above the end of the file (other commits extended it): what the capture knows about new pages by number is stale. The overflow owners of the
+// new pages are not recorded (a later overflow-only update of them is found by the scan), and the pages the commit allocated and freed again are not on the free list of anybody.
+void mw_cdc_relocated (mw_lane *lane) {
+    mw_cdc *c = lane->db->cdc; if (!c) return;
+    lane->cdc_res.novupd = 0;
+    int k = 0; for (int i = 0; i < lane->cdc_res.nfreed; i++) if (lane->cdc_res.freed[i] <= lane->dsz_val) lane->cdc_res.freed[k++] = lane->cdc_res.freed[i];
+    lane->cdc_res.nfreed = k;
+    ovfl_set(lane->db, c, false);
+}

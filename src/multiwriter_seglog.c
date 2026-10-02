@@ -20,8 +20,8 @@
 #include "multiwriter_wait.h"
 
 #define SEG_MAGIC "MWLOG002"
-#define REC_HDR_SIZE 32
-#define REC_MAGIC 0x3143574du
+#define REC_HDR_SIZE 40
+#define REC_MAGIC 0x3243574du                         // v2: the record carries a metadata extension after the pages
 #define SEG_PREFILL_CHUNK (1u << 20)
 
 #if defined(__aarch64__)
@@ -33,7 +33,7 @@
 #endif
 
 typedef struct { char magic[8]; uint32_t version, pgsz; uint64_t base_epoch, salt; uint64_t reserved[3]; uint64_t cksum; } seg_hdr;
-typedef struct { uint32_t magic, npages; uint64_t epoch; uint32_t dbsize, pgsz; uint64_t cksum; } rec_hdr;
+typedef struct { uint32_t magic, npages; uint64_t epoch; uint32_t dbsize, pgsz; uint32_t ext_len, pad; uint64_t cksum; } rec_hdr;
 _Static_assert(sizeof(seg_hdr) == MW_SEG_HDR, "segment header layout");
 _Static_assert(sizeof(rec_hdr) == REC_HDR_SIZE, "record header layout");
 
@@ -80,7 +80,7 @@ static int pread_all (int fd, void *buf, size_t n, off_t off) {
 }
 
 static void seg_path (mw_seglog *sl, uint32_t seg, char *buf, size_t n) { snprintf(buf, n, "%s%u", sl->prefix, seg); }
-static uint64_t rec_size (mw_seglog *sl, int n) { return REC_HDR_SIZE + (uint64_t)n * (4 + (uint64_t)sl->pgsz); }
+static uint64_t rec_size (mw_seglog *sl, int n, uint32_t ext_len) { return REC_HDR_SIZE + (uint64_t)n * (4 + (uint64_t)sl->pgsz) + ext_len; }
 
 static int write_hdr (mw_seglog *sl, int fd, uint64_t base) {
     seg_hdr h; memset(&h, 0, sizeof h);
@@ -282,7 +282,7 @@ int mw_seglog_open (mw_db *db, mw_seglog_replay_fn fn, void *ctx, uint64_t *base
                 rec_hdr r;
                 if (off + REC_HDR_SIZE > (uint64_t)sb.st_size || pread_all(fd, &r, sizeof r, (off_t)off) != SQLITE_OK) break;
                 if (r.magic != REC_MAGIC || r.pgsz != sl->pgsz || r.npages == 0 || r.npages > (1u << 24)) break;
-                size_t body = (size_t)r.npages * (4 + (size_t)sl->pgsz);
+                size_t body = (size_t)r.npages * (4 + (size_t)sl->pgsz) + r.ext_len;
                 if (off + REC_HDR_SIZE + body > (uint64_t)sb.st_size) break;
                 if (body > bcap) { uint8_t *nb = realloc(buf, body); if (!nb) { rc = SQLITE_NOMEM; break; } buf = nb; bcap = body; }
                 if (pread_all(fd, buf, body, (off_t)(off + REC_HDR_SIZE)) != SQLITE_OK || r.cksum != rec_cksum(sl->salt, &r, buf, body)) break;
@@ -296,7 +296,7 @@ int mw_seglog_open (mw_db *db, mw_seglog_replay_fn fn, void *ctx, uint64_t *base
                         memcpy(&pg[k], buf + (size_t)k * (4 + sl->pgsz), 4);
                         locs[k] = MW_LOC(ids[i].id, off + REC_HDR_SIZE + (uint64_t)k * (4 + sl->pgsz) + 4);
                     }
-                    if (fn) rc = fn(ctx, r.epoch, r.dbsize, (int)r.npages, pg, locs);
+                    if (fn) rc = fn(ctx, r.epoch, r.dbsize, (int)r.npages, pg, locs, buf + (size_t)r.npages * (4 + sl->pgsz), r.ext_len, MW_LOC(ids[i].id, off + REC_HDR_SIZE + (uint64_t)r.npages * (4 + sl->pgsz)));
                     if (rc != SQLITE_OK) break;
                     last = r.epoch;
                 }
@@ -386,13 +386,13 @@ static int seg_roll (mw_db *db, mw_seglog *sl, uint32_t cur, uint64_t need, uint
     return SQLITE_OK;
 }
 
-int mw_seglog_append (mw_db *db, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, uint64_t *locs, uint32_t *seg_out, uint64_t *end_out) {
+int mw_seglog_append (mw_db *db, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, const uint8_t *ext, uint32_t ext_len, uint64_t *locs, uint64_t *ext_loc, uint32_t *seg_out, uint64_t *end_out) {
     mw_seglog *sl = db->sl;
     mw_shm *sh = db->shm;
     if (mw_fault_hit(MW_FAULT_LOG_WRITE_ERR)) return SQLITE_IOERR_WRITE;
     uint32_t seg = atomic_load_explicit(&sh->sl_seg, memory_order_acquire);
     uint64_t off = atomic_load_explicit(&sh->sl_end, memory_order_acquire);
-    uint64_t size = rec_size(sl, n);
+    uint64_t size = rec_size(sl, n, ext_len);
     segmap *m = map_acquire(sl, seg);
     if (!m) return SQLITE_CANTOPEN;
     if (off + size > m->len) {
@@ -411,9 +411,11 @@ int mw_seglog_append (mw_db *db, uint64_t epoch, uint32_t dbsize, int n, const u
         locs[i] = MW_LOC(seg, (uint64_t)(p - m->base) + 4);
         p += 4 + pgsz;
     }
+    if (ext_len) memcpy(p, ext, ext_len);
+    if (ext_loc) *ext_loc = MW_LOC(seg, (uint64_t)(p - m->base));
     if (mw_fault_hit(MW_CRASH_MID_LOG)) _exit(9);                                  // body written, header not: a torn record
-    rec_hdr r = { .magic = REC_MAGIC, .npages = (uint32_t)n, .epoch = epoch, .dbsize = dbsize, .pgsz = (uint32_t)pgsz, .cksum = 0 };
-    r.cksum = rec_cksum(sl->salt, &r, m->base + off + REC_HDR_SIZE, (size_t)n * (4 + pgsz));
+    rec_hdr r = { .magic = REC_MAGIC, .npages = (uint32_t)n, .epoch = epoch, .dbsize = dbsize, .pgsz = (uint32_t)pgsz, .ext_len = ext_len, .cksum = 0 };
+    r.cksum = rec_cksum(sl->salt, &r, m->base + off + REC_HDR_SIZE, (size_t)n * (4 + pgsz) + ext_len);
     memcpy(m->base + off, &r, sizeof r);
     map_release(m);
     atomic_store_explicit(&sh->sl_end, off + size, memory_order_release);          // the cursor moves when the record is complete

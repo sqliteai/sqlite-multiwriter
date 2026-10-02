@@ -30,7 +30,7 @@ typedef struct mw_seglog mw_seglog;
 #define MW_LOC_OFF(loc)  ((uint32_t)(loc))
 
 // Replay callback of recovery: one valid record newer than the base, in epoch order.
-typedef int (*mw_seglog_replay_fn)(void *ctx, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *locs);
+typedef int (*mw_seglog_replay_fn)(void *ctx, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *locs, const uint8_t *ext, uint32_t ext_len, uint64_t ext_loc);
 
 // Opens the log of `db` (db->path, the page size of db->store, the shared header db->shm): the first opener of the database recovers it (replaying what is newer than the
 // base through `fn`, truncating a torn tail, removing leftovers) or creates it; the others only attach. *base_out: the compaction base found.
@@ -38,9 +38,9 @@ int  mw_seglog_open (mw_db *db, mw_seglog_replay_fn fn, void *ctx, uint64_t *bas
 void mw_seglog_close (mw_db *db);
 
 // ---- the writer (publication lock held) ----
-// Appends one commit record, rolling to a new segment when it does not fit. locs[i] = where the image of page i is. *seg / *end: where the record ends (for mw_seglog_sync).
+// Appends one commit record (the pages, then the metadata extension), rolling to a new segment when it does not fit. locs[i] = where the image of page i is; *ext_loc = where the extension is. *seg / *end: where the record ends (for mw_seglog_sync).
 // The writer cursor in the shared header moves only when the record is complete.
-int  mw_seglog_append (mw_db *db, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, uint64_t *locs, uint32_t *seg, uint64_t *end);
+int  mw_seglog_append (mw_db *db, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, const uint8_t *ext, uint32_t ext_len, uint64_t *locs, uint64_t *ext_loc, uint32_t *seg, uint64_t *end);
 // Group commit: returns when everything up to (seg, end) is durable (one leader per process syncs the active segment for everybody waiting).
 int  mw_seglog_sync (mw_db *db, uint32_t seg, uint64_t end);
 // Called outside the publication lock after a commit: keeps the next segment prepared. Cheap when there is nothing to do.

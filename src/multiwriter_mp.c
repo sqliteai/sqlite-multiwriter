@@ -440,6 +440,8 @@ int64_t mw_mp_ceiling (mw_db *db) {
 
 // MARK: - compaction coordination and log reset -
 
+bool mw_mp_meta_lock (mw_db *db, int which, bool wait) { return fcntl_lock(db->mp_pubfd, ((off_t)1 << 20) + 8 + which, F_WRLCK, wait) == 0; }
+void mw_mp_meta_unlock (mw_db *db, int which) { fcntl_lock(db->mp_pubfd, ((off_t)1 << 20) + 8 + which, F_UNLCK, false); }
 bool mw_mp_compaction_lock (mw_db *db) { return fcntl_lock(db->mp_pubfd, MP_LOCK_COMPACT, F_WRLCK, false) == 0; }
 void mw_mp_compaction_unlock (mw_db *db) { fcntl_lock(db->mp_pubfd, MP_LOCK_COMPACT, F_UNLCK, false); }
 

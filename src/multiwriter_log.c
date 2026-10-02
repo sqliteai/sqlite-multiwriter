@@ -215,7 +215,6 @@ int mw_log_open (mw_db *db, int pgsz) {
         if ((uint64_t)off >= limit) break;
         if (pread_all(db->logfd, &r, sizeof r, off) != SQLITE_OK) break;
         if (r.magic != REC_MAGIC || r.pgsz != (uint32_t)pgsz || r.npages == 0 || r.npages > (1u << 24)) break;
-        if (r.ext_len > (64u << 20)) break;                                            // (an extension is at most a few MB: a larger value is garbage)
         size_t body = (size_t)r.npages * (4 + (size_t)pgsz) + r.ext_len;
         if ((uint64_t)off + REC_HDR_SIZE + body > fsz) break;                          // a torn / garbage header must not size an allocation
         if (body > rec_cap) {

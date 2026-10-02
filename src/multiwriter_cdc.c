@@ -361,7 +361,7 @@ void mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch) {
     mw_cdc *c = db->cdc;
     mw_ovl *act = lane->cdc_decl ? lane->cdc_decl : lane->cdc_ovl;
     lane->cdc_ng = 0;
-    if (act && lane->cdc_ext_len && !db->shared) { mw_meta_apply(c->meta, act, epoch); if (mw_meta_dirty(c->meta) >= 2048) mw_meta_kick(c->meta); }
+    if (act && lane->cdc_ext_len && !db->shared) { mw_meta_apply(c->meta, act, epoch); if (mw_meta_dirty(c->meta) >= 16384) mw_meta_kick(c->meta); }
     if (lane->cdc_ovl) mw_ovl_clear(lane->cdc_ovl);
     free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
     mw_cat_free(lane->cdc_cat); lane->cdc_cat = NULL;

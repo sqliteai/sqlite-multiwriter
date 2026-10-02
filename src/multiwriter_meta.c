@@ -447,23 +447,32 @@ int mw_ovl_groups (const mw_ovl *o, const uint32_t **bucket, const uint32_t **of
 // the row's state becomes `c` (n cells; those with dv == OV_CHG are of this commit: epoch)
 static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pklen, const mw_mcell *c, int n, uint64_t epoch) {
     uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
+    bool sen = false; for (int k = 0; k < n; k++) if (c[k].col == SEN) sen = true;
+    mentry *ne = NULL;
     pthread_mutex_lock(&s->mu);
     mentry *e = find(s, h, tbl, pk, pklen);
-    if (!e) { e = entry_new(h, tbl, pk, pklen, NULL, 0); if (!e) { pthread_mutex_unlock(&s->mu); return -1; } insert_entry(m, s, e); }
-    size_t before = entry_bytes(e);
-    bool removed = false;                                              // a cell of the old state is not in the new one: the file has to forget it
-    for (int i = 0; i < e->n && !removed; i++) { bool f = false; for (int k = 0; k < n; k++) if (c[k].col == e->cells[i].col) { f = true; break; } if (!f) removed = true; }
-    if (n > e->cap) { mw_mcell *nm = realloc(e->cells, (size_t)n * sizeof *nm); if (!nm) { pthread_mutex_unlock(&s->mu); return -1; } e->cells = nm; e->cap = n; }
-    bool sen = false;
-    for (int k = 0; k < n; k++) { e->cells[k] = c[k]; if (c[k].dv == OV_CHG) e->cells[k].dv = (int64_t)epoch; if (c[k].col == SEN) sen = true; }
-    e->n = n;
-    if (sen) mw_meta_bloom_add(m, tbl, pk, pklen);
-    if (removed) e->drop_ver = epoch;
-    e->ver = epoch;
-    if (!e->in_dirty) { e->in_dirty = true; e->dnext = s->dirty; s->dirty = e; atomic_fetch_add(&m->ndirty, 1); }
-    size_t after = entry_bytes(e); s->bytes += after - before; atomic_fetch_add(&m->bytes, after - before);
+    if (!e) {                                                          // a new row: one allocation for the entry (its cells are the state), linked once
+        ne = entry_new(h, tbl, pk, pklen, c, n);
+        if (!ne) { pthread_mutex_unlock(&s->mu); return -1; }
+        for (int k = 0; k < n; k++) if (ne->cells[k].dv == OV_CHG) ne->cells[k].dv = (int64_t)epoch;
+        ne->ver = epoch; ne->in_dirty = true; ne->dnext = s->dirty; s->dirty = ne;
+        insert_entry(m, s, ne); atomic_fetch_add(&m->ndirty, 1);
+    } else {
+        size_t before = entry_bytes(e);
+        bool removed = false;                                          // a cell of the old state is not in the new one: the file has to forget it
+        for (int i = 0; i < e->n && !removed; i++) { bool f = false; for (int k = 0; k < n; k++) if (c[k].col == e->cells[i].col) { f = true; break; } if (!f) removed = true; }
+        if (n > e->cap) { mw_mcell *nm = realloc(e->cells, (size_t)n * sizeof *nm); if (!nm) { pthread_mutex_unlock(&s->mu); return -1; } e->cells = nm; e->cap = n; }
+        for (int k = 0; k < n; k++) { e->cells[k] = c[k]; if (c[k].dv == OV_CHG) e->cells[k].dv = (int64_t)epoch; }
+        e->n = n;
+        if (removed) e->drop_ver = epoch;
+        e->ver = epoch;
+        if (!e->in_dirty) { e->in_dirty = true; e->dnext = s->dirty; s->dirty = e; atomic_fetch_add(&m->ndirty, 1); }
+        size_t after = entry_bytes(e);
+        if (after != before) { s->bytes += after - before; atomic_fetch_add(&m->bytes, after - before); }
+    }
     evict(m, s);
     pthread_mutex_unlock(&s->mu);
+    if (sen) mw_meta_bloom_add(m, tbl, pk, pklen);                     // (outside the lock: the filter is atomic and only grows)
     return 0;
 }
 

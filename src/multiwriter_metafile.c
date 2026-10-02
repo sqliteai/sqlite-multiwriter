@@ -461,9 +461,11 @@ static void *flusher_main (void *arg) {
         if (stop) break;
         uint64_t d;
         const char *er = getenv("MW_META_FLUSH_ROWS"), *em = getenv("MW_META_FLUSH_MS");           // (tests: flush very often)
-        uint64_t rows = er ? (uint64_t)atoll(er) : 2048, ms = em ? (uint64_t)atoll(em) : 250;
+        uint64_t rows = er ? (uint64_t)atoll(er) : 16384, ms = em ? (uint64_t)atoll(em) : 250;
         d = mw_meta_dirty(m);
-        if (d && (kicked || d >= rows || now_ns() - m->last_flush_ns > ms * 1000000ull)) flush_impl(m, false);
+        uint64_t age = now_ns() - m->last_flush_ns;
+        // a flush is a transaction of its own (a log record, a sync): small ones at a high rate cost the writers more than they save, so a kick is heard only when the last flush is not too recent
+        if (d && ((kicked && (age > 20000000ull || d >= 4 * rows)) || d >= rows || age > ms * 1000000ull)) flush_impl(m, false);
     }
     return NULL;
 }

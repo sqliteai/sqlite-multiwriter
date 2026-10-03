@@ -39,6 +39,7 @@
 #include <sys/stat.h>
 #include <stdio.h>
 #include <time.h>
+#include "multiwriter_io.h"
 #include "multiwriter_internal.h"
 #include "multiwriter_wait.h"
 
@@ -99,9 +100,11 @@ int mw_mp_open (mw_db *db) {
         // we hold the header lock nobody can unlink it.)
         db->mp_pubfd = open(db->mp_pubpath, O_RDWR | O_CREAT, 0644);
         if (db->mp_pubfd < 0) { close(db->mp_lockfd); db->mp_lockfd = -1; return SQLITE_CANTOPEN; }
-        if ((size_t)fs.st_size < len && ftruncate(db->mp_lockfd, (off_t)len) != 0) return SQLITE_IOERR;
-        void *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, db->mp_lockfd, 0);
-        if (m == MAP_FAILED) return SQLITE_IOERR;
+        // (every failure from here on gives the files back: the flock on the header file is what the other processes wait for while the first one initialises it)
+        #define MP_OPEN_FAIL(code) do { close(db->mp_pubfd); db->mp_pubfd = -1; close(db->mp_lockfd); db->mp_lockfd = -1; return (code); } while (0)
+        if ((size_t)fs.st_size < len && mw_io_ftruncate(db->mp_lockfd, (off_t)len) != 0) MP_OPEN_FAIL(SQLITE_IOERR);
+        void *m = mw_io_mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, db->mp_lockfd, 0);
+        if (m == MAP_FAILED) MP_OPEN_FAIL(SQLITE_IOERR);
         if (!first && (((mw_shm *)m)->magic != MP_MAGIC || !atomic_load(&((mw_shm *)m)->ready))) {
             // the process that was initialising it failed: release and try to become the first ourselves
             munmap(m, len); close(db->mp_pubfd); db->mp_pubfd = -1; close(db->mp_lockfd); db->mp_lockfd = -1;
@@ -126,7 +129,7 @@ int mw_mp_open (mw_db *db) {
             atomic_store(&db->shm->procs[i].pid, (int32_t)getpid());
             db->mp_proc = i;
         }
-        if (db->mp_proc < 0) return SQLITE_FULL;
+        if (db->mp_proc < 0) { db->mp = false; db->shm = NULL; munmap(m, len); MP_OPEN_FAIL(SQLITE_FULL); }
         if (!first) { db->mp_gen = MW_LOG_GEN(atomic_load(&db->shm->log_pos)); db->mp_base_seen = atomic_load(&db->shm->base_epoch); }
         return SQLITE_OK;
     }
@@ -540,10 +543,12 @@ void mw_mp_rewrite_log (mw_db *db, uint64_t T) {
 // (64: 5k, 128: 2k tx/s against 9.6k at 32). It engages with more than 1.5 processes per core.. Only a limited number of writer transactions may be in flight at once; the others sleep before taking their snapshot (a
 // sleeping process has nothing to catch up yet). FIFO tickets order the waiters, the first few poll the slot table, the rest sleep in proportion to their distance. A wait is
 // bounded (a transaction that cannot get a slot in 50 ms goes ahead without one) so that a holder that stays open for long, or a dead one, can never stop the others.
-static int mp_admit_cap (void) {
+static int mp_admit_cap (int nprocs) {
     static _Atomic int c = MW_KNOB_UNSET;
     long n = sysconf(_SC_NPROCESSORS_ONLN);
-    int v = mw_knob_int(&c, "MW_MP_ADMIT", (int)(n / 3 < 2 ? 2 : n / 3 > 16 ? 16 : n / 3));     // (18 cores: 6 was the best of 3..32)
+    int big = (int)(n * 2 < 2 ? 2 : n * 2 > 64 ? 64 : n * 2), small = (int)(n / 3 < 2 ? 2 : n / 3 > 16 ? 16 : n / 3);
+    // 2 per core while the processes are up to ~14 per core; beyond that (1000 processes on 18 cores) a small number of writers at a time does better: 6 against 36 there is 7.3k against 5.2k tx/s
+    int v = mw_knob_int(&c, "MW_MP_ADMIT", 0); if (v <= 0) v = nprocs > 14 * (int)n ? small : big;       // (0: not set; the default depends on the processes now there)
     return v > 64 ? 64 : v;
 }
 
@@ -563,7 +568,7 @@ static inline void adm_wake_head (mw_shm *sh, uint64_t h) {              // the 
 int mw_mp_admit (mw_lane *lane) {
     mw_db *db = lane->db;
     mw_shm *sh = db->shm;
-    int cap = mp_admit_cap();
+    int cap = mp_admit_cap(atomic_load_explicit(&db->mp_nprocs, memory_order_relaxed));
     if (cap <= 0) return 0;
     if (lane->adm_check++ % 64 == 0) {                                     // (how many processes are there? not worth a scan per transaction)
         int n = 0; for (int i = 0; i < MW_MP_PROCS; i++) if (atomic_load_explicit(&sh->procs[i].pid, memory_order_relaxed) > 0) n++;
@@ -618,7 +623,7 @@ int mw_mp_admit (mw_lane *lane) {
 void mw_mp_admit_release (mw_lane *lane) {
     if (lane->adm_slot < 0) return;
     MW_T1(MW_ST_ADM_HOLD, lane->adm_t0);
-    if (mw_timing_on) { int busy = 0; int cap = mp_admit_cap(); for (int i = 0; i < cap; i++) if (atomic_load(&lane->db->shm->adm_slot_pid[i]) != 0) busy++; mw_count_add(MW_C_ADM_BUSY, (uint64_t)busy); mw_count_add(MW_C_ADM_SAMPLES, 1); uint64_t tk = atomic_load(&lane->db->shm->adm_ticket), ad = atomic_load(&lane->db->shm->adm_admitted); mw_count_add(MW_C_ADM_WAITERS, tk > ad ? tk - ad : 0); }
+    if (mw_timing_on) { int busy = 0; int cap = mp_admit_cap(atomic_load(&lane->db->mp_nprocs)); for (int i = 0; i < cap; i++) if (atomic_load(&lane->db->shm->adm_slot_pid[i]) != 0) busy++; mw_count_add(MW_C_ADM_BUSY, (uint64_t)busy); mw_count_add(MW_C_ADM_SAMPLES, 1); uint64_t tk = atomic_load(&lane->db->shm->adm_ticket), ad = atomic_load(&lane->db->shm->adm_admitted); mw_count_add(MW_C_ADM_WAITERS, tk > ad ? tk - ad : 0); }
     { struct timespec nw; clock_gettime(CLOCK_MONOTONIC, &nw); atomic_store(&lane->db->shm->adm_slot_rel_ns[lane->adm_slot], (uint64_t)nw.tv_sec * 1000000000ull + (uint64_t)nw.tv_nsec); }
     atomic_store_explicit(&lane->db->shm->adm_slot_pid[lane->adm_slot], 0, memory_order_release);
     lane->adm_slot = -1;

@@ -113,6 +113,7 @@ void mw_metafile_free (mw_meta *m) {
 }
 
 // ---- reading ----
+static bool mf_hard (int rc) { return rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW && (rc & 0xff) != SQLITE_ERROR; }
 // n keys, one read transaction of one connection of the pool (a read transaction per row costs more than the lookup: the page cache is dropped when the database changed)
 static int load_keys (mw_meta *m, int n, const uint32_t *tbl, const uint8_t *const *pk, const size_t *pklen, mw_mcell **cells, int *ncells) {
     for (int i = 0; i < n; i++) { cells[i] = NULL; ncells[i] = 0; }
@@ -122,9 +123,13 @@ static int load_keys (mw_meta *m, int n, const uint32_t *tbl, const uint8_t *con
     pthread_mutex_lock(&m->rdmu[slot]);
 locked:
     if (!m->rd[slot]) m->rd[slot] = open_conn(m);
-    if (m->rd[slot] && !m->rds[slot]) sqlite3_prepare_v2(m->rd[slot], rsx_blk_sql(), -1, &m->rds[slot], NULL);
-    int rc = 0;                                                                 // (no table yet, or a statement that cannot be prepared: the rows are not in the file)
-    if (m->rds[slot]) {
+    int rc = 0;
+    if (!m->rd[slot]) rc = -1;                                                  // (a failure to open is not "no rows": the caller would build the metadata of a row from nothing)
+    else if (!m->rds[slot]) {
+        int prc = sqlite3_prepare_v2(m->rd[slot], rsx_blk_sql(), -1, &m->rds[slot], NULL);
+        if (prc != SQLITE_OK) { sqlite3_finalize(m->rds[slot]); m->rds[slot] = NULL; if (mf_hard(prc)) rc = -1; }       // (no table yet: the rows are not in the file)
+    }
+    if (rc == 0 && m->rds[slot]) {
         sqlite3 *c = m->rd[slot];
         bool txn = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL) == SQLITE_OK;
         mw_rman *man = NULL;
@@ -156,39 +161,53 @@ static void bloom_cb (void *ctx, uint32_t tbl, const uint8_t *pk, size_t pklen) 
 int mw_metafile_load_tombstones (mw_meta *m) {
     if (!m->attached) return 0;
     sqlite3 *c = open_conn(m); if (!c) return -1;
-    rsx_scan_keys(m->rsx, c, bloom_cb, m);
+    int rc = rsx_scan_keys(m->rsx, c, bloom_cb, m);
     sqlite3_close(c);
-    return 0;
+    return rc ? -1 : 0;
 }
 
 // ---- recovery / first use ----
 // What the file tables say: the epoch they cover, the site ids they hold (installed through mw_meta_site_install: ord 0 is this database's own id)
-void mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]) {
+// one value of mw_state: a key that is not there is 0; a failure to read is an error (starting from nothing instead would give the database a new identity and a fresh epoch)
+static int mf_state (sqlite3 *c, const char *k, uint64_t *v) {
+    sqlite3_stmt *st = NULL; char sql[100]; snprintf(sql, sizeof sql, "SELECT v FROM mw_state WHERE k = '%s'", k);
+    int rc = sqlite3_prepare_v2(c, sql, -1, &st, NULL);
+    if (rc == SQLITE_OK) { rc = sqlite3_step(st); if (rc == SQLITE_ROW) { *v = (uint64_t)sqlite3_column_int64(st, 0); rc = SQLITE_OK; } else if (rc == SQLITE_DONE) rc = SQLITE_OK; }
+    sqlite3_finalize(st);
+    return mf_hard(rc) ? rc : SQLITE_OK;
+}
+int mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]) {
     *F = 0; *hwm = 0; *sites_flushed = 0; *have_own = false;
-    if (!m->attached) return;
-    sqlite3 *c = open_conn(m); if (!c) return;
+    if (!m->attached) return SQLITE_OK;
+    sqlite3 *c = open_conn(m); if (!c) return SQLITE_CANTOPEN;
     sqlite3_stmt *st = NULL; int have = 0;
-    if (sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_runs')", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) have = sqlite3_column_int(st, 0);
+    int rc = sqlite3_prepare_v2(c, "SELECT count(*) FROM sqlite_schema WHERE name IN ('mw_state','mw_sites','mw_runs')", -1, &st, NULL);
+    if (rc == SQLITE_OK) { rc = sqlite3_step(st); if (rc == SQLITE_ROW) { have = sqlite3_column_int(st, 0); rc = SQLITE_OK; } }
     sqlite3_finalize(st); st = NULL;
+    if (rc != SQLITE_OK) { sqlite3_close(c); return mf_hard(rc) ? rc : SQLITE_IOERR; }
     if (have == 3) {
         m->tables_ok = true;
-        if (sqlite3_prepare_v2(c, "SELECT v FROM mw_state WHERE k = 'meta_epoch'", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) *F = (uint64_t)sqlite3_column_int64(st, 0);
-        sqlite3_finalize(st); st = NULL;
-        if (sqlite3_prepare_v2(c, "SELECT v FROM mw_state WHERE k = 'dv_hwm'", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) *hwm = (uint64_t)sqlite3_column_int64(st, 0);
-        sqlite3_finalize(st); st = NULL;
+        rc = mf_state(c, "meta_epoch", F);
+        if (rc == SQLITE_OK) rc = mf_state(c, "dv_hwm", hwm);
+        if (rc != SQLITE_OK) { sqlite3_close(c); return rc; }
         if (*hwm < *F) *hwm = *F;
-        if (sqlite3_prepare_v2(c, "SELECT ord, id FROM mw_sites ORDER BY ord", -1, &st, NULL) == SQLITE_OK) {
-            while (sqlite3_step(st) == SQLITE_ROW) {
+        rc = sqlite3_prepare_v2(c, "SELECT ord, id FROM mw_sites ORDER BY ord", -1, &st, NULL);
+        if (rc == SQLITE_OK) {
+            int r;
+            while ((r = sqlite3_step(st)) == SQLITE_ROW) {
                 uint32_t ord = (uint32_t)sqlite3_column_int64(st, 0);
                 if (sqlite3_column_bytes(st, 1) != 16) continue;
                 if (ord == 0) { memcpy(own, sqlite3_column_blob(st, 1), 16); *have_own = true; }
                 if (!m->shared) mw_meta_site_install(m, ord, sqlite3_column_blob(st, 1)); else mm_site_install(m, ord, sqlite3_column_blob(st, 1));
                 if (ord + 1 > *sites_flushed) *sites_flushed = ord + 1;
             }
+            rc = r == SQLITE_DONE ? SQLITE_OK : r;
         }
         sqlite3_finalize(st);
+        if (rc != SQLITE_OK) { sqlite3_close(c); return rc; }
     }
     sqlite3_close(c);
+    return SQLITE_OK;
 }
 
 int mw_meta_ready (mw_meta *m) {
@@ -197,12 +216,13 @@ int mw_meta_ready (mw_meta *m) {
     pthread_mutex_lock(&m->file_mu);
     if (atomic_load(&m->ready)) { pthread_mutex_unlock(&m->file_mu); return 0; }
     uint64_t F, hwm; uint8_t own[16]; bool have_own;
-    mw_metafile_load_state(m, &F, &hwm, &m->sites_flushed, &have_own, own);
+    int lrc = mw_metafile_load_state(m, &F, &hwm, &m->sites_flushed, &have_own, own);
+    if (lrc != SQLITE_OK) { pthread_mutex_unlock(&m->file_mu); return lrc; }
     if (have_own) memcpy(m->sites[0], own, 16);
     m->origin = (int64_t)hwm;                                   // this incarnation's epochs start again at 1: its db_versions go on from the largest the file has seen
     atomic_store(&m->hwm, hwm);
     atomic_store(&m->flushed, F);
-    mw_metafile_load_tombstones(m);
+    if (mw_metafile_load_tombstones(m) != 0) { pthread_mutex_unlock(&m->file_mu); return SQLITE_IOERR_READ; }       // (without the filter an insert of a key that had a life would pass for a first one)
     struct mw_db *db = m->db;
     for (int i = 0; i < db->nrext; i++) mw_meta_replay(m, db->rext[i].epoch, db->rext[i].data, db->rext[i].len);      // (all of them: the epochs of the log are of this incarnation, the file's flushed point is of an older one)
     for (int i = 0; i < db->nrext; i++) free(db->rext[i].data);
@@ -278,13 +298,14 @@ static void collect_done (mw_meta *m, dlist *det, bool ok) {
             for (; i < end; i++) {
                 mentry *e = v[i];
                 if (i + 16 < n) __builtin_prefetch(v[i + 16]);
-                if (e->tbl == 0xFFFFFFFFu) { free(e->cells); free(e); cleaned++; }
+                if (e->tbl == 0xFFFFFFFFu) { entry_free(e); cleaned++; }
                 else if (ok && e->fver == e->ver) { e->in_dirty = false; cleaned++; }
                 else if (!dq_push(st, e)) { e->in_dirty = false; cleaned++; }     // (no memory to remember it: it stays in the table as a clean entry that the next change of the row marks again; the file lacks this state until then: it is also in the log)
             }
             pthread_mutex_unlock(&st->mu);
         }
         free(v); det[s] = (dlist){ NULL, 0 };
+        mw_meta_trim(m, s);
     }
     atomic_fetch_sub(&m->ndirty, cleaned);
 }

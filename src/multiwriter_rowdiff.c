@@ -107,6 +107,7 @@ static uint32_t ov_get (const ovmap *m, uint32_t pg) {
 }
 static uint32_t owner_new (const mw_rd_owner *own, const ovmap *ov, uint32_t pg) { if (own && own->cat && mw_cat_by_root(own->cat, pg)) return pg; uint32_t r = ov_get(ov, pg); return r ? r : (own && own->old_owner ? own->old_owner(own->ctx, pg) : 0); }
 
+static bool rd_debug (void) { static int on = -1; if (on < 0) on = getenv("MW_ROWDIFF_DEBUG") != NULL; return on; }
 // ---- records ----
 // Column spans of a record: serial type, offset and length of every column; returns the number of columns, -1 if malformed
 static int rec_cols (const uint8_t *rec, uint32_t reclen, uint64_t *ty, uint32_t *off, uint32_t *len, int max) {
@@ -137,8 +138,10 @@ static bool row_pk (const mw_tab *t, const rd_row *r, uint8_t **out, size_t *out
         if (nc < 0) return false;
         for (int k = 0; k < t->npk; k++) { int ri = t->pk_rec[k]; if (ri < 0 || ri >= nc || !rec_value(r->rec, ty[ri], off[ri], len[ri], &v[k])) return false; n++; }
     }
-    size_t need = crdt_pk_encode(v, n, NULL, 0); uint8_t *b = malloc(need ? need : 1); if (!b) return false;
-    *outn = crdt_pk_encode(v, n, b, need); *out = b; return true;
+    uint8_t small[96]; size_t need = crdt_pk_encode(v, n, small, sizeof small);          // (one pass for the usual short keys)
+    uint8_t *b = malloc(need ? need : 1); if (!b) return false;
+    if (need <= sizeof small) memcpy(b, small, need); else crdt_pk_encode(v, n, b, need);
+    *outn = need; *out = b; return true;
 }
 
 // ---- rows of a page ----
@@ -342,7 +345,7 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_o
             nout++; if (c < 0) i++; else j++;
         } else {
             bool pkc = false; uint64_t *wide = NULL; uint64_t m = cells_differ(newr.a[j].tab, &oldr.a[i], &newr.a[j], &pkc, &wide);
-            if (getenv("MW_ROWDIFF_DEBUG") && (m || pkc)) { const rd_row *o = &oldr.a[i], *w = &newr.a[j]; fprintf(stderr, "rowdiff: update root %u rowid %lld mask %llx: old len %u new len %u; old:", r->root, (long long)o->rowid, (unsigned long long)m, o->reclen, w->reclen); for (uint32_t q = 0; q < o->reclen && q < 24; q++) fprintf(stderr, " %02x", o->rec[q]); fprintf(stderr, " | new:"); for (uint32_t q = 0; q < w->reclen && q < 24; q++) fprintf(stderr, " %02x", w->rec[q]); fprintf(stderr, "\n"); }
+            if (rd_debug() && (m || pkc)) { const rd_row *o = &oldr.a[i], *w = &newr.a[j]; fprintf(stderr, "rowdiff: update root %u rowid %lld mask %llx: old len %u new len %u; old:", r->root, (long long)o->rowid, (unsigned long long)m, o->reclen, w->reclen); for (uint32_t q = 0; q < o->reclen && q < 24; q++) fprintf(stderr, " %02x", o->rec[q]); fprintf(stderr, " | new:"); for (uint32_t q = 0; q < w->reclen && q < 24; q++) fprintf(stderr, " %02x", w->rec[q]); fprintf(stderr, "\n"); }
             if (m || pkc) {
                 x->kind = 2; x->tab = newr.a[j].tab; x->root = newr.a[j].root; x->rowid = newr.a[j].rowid; x->changed = m; x->wide = wide; wide = NULL;
                 if (x->tab && !newr.a[j].bad) { if (!row_pk(x->tab, &newr.a[j], &x->pk, &x->pklen)) x->pk = NULL; }

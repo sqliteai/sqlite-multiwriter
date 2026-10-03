@@ -109,6 +109,24 @@ the metadata tests with the store under pressure.
   a commit exists in the log record or in the file tables, never nowhere. A compaction that is limited asks the flusher to run.
 - The last connection to close flushes before the log is dropped.
 
+### Errors of the file system (I/O errors, a full disk)
+- **What a failure does.** A commit whose record cannot be written or fsynced fails (`SQLITE_IOERR_*`, `SQLITE_FULL` where the system says so) and is not visible. When the record never reached
+  the log and nothing was assigned after it, the commit is taken back cleanly; otherwise (a group write or an fsync that fails, where the outcome is uncertain) the database is *failed*:
+  every later commit of the process returns an error until the database is closed and opened again. Opening it again is recovery as after a crash: the valid prefix of the log is
+  replayed, so a transaction is there if its record was complete and nothing else is. There is no in-place recovery after the space comes back (measured: 1200 transactions refused
+  after the space was freed, then all fine after the reopen).
+- **A tracked database never runs untracked.** If the capture cannot build the metadata of a commit (the metadata store cannot be read, no memory, the maps of the shared mode cannot be
+  attached) the commit is refused with the error; it is not written without its metadata. The state of the store (list of runs, identity, epochs, the filter of known keys) is never
+  assumed empty because a read failed: a failed read is an error, not a default.
+- **Opening.** A failed open gives everything back (in the shared mode the exclusive lock on the header file, which the other processes wait on while the first one initialises, is
+  released and no connection of the metadata store is opened for a database that did not finish opening).
+- **Tests.** `make test-io`. `mw_ioerr`: every file call of a workload (log and segment writes, fsync, truncation, rename, mapping, reads) fails in turn, once or from there on (a disk
+  that stays full), or writes half of its blocks first; in the thread mode and the shared mode; after each, the database is opened again and must hold every acknowledged
+  transaction, none half, with its metadata agreeing with the rows, an intact b-tree, and take new transactions. `mw_diskfull`: the same on a real volume (a disk image that is filled
+  to the brim before the open, during the workload, after the open), with no SIGBUS from the mapped files, and the database intact afterwards. These found: a deadlock of the open when
+  the first opener failed, metadata silently lost (an I/O error taken for "nothing there" in four places, a failed attach of the maps), a commit of a stale schema written without its
+  metadata in the shared mode, and a false conflict in the shared mode when the versions of a bucket were retired between the read and the validation.
+
 ## Capture and DDL
 
 Tables are tracked when they are not internal (`mw_*`, `sqlite_*`) and are not virtual: with an explicit primary key (INTEGER, composite, text, WITHOUT ROWID), or without one, in which case the **rowid is the key** (a column that is itself called `rowid` moves the key to `_rowid_` or `oid`). A table without a primary key has no identity that is the same on every peer: if peers insert into it concurrently, equal rowids are taken for the same row (a choice: the application that wants otherwise declares a primary key).
@@ -144,4 +162,4 @@ stores (`mw_mp=3`: the metadata design needs the shared mode; opening it with `m
 
 `make test` (the engine and the metadata: capture against a model, the store across restarts and SIGKILL, DDL, sync convergence and atomicity, multi-process with a live reader
 and SIGKILL rounds), `make oracle-test` (differential tests against sqlite-sync: primary-key encoding, local generation, merge of 37 thousand changes, 4000 transactions of the
-live store, features, 300 rounds of two peers exchanging payloads through the real encoder and decoder), `make test-mp` (the metadata tests again with the processes mode).
+live store, features, 300 rounds of two peers exchanging payloads through the real encoder and decoder), `make test-mp` (the metadata tests again with the processes mode), `make test-io` (errors of the file system and a full disk: see above).

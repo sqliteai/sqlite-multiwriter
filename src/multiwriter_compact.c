@@ -25,6 +25,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include "multiwriter_io.h"
 #include "multiwriter_internal.h"
 
 static uint64_t now_ns (void) {
@@ -92,7 +93,7 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
         if (k >= 0 && c->v[k].epoch > base) { memcpy(page, mw_pv_data(db->store, &c->v[k]), pgsz); have = true; }
         pthread_mutex_unlock(mu);
         if (!have) continue;
-        ssize_t w = pwrite(db->fd_real, page, pgsz, (off_t)(pgno - 1) * (off_t)pgsz);
+        ssize_t w = mw_io_pwrite(db->fd_real, page, pgsz, (off_t)(pgno - 1) * (off_t)pgsz);
         if (w != (ssize_t)pgsz) rc = SQLITE_IOERR_WRITE;
         else out->pages_written++;
     }
@@ -113,8 +114,8 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
             pthread_mutex_unlock(mu1);
         }
     }
-    if (rc == SQLITE_OK && size_pages && ftruncate(db->fd_real, (off_t)size_pages * (off_t)pgsz) != 0) rc = SQLITE_IOERR_TRUNCATE;
-    if (rc == SQLITE_OK && fsync(db->fd_real) != 0) rc = SQLITE_IOERR_FSYNC;
+    if (rc == SQLITE_OK && size_pages && mw_io_ftruncate(db->fd_real, (off_t)size_pages * (off_t)pgsz) != 0) rc = SQLITE_IOERR_TRUNCATE;
+    if (rc == SQLITE_OK && mw_io_fsync(db->fd_real) != 0) rc = SQLITE_IOERR_FSYNC;
     if (rc == SQLITE_OK) mw_fault_hit(MW_CRASH_COMPACT_PAGES);
 
     // 2. durable new base
@@ -150,7 +151,7 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
     if (db->mp) {
         /* handled after seq_mu is released (needs the publication lock) */
     } else if (atomic_load(&db->next_epoch) == T && atomic_load(&db->epoch) == T) {
-        if (ftruncate(db->logfd, 64) == 0) { db->log_off = 64; mw_log_stage_reset(db, 64); mw_log_remap(db); }
+        if (mw_io_ftruncate(db->logfd, 64) == 0) { db->log_off = 64; mw_log_stage_reset(db, 64); mw_log_remap(db); }
     } else if (db->log_off > 8 * 4096) {
         mw_log_rewrite_tail(db, T);                                // busy: keep only the records newer than T
     }

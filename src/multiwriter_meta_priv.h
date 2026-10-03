@@ -22,10 +22,13 @@ struct mw_db; struct mw_lane;
 typedef struct mentry {
     struct mentry *next;
     uint64_t h, ver, fver, drop_ver;           // ver: epoch of the last change; fver: ver as the flush in progress collected it; drop_ver: epoch of the last DROP (the file must lose the old cells too)
-    uint32_t tbl, pklen; int n, cap; bool in_dirty;
+    uint32_t tbl, pklen; int n, cap; bool in_dirty, inl;     // inl: the cells are in the same allocation as the entry (after the key)
     mw_mcell *cells;
     uint8_t pk[];
 } mentry;
+
+void mw_meta_trim (mw_meta *m, int stripe_no);                       // drops clean entries of a stripe down to its share of the cache (the flusher calls it)
+static inline void entry_free (mentry *e) { if (!e->inl) free(e->cells); free(e); }
 
 typedef struct { pthread_mutex_t mu; mentry **b; size_t nb, n; mentry **dq; size_t ndq, capdq; size_t bytes; size_t hand; uint64_t gen; uint32_t backoff; } stripe;   // dq: the dirty entries, as a vector (read in order, with the next ones fetched ahead: a list would be a cache miss at a time)
 typedef struct { mentry **v; size_t n; } dlist;                          // a dirty vector taken from a stripe by a flush
@@ -66,7 +69,7 @@ int      mw_metafile_load_tombstones (mw_meta *m);                              
 int      mw_metafile_load (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n);       // the row's cells from the file tables (n = 0: none / no tables)
 void     mw_meta_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]);
 void     mw_metafile_free (mw_meta *m);
-void     mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]);
+int      mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]);
 #endif
 
 typedef struct { uint32_t tbl; uint8_t *pk; uint32_t pklen; uint32_t n; uint32_t bloblen; uint8_t *blob; int64_t dv; } fitem;       // a row to write to the file: its key and its cells already packed (n of them; none: the row goes), dv the largest db_version among them

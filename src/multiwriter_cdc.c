@@ -18,6 +18,7 @@
 #include <strings.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "multiwriter_io.h"
 #include "multiwriter_internal.h"
 #include "multiwriter_meta.h"
 
@@ -42,8 +43,8 @@ int mw_cdc_open (mw_db *db) {
     mw_cdc *c = calloc(1, sizeof *c);
     if (!c) return SQLITE_NOMEM;
     if (!db->shared) {                                                       // (shared mode: the maps are a file mapped by every process, attached at the first use)
-        c->owner = mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-        c->ovo = mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        c->owner = mw_io_mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        c->ovo = mw_io_mmap(NULL, (size_t)OWNER_PAGES * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
         if (c->owner == MAP_FAILED || c->ovo == MAP_FAILED) { free(c); return SQLITE_NOMEM; }
     }
     pthread_mutex_init(&c->mu, NULL);
@@ -75,7 +76,7 @@ int mw_cdc_shared_create (mw_db *db) {                                      // t
     unlink(p);
     int fd = open(p, O_RDWR | O_CREAT, 0644); sqlite3_free(p);
     if (fd < 0) return SQLITE_CANTOPEN;
-    int rc = ftruncate(fd, (off_t)OWN_FILE_BYTES) == 0 ? SQLITE_OK : SQLITE_IOERR;
+    int rc = mw_io_ftruncate(fd, (off_t)OWN_FILE_BYTES) == 0 ? SQLITE_OK : SQLITE_IOERR;
     close(fd); return rc;
 }
 void mw_cdc_shared_unlink (mw_db *db) { char *p = sqlite3_mprintf("%s-mwown", db->path); if (p) { unlink(p); sqlite3_free(p); } }
@@ -84,7 +85,7 @@ static int maps_attach (mw_db *db, mw_cdc *c) {
     pthread_mutex_lock(&c->mu);
     if (!c->owner) {
         char *p = sqlite3_mprintf("%s-mwown", db->path); int fd = p ? open(p, O_RDWR) : -1; sqlite3_free(p);
-        if (fd >= 0) { void *m = mmap(NULL, OWN_FILE_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0); close(fd); if (m != MAP_FAILED) { c->ovo = (_Atomic uint32_t *)m + OWNER_PAGES; c->owner = m; } }
+        if (fd >= 0) { void *m = mw_io_mmap(NULL, OWN_FILE_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0); close(fd); if (m != MAP_FAILED) { c->ovo = (_Atomic uint32_t *)m + OWNER_PAGES; c->owner = m; } }
     }
     pthread_mutex_unlock(&c->mu);
     return c->owner ? SQLITE_OK : SQLITE_CANTOPEN;
@@ -203,10 +204,10 @@ static void snap_restore (mw_lane *lane, const snap_save *sv) { lane->tx.snapsho
 
 static bool shared_maps (mw_cdc *c, mw_lane *lane, const mw_cat *cat) {
     mw_db *db = lane->db; mw_shm *sh = db->shm;
-    if (maps_attach(db, c) != SQLITE_OK) return false;
+    if (maps_attach(db, c) != SQLITE_OK) { lane->cdc_err = SQLITE_IOERR; return false; }                 // (the commit is refused: it cannot be tracked)
     uint64_t want = (1ull << 32) | cat->cookie, cur = atomic_load_explicit(&sh->own_cookie, memory_order_acquire);
     if (cur == want) return true;
-    if (cur != 0 && (int32_t)(cat->cookie - (uint32_t)cur) < 0) return false;
+    if (cur != 0 && (int32_t)(cat->cookie - (uint32_t)cur) < 0) { lane->cdc_err = SQLITE_BUSY_SNAPSHOT; return false; }          // (this lane's schema is stale: the commit is refused, the application runs it again)
     mw_mp_lock(db);
     cur = atomic_load(&sh->own_cookie); bool ok = true;
     if (cur != want) {
@@ -219,6 +220,7 @@ static bool shared_maps (mw_cdc *c, mw_lane *lane, const mw_cat *cat) {
         }
     }
     mw_mp_unlock(db);
+    if (!ok) lane->cdc_err = SQLITE_BUSY_SNAPSHOT;
     return ok;
 }
 static void shared_build_ovfl (mw_cdc *c, mw_lane *lane, const mw_cat *cat) {
@@ -239,7 +241,7 @@ static mw_cat *catalog_for (mw_cdc *c, mw_lane *lane) {
 }
 
 static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int npurge);
-static void ensure_ready (mw_db *db, mw_cdc *c);
+static int ensure_ready (mw_db *db, mw_cdc *c);
 
 // ---- DDL in the commit ----
 typedef struct { const char **skip; int nskip; const char **skip_old; int nskip_old; uint32_t *purge; int npurge; } ddl_plan;
@@ -259,7 +261,7 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
     mw_rd_result_free(&lane->cdc_res); lane->cdc_nfreed = 0;
     mw_cat_free(lane->cdc_cat); lane->cdc_cat = NULL;                           // (a retried commit prepares again: the catalog of the earlier attempt goes)
     mw_cat *cat = catalog_for(c, lane), *newcat = NULL;
-    lane->cdc_ng = 0;
+    lane->cdc_ng = 0; lane->cdc_err = 0;
     free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
     if (lane->db->shared && cat && !shared_maps(c, lane, cat)) { mw_cat_free(cat); lane->cdc_cat = NULL; return; }       // (this lane's schema is stale: its commit is refused)
     ddl_plan plan = {0};
@@ -286,8 +288,8 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
     if (c->sink) c->sink(c->sink_arg, lane->cdc_res.chg, lane->cdc_res.n, &lane->cdc_res.info);
     if (lane->cdc_decl) {                                                      // a merge of remote changes: the metadata is the one the merge produced
         free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
-        ensure_ready(lane->db, c);
-        if (mw_ovl_encode(lane->cdc_decl, &lane->cdc_ext, &lane->cdc_ext_len) != 0) { lane->cdc_ext = NULL; lane->cdc_ext_len = 0; }
+        int erc = ensure_ready(lane->db, c); if (erc) lane->cdc_err = erc;
+        if (mw_ovl_encode(lane->cdc_decl, &lane->cdc_ext, &lane->cdc_ext_len) != 0) { lane->cdc_ext = NULL; lane->cdc_ext_len = 0; lane->cdc_err = SQLITE_NOMEM; }
     } else build_delta(lane, c, plan.purge, plan.npurge);
     { mw_ovl *act = lane->cdc_decl ? lane->cdc_decl : lane->cdc_ovl; if (act && lane->cdc_ext_len) lane->cdc_ng = mw_ovl_groups(act, (const uint32_t **)&lane->cdc_gbucket, (const uint32_t **)&lane->cdc_goff, (const uint64_t **)&lane->cdc_gseen); }
     free(plan.skip); free(plan.skip_old); free(plan.purge);
@@ -300,7 +302,7 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
 void mw_cdc_skip (mw_lane *lane) {
     mw_rd_result_free(&lane->cdc_res); lane->cdc_nfreed = 0;
     mw_cat_free(lane->cdc_cat); lane->cdc_cat = NULL;
-    lane->cdc_ng = 0;
+    lane->cdc_ng = 0; lane->cdc_err = 0;
     free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
     if (lane->cdc_ovl) mw_ovl_clear(lane->cdc_ovl);
 }
@@ -322,15 +324,15 @@ void mw_cdc_apply_owner (mw_db *db, mw_lane *lane, const uint32_t *pgnos, const 
 }
 
 // ---- the CRDT metadata of the commit ----
-static void ensure_ready (mw_db *db, mw_cdc *c) { (void)db; if (!c->ready) { mw_meta_ready(c->meta); c->ready = true; } }
+static int ensure_ready (mw_db *db, mw_cdc *c) { (void)db; if (!c->ready) { int rc = mw_meta_ready(c->meta); if (rc) return rc; c->ready = true; } return SQLITE_OK; }
 
 // the changes of the commit as local changes of the CRDT, into the lane's overlay; the overlay is then encoded as the record extension
 static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int npurge) {
     free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
     if (!lane->cdc_ovl) lane->cdc_ovl = mw_ovl_new(c->meta);
-    if (!lane->cdc_ovl) return;
+    if (!lane->cdc_ovl) { lane->cdc_err = SQLITE_NOMEM; return; }
     mw_ovl *o = lane->cdc_ovl; mw_ovl_clear(o);
-    ensure_ready(lane->db, c);
+    { int erc = ensure_ready(lane->db, c); if (erc) { lane->cdc_err = erc; return; } }
     const crdt_ops *ops = mw_ovl_ops();
     int64_t seq = 0; uint32_t *cols = NULL; int ccap = 0;
     for (int i = 0; i < npurge; i++) mw_ovl_purge(o, purge[i]);
@@ -351,7 +353,7 @@ static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int np
         if (!t || !t->synced || !x->pk) continue;
         int want = x->kind == 3 ? 0 : (x->kind == 2 && x->oldpk) ? 1 : x->kind == 1 ? 2 : 3;
         if (want != pass) continue;
-        int nc = 0; if (t->ncells > ccap) { ccap = t->ncells + 16; cols = realloc(cols, (size_t)ccap * sizeof *cols); if (!cols) return; }
+        int nc = 0; if (t->ncells > ccap) { ccap = t->ncells + 16; cols = realloc(cols, (size_t)ccap * sizeof *cols); if (!cols) { lane->cdc_err = SQLITE_NOMEM; return; } }
         if (x->kind == 2 && !x->oldpk) {
             if (x->wide) { for (int k = 0; k < t->ncells; k++) if (x->wide[k / 64] & (1ull << (k % 64))) cols[nc++] = t->cell_id[k]; }
             else for (int k = 0; k < t->ncells && k < 63; k++) if (x->changed & (1ull << k)) cols[nc++] = t->cell_id[k];
@@ -363,7 +365,8 @@ static void build_delta (mw_lane *lane, mw_cdc *c, const uint32_t *purge, int np
         else if (nc) crdt_local_update(ops, o, t->tid, x->pk, x->pklen, cols, nc, 0, &seq, NULL, 0);
     }
     free(cols);
-    if (mw_ovl_encode(o, &lane->cdc_ext, &lane->cdc_ext_len) != 0) { lane->cdc_ext = NULL; lane->cdc_ext_len = 0; }
+    if (mw_ovl_err(o)) { lane->cdc_err = mw_ovl_err(o); return; }              // (a row could not be read: what was built from it is wrong)
+    if (mw_ovl_encode(o, &lane->cdc_ext, &lane->cdc_ext_len) != 0) { lane->cdc_ext = NULL; lane->cdc_ext_len = 0; lane->cdc_err = SQLITE_NOMEM; }
 }
 
 void mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch) {

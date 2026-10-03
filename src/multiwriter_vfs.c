@@ -263,7 +263,13 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         }
         mw_lane_init(lane, db);
         if (sqlite3_uri_boolean(name, "mw_cdc", 0) && mode >= 2 && mpmode == 1 && !getenv("MW_MP_PRIVATE_OK")) { /* private-store multi-process mode keeps the pages in every process; the metadata design needs the shared mode */ mw_lane_free(lane); mw_db_release(db); f->real->pMethods->xClose(f->real); f->base.pMethods = NULL; return SQLITE_MISUSE; }
-        if (sqlite3_uri_boolean(name, "mw_cdc", 0) && mode >= 2) { sqlite3_mutex_enter(db->mu); if (!db->cdc) (void)mw_cdc_open(db); sqlite3_mutex_leave(db->mu); }
+        if (sqlite3_uri_boolean(name, "mw_cdc", 0) && mode >= 2) {
+            sqlite3_mutex_enter(db->mu); int crc = db->cdc ? SQLITE_OK : mw_cdc_open(db); sqlite3_mutex_leave(db->mu);
+            if (crc != SQLITE_OK) {                                  // (a database that is to be tracked does not open untracked: its commits would carry no metadata)
+                mw_lane_free(lane); mw_db_release_ex(db, want_sys); f->real->pMethods->xClose(f->real); f->base.pMethods = NULL;
+                return crc;
+            }
+        }
         if (db->cdc && sqlite3_uri_parameter(name, "mw_meta_cache_mb")) mw_cdc_set_cache_mb(db, (int)sqlite3_uri_int64(name, "mw_meta_cache_mb", 64));
         lane->norebase = sqlite3_uri_boolean(name, "mw_norebase", 0) != 0;
         if (want_sys) lane->sys = true;
@@ -284,6 +290,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
             lane->private_mode = true;
             rc = mw_lane_open_main(f, lane);
             if (rc == SQLITE_OK) {
+                db->open_done = true;
                 int ms = (int)sqlite3_uri_int64(name, "mw_compact_ms", db->mp_req ? 1000 : 0);   // multi-process: the log only shrinks through compaction
                 mw_db_compactor_start(db, ms);                       // always: event-driven by log size; periodic if mw_compact_ms > 0
                 if (sqlite3_uri_parameter(name, "mw_log_max_mb")) db->log_max_bytes = (uint64_t)sqlite3_uri_int64(name, "mw_log_max_mb", 0) << 20;

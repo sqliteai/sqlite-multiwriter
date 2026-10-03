@@ -115,6 +115,14 @@ typedef enum {
 void mw_fault_arm (mw_fault_t f, int nth);
 void mw_fault_disarm_all (void);
 
+// I/O fault injection (tests): the nth call, from now on, among the engine's own file calls of the given kinds (a mask of 1 write, 2 sync, 4 truncate, 8 rename, 16 mmap, 32 read) fails with err
+// (EIO, ENOSPC...). sticky: every matching call after it fails too (a disk that stays full); shortw: a failing write of more than 512 bytes first writes about half of them (whole 512-byte blocks), and the disk is full from there on.
+// mw_io_fault_calls() counts the matching calls since the arm (arm with a huge nth to count a workload's calls).
+enum { MW_IO_WRITE = 1, MW_IO_SYNC = 2, MW_IO_TRUNC = 4, MW_IO_RENAME = 8, MW_IO_MAP = 16, MW_IO_READ = 32, MW_IO_ALL = 63 };
+void mw_io_fault_arm (int kinds, long nth, int err, int sticky, int shortw);
+void mw_io_fault_disarm (void);
+long mw_io_fault_calls (void);
+
 // EXPERIMENT (docs §51): row-level changes of every commit, derived from the page images alone. A sink is called once per commit of a private lane, from the
 // committing thread, before the commit is published. Changes are the net change of the table rows over the whole write set (rows of different tables are pooled).
 typedef struct { int kind; int64_t rowid; uint32_t changed; uint32_t root; int ncols; } mw_rowchg;      // root = the table (its root page) when the page owners are known, ncols = columns of the record           // kind 1 insert, 2 update (changed = bitmask of columns, bit 31: not decidable per column), 3 delete

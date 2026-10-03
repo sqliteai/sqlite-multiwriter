@@ -94,7 +94,7 @@ void mw_db_release_ex (mw_db *db, bool sys) {
     if (!db) return;
     sqlite3_mutex *g = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MAIN);
     sqlite3_mutex_enter(g);
-    if (!sys && db->cdc && !db->orphaned && db->refs - 1 == atomic_load(&db->sys_refs)) {
+    if (!sys && db->cdc && db->open_done && !db->orphaned && db->refs - 1 == atomic_load(&db->sys_refs)) {
         sqlite3_mutex_leave(g);
         mw_cdc_quiesce(db);
         sqlite3_mutex_enter(g);

@@ -121,7 +121,12 @@ int mm_head (mw_meta *m, uint32_t bucket, mm_group *g) {
 // The buckets this commit writes must be as the transaction read them: a change of the bucket since means another commit changed a row the transaction took its versions from.
 int mm_validate (mw_db *db, mw_lane *lane) {
     if (!lane || !lane->cdc_ng) return SQLITE_OK;
-    for (int i = 0; i < lane->cdc_ng; i++) if (shidx_head_epoch(db->rx, lane->cdc_gbucket[i]) != lane->cdc_gseen[i]) return MW_CONFLICT;
+    for (int i = 0; i < lane->cdc_ng; i++) {
+        uint64_t head = shidx_head_epoch(db->rx, lane->cdc_gbucket[i]);
+        if (head == lane->cdc_gseen[i]) continue;
+        if (head == 0) continue;           // the versions of the bucket were retired (everything up to the base is in the file, which is where a later read finds it): nobody changed it, or there would be a newer head
+        return MW_CONFLICT;
+    }
     return SQLITE_OK;
 }
 
@@ -189,14 +194,15 @@ int mm_ready (mw_meta *m) {
     mw_mp_meta_lock(m->db, 1, true);                                         // (the flusher's lock: nobody flushes before the file's state is known)
     if (atomic_load(&sh->meta_state) != 2) {
         uint64_t F = 0, hwm = 0; uint32_t flushed_sites = 0; uint8_t own[16]; bool have_own = false;
-        mw_metafile_load_state(m, &F, &hwm, &flushed_sites, &have_own, own);
+        int lrc = mw_metafile_load_state(m, &F, &hwm, &flushed_sites, &have_own, own);
+        if (lrc != SQLITE_OK) { mw_mp_meta_unlock(m->db, 1); pthread_mutex_unlock(&m->file_mu); return lrc; }
         atomic_store(&sh->dv_origin, hwm); atomic_store(&sh->dv_hwm, hwm);
         if (!have_own) sqlite3_randomness(16, own);
         mm_site_install_db(m->db, 0, own);
         if (!have_own) { /* a fresh id: it is written with the first flush */ }
         atomic_store(&sh->sites_flushed, flushed_sites);
         atomic_store(&sh->meta_flushed, F);
-        mw_metafile_load_tombstones(m);
+        if (mw_metafile_load_tombstones(m) != 0) { mw_mp_meta_unlock(m->db, 1); pthread_mutex_unlock(&m->file_mu); return SQLITE_IOERR_READ; }
         atomic_store_explicit(&sh->meta_state, 2, memory_order_release);
     }
     mw_mp_meta_unlock(m->db, 1);

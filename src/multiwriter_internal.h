@@ -241,6 +241,7 @@ struct mw_lane {
     struct mw_ovl *cdc_ovl;
     int          cdc_ng; uint32_t *cdc_gbucket, *cdc_goff; uint64_t *cdc_gseen;      // the groups of the extension (shared mode): bucket, offset in the extension, the head epoch of the bucket when its state was read
                          // the metadata delta of the commit being published (multiwriter_meta.c)
+    int          cdc_err;                       // the capture could not produce the commit's metadata (a read of the metadata store failed, no memory): the commit is refused, never written without it
     uint8_t *cdc_ext; uint32_t cdc_ext_len;      // the commit's change-capture extension, written in the log record next to the pages
     int64_t     min_reserved;   // lowest db_version reserved by the current transaction, 0 = none (protected by db->mu)
     uint64_t    writer_id;      // unique per connection (lane) in this process; NOT the sqlite-sync site_id
@@ -368,6 +369,7 @@ struct mw_db {
     // multi-process mode (mw_mp=1)
     bool              mp_req, mp;          // requested at open / active
     bool              has_log;             // a log file exists (set once when it is opened, before any commit): read by publishers instead of the logfd that a rewrite replaces
+    bool              open_done;           // the first connection finished opening (a database whose open failed has nothing to flush: no connection of the metadata store is opened for it)
     _Atomic int       mp_nprocs;           // processes registered on this database, as last counted by the admission control
     bool              compact_claimed;     // this process holds the compaction claim (shared mode)
     bool              shared;              // multi-process in shared mode (mw_mp=2): shared version index + segmented log, no private store

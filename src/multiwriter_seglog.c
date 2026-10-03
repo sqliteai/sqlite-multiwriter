@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <sched.h>
+#include "multiwriter_io.h"
 #include "multiwriter_seglog.h"
 #include "multiwriter_wait.h"
 
@@ -70,12 +71,12 @@ static uint64_t rec_cksum (uint64_t salt, const rec_hdr *h, const void *body, si
 
 static int pwrite_all (int fd, const void *buf, size_t n, off_t off) {
     const char *p = buf;
-    while (n > 0) { ssize_t w = pwrite(fd, p, n, off); if (w < 0) { if (errno == EINTR) continue; return SQLITE_IOERR_WRITE; } p += w; off += w; n -= (size_t)w; }
+    while (n > 0) { ssize_t w = mw_io_pwrite(fd, p, n, off); if (w < 0) { if (errno == EINTR) continue; return SQLITE_IOERR_WRITE; } p += w; off += w; n -= (size_t)w; }
     return SQLITE_OK;
 }
 static int pread_all (int fd, void *buf, size_t n, off_t off) {
     char *p = buf;
-    while (n > 0) { ssize_t r = pread(fd, p, n, off); if (r < 0) { if (errno == EINTR) continue; return SQLITE_IOERR_READ; } if (r == 0) return SQLITE_IOERR_SHORT_READ; p += r; off += r; n -= (size_t)r; }
+    while (n > 0) { ssize_t r = mw_io_pread(fd, p, n, off); if (r < 0) { if (errno == EINTR) continue; return SQLITE_IOERR_READ; } if (r == 0) return SQLITE_IOERR_SHORT_READ; p += r; off += r; n -= (size_t)r; }
     return SQLITE_OK;
 }
 
@@ -123,7 +124,7 @@ static segmap *map_acquire (mw_seglog *sl, uint32_t seg) {
             if (fd < 0) { pthread_mutex_unlock(&sl->map_mu); return NULL; }
             struct stat sb;
             if (fstat(fd, &sb) != 0 || sb.st_size < MW_SEG_HDR) { close(fd); pthread_mutex_unlock(&sl->map_mu); return NULL; }
-            void *p = mmap(NULL, (size_t)sb.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            void *p = mw_io_mmap(NULL, (size_t)sb.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
             if (p == MAP_FAILED) { close(fd); pthread_mutex_unlock(&sl->map_mu); return NULL; }
             m->base = p; m->len = (size_t)sb.st_size; m->fd = fd;
             atomic_store(&m->dying, 0);
@@ -153,7 +154,7 @@ static int seg_create (mw_seglog *sl, uint32_t seg, uint64_t size, uint64_t base
             rc = pwrite_all(fd, z, (size_t)k, (off_t)off); off += k;
         }
         free(z);
-    } else if (rc == SQLITE_OK && ftruncate(fd, (off_t)size) != 0) rc = SQLITE_IOERR;
+    } else if (rc == SQLITE_OK && mw_io_ftruncate(fd, (off_t)size) != 0) rc = SQLITE_IOERR;
     close(fd);
     return rc;
 }
@@ -320,7 +321,7 @@ int mw_seglog_open (mw_db *db, mw_seglog_replay_fn fn, void *ctx, uint64_t *base
         int fd = open(path, O_RDWR); struct stat sb;
         if (fd >= 0 && fstat(fd, &sb) == 0) {
             for (uint64_t off = cur_end; off < (uint64_t)sb.st_size; ) { uint64_t k = (uint64_t)sb.st_size - off < SEG_PREFILL_CHUNK ? (uint64_t)sb.st_size - off : SEG_PREFILL_CHUNK; if (pwrite_all(fd, sl->zeros, (size_t)k, (off_t)off) != SQLITE_OK) break; off += k; }
-            fsync(fd);
+            mw_io_fsync(fd);
         }
         if (fd >= 0) close(fd);
     }
@@ -355,7 +356,7 @@ void mw_seglog_close (mw_db *db) {
 static int seg_roll (mw_db *db, mw_seglog *sl, uint32_t cur, uint64_t need, uint64_t first_epoch) {
     mw_shm *sh = db->shm;
     segmap *m = map_acquire(sl, cur);
-    if (m) { msync(m->base, m->len, MS_SYNC); if (fsync(m->fd) != 0) { map_release(m); return SQLITE_IOERR_FSYNC; } map_release(m); }
+    if (m) { mw_io_msync(m->base, m->len, MS_SYNC); if (mw_io_fsync(m->fd) != 0) { map_release(m); return SQLITE_IOERR_FSYNC; } map_release(m); }
     uint32_t next = cur + 1;
     uint64_t base = atomic_load(&sh->base_epoch);
     char final_[620]; seg_path(sl, next, final_, sizeof final_);
@@ -458,8 +459,8 @@ int mw_seglog_sync (mw_db *db, uint32_t seg, uint64_t end) {
                     uint64_t from = MW_LOG_GEN(done) == tseg ? MW_LOG_END(done) : MW_SEG_HDR;         // (what was synced before is on disk)
                     from &= ~((uint64_t)osp - 1);
                     uint64_t to = (tend + (uint64_t)osp - 1) & ~((uint64_t)osp - 1); if (to > m->len) to = m->len;
-                    frc = to > from ? msync(m->base + from, (size_t)(to - from), MS_SYNC) : 0;
-                    if (frc == 0) frc = fsync(m->fd);
+                    frc = to > from ? mw_io_msync(m->base + from, (size_t)(to - from), MS_SYNC) : 0;
+                    if (frc == 0) frc = mw_io_fsync(m->fd);
                     map_release(m);
                 } else frc = -1;
             }
@@ -517,7 +518,7 @@ void mw_seglog_prefill_bg (mw_db *db) {
                 atomic_store(&sh->log_ready, done);
                 if (done >= sl->seg_bytes) {
                     char fin[640]; seg_path(sl, next, fin, sizeof fin);
-                    if (rename(tmp, fin) == 0) atomic_store(&sh->seg_next_ready, next);
+                    if (mw_io_rename(tmp, fin) == 0) atomic_store(&sh->seg_next_ready, next);
                 }
             }
         }
@@ -578,7 +579,7 @@ int mw_seglog_set_base (mw_db *db, uint64_t base) {
     int fd = open(path, O_RDWR);
     if (fd < 0) return SQLITE_CANTOPEN;
     int rc = write_hdr(sl, fd, base);
-    if (rc == SQLITE_OK && fsync(fd) != 0) rc = SQLITE_IOERR_FSYNC;
+    if (rc == SQLITE_OK && mw_io_fsync(fd) != 0) rc = SQLITE_IOERR_FSYNC;
     close(fd);
     return rc;
 }
@@ -594,7 +595,7 @@ void mw_seglog_trim (mw_db *db, uint64_t base) {
         // the new oldest segment's header must carry the base before the old one goes (recovery reads it from there)
         char path[620]; seg_path(sl, mn + 1, path, sizeof path);
         int fd = open(path, O_RDWR);
-        if (fd >= 0) { write_hdr(sl, fd, base); fsync(fd); close(fd); }
+        if (fd >= 0) { write_hdr(sl, fd, base); mw_io_fsync(fd); close(fd); }
         seg_path(sl, mn, path, sizeof path);
         unlink(path);
         mn++;

@@ -16,11 +16,12 @@
 
 typedef struct { mw_mcell *c; int n, cap; } cellvec;
 typedef struct {
-    uint32_t tbl; uint8_t *pk; uint32_t pklen; uint8_t flags; mw_mcell *c; int n, cap; int bk;      // bk: index in the overlay's buckets (shared mode), -1 otherwise
+    uint32_t tbl; uint8_t *pk; uint32_t pklen; uint8_t flags; bool carena; mw_mcell *c; int n, cap; int bk;      // bk: index in the overlay's buckets (shared mode), -1 otherwise
 } orow;
 typedef struct { uint32_t id; uint64_t seen; mm_group g; } obk;      // a bucket as the transaction read it: its head epoch and the rows it held
 struct mw_ovl {
-    mw_meta *m; orow *rows; int n, cap; int *hash; int hcap;
+    mw_meta *m; orow *rows; int n, cap; int *hash; int hcap; int err;      // err: a row could not be read or built (the metadata of the transaction is not to be used)
+    uint8_t *ab; size_t an, acap; uint8_t **aold; int naold, capold;      // bump arena for the keys (and the first cells) of the rows: no malloc/free per row; emptied by clear
     mw_value_fn vfn; void *varg; bool hint_new;                  // hint_new: the rows the CRDT asks for next are inserts
     uint32_t *purge; int npurge, cappurge;
     obk *bk; int nbk, capbk; int *bkh; int bkhcap;               // the buckets the transaction read (hash: bucket id -> index)
@@ -64,7 +65,7 @@ mw_meta *mw_meta_new (struct mw_db *db) {
 void mw_meta_free (mw_meta *m) {
     if (!m) return;
     for (int i = 0; i < STRIPES; i++) {
-        for (size_t k = 0; m->st[i].b && k < m->st[i].nb; k++) for (mentry *e = m->st[i].b[k], *nx; e; e = nx) { nx = e->next; free(e->cells); free(e); }
+        for (size_t k = 0; m->st[i].b && k < m->st[i].nb; k++) for (mentry *e = m->st[i].b[k], *nx; e; e = nx) { nx = e->next; entry_free(e); }
         free(m->st[i].b); free(m->st[i].dq); pthread_mutex_destroy(&m->st[i].mu);
     }
     mw_metafile_free(m); rsx_free(m->rsx); free(m->purge); free(m->bloom);
@@ -86,30 +87,42 @@ static void grow (stripe *s) {
     free(s->b); s->b = nb; s->nb = nn;
 }
 
-// drops clean entries of the stripe until it is under its share of the budget (the caller holds the lock)
-static void evict (mw_meta *m, stripe *s) {
-    size_t cap = m->cap_bytes / STRIPES + 1;
+// drops clean entries of the stripe until it is under `limit` bytes (the caller holds the lock); looks at no more than `maxscan` buckets
+static void evict_to (mw_meta *m, stripe *s, size_t limit, size_t maxscan) {
     size_t scanned = 0, freed = 0;
-    if (s->bytes <= cap) return;
-    if (s->backoff) { s->backoff--; return; }                                          // (the last look found only rows that are waiting for the flusher)
-    while (s->bytes > cap && scanned < s->nb && scanned < 48) {                       // (a bounded step: when the rows are dirty there is nothing to drop and a full scan of the stripe at every insert, under its lock, is what the writers would wait for)
+    if (s->bytes <= limit) return;
+    if (s->backoff && maxscan <= 48) { s->backoff--; return; }                          // (the last look found only rows that are waiting for the flusher)
+    while (s->bytes > limit && scanned < s->nb && scanned < maxscan) {                 // (a bounded step: when the rows are dirty there is nothing to drop and a full scan of the stripe at every insert, under its lock, is what the writers would wait for)
         size_t k = s->hand++ & (s->nb - 1); scanned++;
         mentry **pp = &s->b[k];
         while (*pp) {
             mentry *e = *pp;
-            if (!e->in_dirty && s->bytes > cap) { *pp = e->next; s->n--; s->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); free(e->cells); free(e); s->gen++; freed++; }
+            if (!e->in_dirty && s->bytes > limit) { *pp = e->next; s->n--; s->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); entry_free(e); s->gen++; freed++; }
             else pp = &e->next;
         }
     }
-    if (!freed) s->backoff = 256;
+    if (!freed) s->backoff = 256; else s->backoff = 0;
+}
+// The writers drop entries only when the stripe is well over its share: the usual trimming (freeing cold entries is a cache miss each) is done by the flusher, after it has made entries clean.
+static void evict (mw_meta *m, stripe *s) { size_t cap = m->cap_bytes / STRIPES + 1; evict_to(m, s, cap + cap / 4, 48); }
+void mw_meta_trim (mw_meta *m, int stripe_no) {
+    stripe *s = &m->st[stripe_no]; size_t cap = m->cap_bytes / STRIPES + 1;
+    for (int round = 0; round < 64; round++) {
+        pthread_mutex_lock(&s->mu);
+        bool over = s->bytes > cap; if (over) evict_to(m, s, cap, 512);
+        bool still = s->bytes > cap && !s->backoff;
+        pthread_mutex_unlock(&s->mu);
+        if (!over || !still) break;
+    }
 }
 
 static mentry *entry_new (uint64_t h, uint32_t tbl, const void *pk, size_t pklen, const mw_mcell *c, int n) {
-    mentry *e = calloc(1, sizeof *e + pklen);
+    size_t off = (sizeof(mentry) + pklen + 7) & ~(size_t)7;                          // (one allocation for the entry, its key and its cells: a row costs one malloc and one free)
+    mentry *e = calloc(1, off + (size_t)n * sizeof *c);
     if (!e) return NULL;
     e->h = h; e->tbl = tbl; e->pklen = (uint32_t)pklen; memcpy(e->pk, pk, pklen);
-    e->cap = n; e->n = n;
-    if (n) { e->cells = malloc((size_t)n * sizeof *c); if (!e->cells) { free(e); return NULL; } memcpy(e->cells, c, (size_t)n * sizeof *c); }
+    e->cap = n; e->n = n; e->inl = true;
+    if (n) { e->cells = (mw_mcell *)((uint8_t *)e + off); memcpy(e->cells, c, (size_t)n * sizeof *c); }
     return e;
 }
 
@@ -210,19 +223,36 @@ void mw_meta_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]) {    
 }
 
 // ---- the overlay ----
+#define ARENA_BLOCK (64u << 10)
+static void *oa_alloc (mw_ovl *o, size_t n) {
+    n = (n + 7) & ~(size_t)7;
+    if (!o->ab || o->an + n > o->acap) {
+        size_t nc = n > ARENA_BLOCK ? n : ARENA_BLOCK;
+        if (o->ab) {
+            if (o->naold == o->capold) { int c = o->capold ? o->capold * 2 : 8; uint8_t **na = realloc(o->aold, (size_t)c * sizeof *na); if (!na) return NULL; o->aold = na; o->capold = c; }
+            o->aold[o->naold++] = o->ab;
+        }
+        o->ab = malloc(nc); o->an = 0; o->acap = o->ab ? nc : 0;
+        if (!o->ab) return NULL;
+    }
+    void *r = o->ab + o->an; o->an += n; return r;
+}
 mw_ovl *mw_ovl_new (mw_meta *m) { mw_ovl *o = calloc(1, sizeof *o); if (o) o->m = m; return o; }
 void mw_ovl_clear (mw_ovl *o) {
-    for (int i = 0; i < o->n; i++) { free(o->rows[i].pk); free(o->rows[i].c); }
+    for (int i = 0; i < o->n; i++) if (!o->rows[i].carena) free(o->rows[i].c);
+    for (int i = 0; i < o->naold; i++) free(o->aold[i]);
+    o->naold = 0; o->an = 0; if (o->acap > 4 * ARENA_BLOCK) { free(o->ab); o->ab = NULL; o->acap = 0; }
     for (int i = 0; i < o->nbk; i++) mm_group_free(&o->bk[i].g);
     o->nbk = 0; o->ng = 0; if (o->bkh) memset(o->bkh, 0xff, (size_t)o->bkhcap * sizeof(int));
-    o->npurge = 0;
+    o->npurge = 0; o->err = 0;
     o->n = 0; if (o->hash) memset(o->hash, 0xff, (size_t)o->hcap * sizeof(int));
     if (o->cap > 65536) { free(o->rows); o->rows = NULL; o->cap = 0; free(o->hash); o->hash = NULL; o->hcap = 0; }             // (a bulk load must not leave its tables behind)
     if (o->capbk > 65536) { free(o->bk); o->bk = NULL; o->capbk = 0; free(o->bkh); o->bkh = NULL; o->bkhcap = 0; }
 }
-void mw_ovl_free (mw_ovl *o) { if (!o) return; mw_ovl_clear(o); free(o->purge); free(o->bk); free(o->bkh); free(o->gbucket); free(o->goff); free(o->gseen); free(o->rows); free(o->hash); free(o); }
+void mw_ovl_free (mw_ovl *o) { if (!o) return; mw_ovl_clear(o); free(o->ab); free(o->aold); free(o->purge); free(o->bk); free(o->bkh); free(o->gbucket); free(o->goff); free(o->gseen); free(o->rows); free(o->hash); free(o); }
 void mw_ovl_set_value_fn (mw_ovl *o, mw_value_fn fn, void *arg) { o->vfn = fn; o->varg = arg; }
 void mw_ovl_hint_new (mw_ovl *o, bool on) { o->hint_new = on; }
+int mw_ovl_err (const mw_ovl *o) { return o->err; }
 bool mw_ovl_empty (const mw_ovl *o) { return o->n == 0 && o->npurge == 0; }
 void mw_ovl_purge (mw_ovl *o, uint32_t tbl) {
     for (int i = 0; i < o->npurge; i++) if (o->purge[i] == tbl) return;
@@ -248,13 +278,13 @@ static orow *ovl_row_make (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen
     while (o->hash[j] >= 0) { orow *r = &o->rows[o->hash[j]]; if (r->tbl == tbl && r->pklen == pklen && !memcmp(r->pk, pk, pklen)) return r; j = (j + 1) & (size_t)(o->hcap - 1); }
     if (o->n == o->cap) { int nc = o->cap ? o->cap * 2 : 64; orow *nr = realloc(o->rows, (size_t)nc * sizeof *nr); if (!nr) return NULL; o->rows = nr; o->cap = nc; }
     orow *r = &o->rows[o->n]; memset(r, 0, sizeof *r);
-    r->tbl = tbl; r->pklen = (uint32_t)pklen; r->pk = malloc(pklen ? pklen : 1); if (!r->pk) return NULL; memcpy(r->pk, pk, pklen);
+    r->tbl = tbl; r->pklen = (uint32_t)pklen; r->pk = oa_alloc(o, pklen ? pklen : 1); if (!r->pk) return NULL; memcpy(r->pk, pk, pklen);
     r->bk = -1;
     bool found = false;
     if (o->m->shared) {                                                    // shared mode: the row is in its bucket's newest state, or in the file
         uint32_t b = mw_bucket_of(tbl, pk, pklen); int bi = -1;
         if (o->bkhcap == 0 || (o->nbk + 1) * 2 > o->bkhcap) {                // (bucket id -> index in o->bk, open addressing)
-            int nc = o->bkhcap ? o->bkhcap * 2 : 64; int *nh = malloc((size_t)nc * sizeof(int)); if (!nh) { free(r->pk); return NULL; }
+            int nc = o->bkhcap ? o->bkhcap * 2 : 64; int *nh = malloc((size_t)nc * sizeof(int)); if (!nh) { return NULL; }
             memset(nh, 0xff, (size_t)nc * sizeof(int));
             for (int q = 0; q < o->nbk; q++) { size_t hh = (size_t)(o->bk[q].id * 2654435761u) & (size_t)(nc - 1); while (nh[hh] >= 0) hh = (hh + 1) & (size_t)(nc - 1); nh[hh] = q; }
             free(o->bkh); o->bkh = nh; o->bkhcap = nc;
@@ -262,21 +292,23 @@ static orow *ovl_row_make (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen
         size_t hb = (size_t)(b * 2654435761u) & (size_t)(o->bkhcap - 1);
         while (o->bkh[hb] >= 0) { if (o->bk[o->bkh[hb]].id == b) { bi = o->bkh[hb]; break; } hb = (hb + 1) & (size_t)(o->bkhcap - 1); }
         if (bi < 0) {
-            if (o->nbk == o->capbk) { int nc = o->capbk ? o->capbk * 2 : 8; obk *nb = realloc(o->bk, (size_t)nc * sizeof *nb); if (!nb) { free(r->pk); return NULL; } o->bk = nb; o->capbk = nc; }
+            if (o->nbk == o->capbk) { int nc = o->capbk ? o->capbk * 2 : 8; obk *nb = realloc(o->bk, (size_t)nc * sizeof *nb); if (!nb) { return NULL; } o->bk = nb; o->capbk = nc; }
             obk *x = &o->bk[o->nbk]; memset(x, 0, sizeof *x); x->id = b;
-            if (mm_head(o->m, b, &x->g) != 0) { free(r->pk); return NULL; }
+            if (mm_head(o->m, b, &x->g) != 0) { return NULL; }
             x->seen = x->g.epoch; bi = o->nbk++; o->bkh[hb] = bi;
         }
         r->bk = bi;
         const mm_group *g = &o->bk[bi].g;
         for (int q = 0; q < g->n && !found; q++) if (g->rows[q].tbl == tbl && g->rows[q].pklen == pklen && !memcmp(g->rows[q].pk, pk, pklen)) {
-            r->n = g->rows[q].n; r->c = malloc((size_t)(r->n ? r->n : 1) * sizeof(mw_mcell)); if (!r->c) { free(r->pk); return NULL; }
+            r->n = g->rows[q].n; r->c = malloc((size_t)(r->n ? r->n : 1) * sizeof(mw_mcell)); if (!r->c) { return NULL; }
             memcpy(r->c, g->rows[q].c, (size_t)r->n * sizeof(mw_mcell)); found = true;
         }
     } else {
-        int pr = mem_peek(o->m, tbl, pk, pklen, &r->c, &r->n);
-        if (pr < 0) { free(r->pk); return NULL; }
-        found = pr == 1;
+        if (!(is_new && !mw_meta_bloom_maybe(o->m, tbl, pk, pklen))) {       // (a new key that is not in the filter is in no entry either: every entry's key went into it)
+            int pr = mem_peek(o->m, tbl, pk, pklen, &r->c, &r->n);
+            if (pr < 0) return NULL;
+            found = pr == 1;
+        }
     }
     if (!found) {
         if (is_new && !mw_meta_bloom_maybe(o->m, tbl, pk, pklen)) { r->c = NULL; r->n = 0; }              // (no earlier life: nothing to load)
@@ -290,8 +322,9 @@ static orow *ovl_row_make (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen
 static orow *ovl_row (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen, bool create) {
     (void)create;
     bool need; orow *r = ovl_row_make(o, tbl, pk, pklen, o->hint_new, &need);
+    if (!r) { if (!o->err) o->err = SQLITE_NOMEM; return NULL; }
     if (r && need) {
-        if (file_load(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) return NULL;
+        if (file_load(o->m, tbl, pk, pklen, &r->c, &r->n) != 0) { o->err = SQLITE_IOERR_READ; return NULL; }
         if (!o->m->shared) mem_cache(o->m, tbl, pk, pklen, r->c, r->n);
         r->cap = r->n;
     }
@@ -303,8 +336,9 @@ void mw_ovl_prefetch (mw_ovl *o, const mw_want *w, int n) {
     int *pend = NULL, np = 0; int cap = 0;
     for (int i = 0; i < n; i++) {
         bool need; int before = o->n; orow *r = ovl_row_make(o, w[i].tbl, w[i].pk, w[i].pklen, w[i].is_new, &need);
-        if (!r || !need || o->n == before) continue;                              // (a row that was there already is loaded already)
-        if (np == cap) { cap = cap ? cap * 2 : 128; int *np2 = realloc(pend, (size_t)cap * sizeof *pend); if (!np2) { free(pend); return; } pend = np2; }
+        if (!r) { o->err = SQLITE_NOMEM; continue; }
+        if (!need || o->n == before) continue;                              // (a row that was there already is loaded already)
+        if (np == cap) { cap = cap ? cap * 2 : 128; int *np2 = realloc(pend, (size_t)cap * sizeof *pend); if (!np2) { free(pend); o->err = SQLITE_NOMEM; return; } pend = np2; }
         pend[np++] = o->n - 1;
     }
     if (np) {
@@ -312,7 +346,9 @@ void mw_ovl_prefetch (mw_ovl *o, const mw_want *w, int n) {
         mw_mcell **cells = calloc((size_t)np, sizeof *cells); int *nc = calloc((size_t)np, sizeof *nc);
         if (tb && pk && pl && cells && nc) {
             for (int i = 0; i < np; i++) { const orow *r = &o->rows[pend[i]]; tb[i] = r->tbl; pk[i] = r->pk; pl[i] = r->pklen; }
-            if (mw_metafile_load_many(o->m, np, tb, pk, pl, cells, nc) == 0) {
+            int lm = mw_metafile_load_many(o->m, np, tb, pk, pl, cells, nc);
+            if (lm != 0) o->err = SQLITE_IOERR_READ;
+            if (lm == 0) {
                 for (int i = 0; i < np; i++) { orow *r = &o->rows[pend[i]]; r->c = cells[i]; r->n = nc[i]; r->cap = nc[i]; if (!o->m->shared) mem_cache(o->m, r->tbl, r->pk, r->pklen, r->c, r->n); }
                 np = 0;                                                         // (all taken)
             }
@@ -335,7 +371,13 @@ static void ops_put (void *st, uint32_t tbl, const void *pk, size_t pklen, uint3
     orow *r = ovl_row(st, tbl, pk, pklen, true); if (!r) return;
     mw_mcell *c = cell_find(r, col);
     if (!c) {
-        if (r->n == r->cap) { int nc = r->cap ? r->cap * 2 : 4; mw_mcell *nm = realloc(r->c, (size_t)nc * sizeof *nm); if (!nm) return; r->c = nm; r->cap = nc; }
+        if (r->n == r->cap) {
+            int nc = r->cap ? r->cap * 2 : 8; mw_mcell *nm;
+            if (!r->c) { nm = oa_alloc(st, (size_t)nc * sizeof *nm); r->carena = nm != NULL; }                  // (the first cells of a new row: from the arena)
+            else if (r->carena) { nm = malloc((size_t)nc * sizeof *nm); if (nm) { memcpy(nm, r->c, (size_t)r->n * sizeof *nm); r->carena = false; } }
+            else nm = realloc(r->c, (size_t)nc * sizeof *nm);
+            if (!nm) return; r->c = nm; r->cap = nc;
+        }
         c = &r->c[r->n++];
     }
     *c = (mw_mcell){ cc->cv, OV_CHG, col, cc->site, (uint32_t)cc->seq };
@@ -462,14 +504,20 @@ static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pkle
         if (!ne) { pthread_mutex_unlock(&s->mu); return -1; }
         for (int k = 0; k < n; k++) if (ne->cells[k].dv == OV_CHG) ne->cells[k].dv = (int64_t)epoch;
         ne->ver = epoch; ne->in_dirty = true;
-        if (!dq_push(s, ne)) { free(ne->cells); free(ne); pthread_mutex_unlock(&s->mu); return -1; }
+        if (!dq_push(s, ne)) { entry_free(ne); pthread_mutex_unlock(&s->mu); return -1; }
         insert_entry(m, s, ne); atomic_fetch_add(&m->ndirty, 1);
     } else {
         if (!e->in_dirty) { if (!dq_push(s, e)) { pthread_mutex_unlock(&s->mu); return -1; } e->in_dirty = true; atomic_fetch_add(&m->ndirty, 1); }
         size_t before = entry_bytes(e);
         bool removed = false;                                          // a cell of the old state is not in the new one: the file has to forget it
         for (int i = 0; i < e->n && !removed; i++) { bool f = false; for (int k = 0; k < n; k++) if (c[k].col == e->cells[i].col) { f = true; break; } if (!f) removed = true; }
-        if (n > e->cap) { mw_mcell *nm = realloc(e->cells, (size_t)n * sizeof *nm); if (!nm) { pthread_mutex_unlock(&s->mu); return -1; } e->cells = nm; e->cap = n; }
+        if (n > e->cap) {
+            mw_mcell *nm;
+            if (e->inl) { nm = malloc((size_t)n * sizeof *nm); if (nm && e->n) memcpy(nm, e->cells, (size_t)e->n * sizeof *nm); }
+            else nm = realloc(e->cells, (size_t)n * sizeof *nm);
+            if (!nm) { pthread_mutex_unlock(&s->mu); return -1; }
+            e->cells = nm; e->cap = n; e->inl = false;
+        }
         for (int k = 0; k < n; k++) { e->cells[k] = c[k]; if (c[k].dv == OV_CHG) e->cells[k].dv = (int64_t)epoch; }
         e->n = n;
         if (removed) e->drop_ver = epoch;
@@ -486,9 +534,9 @@ static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pkle
 static void purge_table (mw_meta *m, uint32_t tbl, uint64_t epoch) {
     for (int s = 0; s < STRIPES; s++) {
         stripe *st = &m->st[s]; pthread_mutex_lock(&st->mu);
-        for (size_t k = 0; k < st->nb; k++) { mentry **pp = &st->b[k]; while (*pp) { mentry *e = *pp; if (e->tbl == tbl) { *pp = e->next; st->n--; st->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); if (e->in_dirty) e->tbl = 0xFFFFFFFFu; else { free(e->cells); free(e); } } else pp = &e->next; } }
+        for (size_t k = 0; k < st->nb; k++) { mentry **pp = &st->b[k]; while (*pp) { mentry *e = *pp; if (e->tbl == tbl) { *pp = e->next; st->n--; st->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); if (e->in_dirty) e->tbl = 0xFFFFFFFFu; else entry_free(e); } else pp = &e->next; } }
         // dirty entries of the table: unlinked from the dirty list too (the list owns them now)
-        { size_t k = 0; for (size_t i = 0; i < st->ndq; i++) { mentry *e = st->dq[i]; if (e->tbl == 0xFFFFFFFFu && e->in_dirty) { atomic_fetch_sub(&m->ndirty, 1); free(e->cells); free(e); } else st->dq[k++] = e; } st->ndq = k; }
+        { size_t k = 0; for (size_t i = 0; i < st->ndq; i++) { mentry *e = st->dq[i]; if (e->tbl == 0xFFFFFFFFu && e->in_dirty) { atomic_fetch_sub(&m->ndirty, 1); entry_free(e); } else st->dq[k++] = e; } st->ndq = k; }
         st->gen++; pthread_mutex_unlock(&st->mu);
     }
     pthread_mutex_lock(&m->purge_mu);

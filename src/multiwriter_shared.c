@@ -20,6 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include "multiwriter_io.h"
 #include "multiwriter_internal.h"
 #include "multiwriter_seglog.h"
 #include "multiwriter_meta_priv.h"
@@ -408,12 +409,12 @@ int mw_shared_compact (mw_db *db, mw_compact_result *out) {
     rc = c.rc;
     for (uint32_t i = 0; i < c.n && rc == SQLITE_OK; i++) {
         if (!mw_seglog_read(db, c.locs[i], 0, (uint32_t)c.pgsz, c.page)) { rc = SQLITE_IOERR_READ; break; }
-        ssize_t w = pwrite(fd, c.page, c.pgsz, (off_t)(c.list[i] - 1) * (off_t)c.pgsz);
+        ssize_t w = mw_io_pwrite(fd, c.page, c.pgsz, (off_t)(c.list[i] - 1) * (off_t)c.pgsz);
         if (w != (ssize_t)c.pgsz) rc = SQLITE_IOERR_WRITE; else out->pages_written++;
     }
     uint32_t size_pages = 0;
-    if (rc == SQLITE_OK && shidx_dbsize(db->ix, T, &size_pages) && size_pages && ftruncate(fd, (off_t)size_pages * (off_t)c.pgsz) != 0) rc = SQLITE_IOERR_TRUNCATE;
-    if (rc == SQLITE_OK && fsync(fd) != 0) rc = SQLITE_IOERR_FSYNC;
+    if (rc == SQLITE_OK && shidx_dbsize(db->ix, T, &size_pages) && size_pages && mw_io_ftruncate(fd, (off_t)size_pages * (off_t)c.pgsz) != 0) rc = SQLITE_IOERR_TRUNCATE;
+    if (rc == SQLITE_OK && mw_io_fsync(fd) != 0) rc = SQLITE_IOERR_FSYNC;
     if (rc == SQLITE_OK) mw_fault_hit(MW_CRASH_COMPACT_PAGES);
     if (rc == SQLITE_OK) {                                                      // the base becomes durable, then visible
         rc = mw_seglog_set_base(db, T);

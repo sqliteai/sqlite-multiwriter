@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include "multiwriter_io.h"
 #include "multiwriter_shidx.h"
 
 #define SHIDX_MAGIC   0x58444953574d4357ull         // "WCMWSIDX"
@@ -109,8 +110,8 @@ shidx *shidx_open (const char *path, const shidx_params *params) {
         h.off_slots = align_up(h.off_arena + ((size_t)p.max_entries + 1) * sizeof(ver), 4096);
         h.off_cand = align_up(h.off_slots + (size_t)p.nslots * sizeof(slot), 4096);
         h.total = align_up(h.off_cand + (size_t)p.max_cands * 4, 4096);
-        if (ftruncate(fd, (off_t)h.total) != 0) { int e = errno; flock(fd, LOCK_UN); close(fd); errno = e; return NULL; }
-        uint8_t *m = mmap(NULL, h.total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mw_io_ftruncate(fd, (off_t)h.total) != 0) { int e = errno; flock(fd, LOCK_UN); close(fd); errno = e; return NULL; }
+        uint8_t *m = mw_io_mmap(NULL, h.total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (m == MAP_FAILED) { int e = errno; flock(fd, LOCK_UN); close(fd); errno = e; return NULL; }
         hdr *hp = (hdr *)m;
         memcpy(hp, &h, sizeof h);
@@ -119,11 +120,11 @@ shidx *shidx_open (const char *path, const shidx_params *params) {
         atomic_init(&hp->committed, 1); atomic_init(&hp->floor, 0);
         atomic_thread_fence(memory_order_seq_cst);
         hp->magic = SHIDX_MAGIC;                                    // last: an opener that sees the magic sees everything
-        msync(m, 4096, MS_ASYNC);
+        mw_io_msync(m, 4096, MS_ASYNC);
         munmap(m, h.total);
     }
     if (fstat(fd, &sb) != 0) { flock(fd, LOCK_UN); close(fd); return NULL; }
-    uint8_t *m = mmap(NULL, (size_t)sb.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    uint8_t *m = mw_io_mmap(NULL, (size_t)sb.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     flock(fd, LOCK_UN);
     if (m == MAP_FAILED) { close(fd); return NULL; }
     hdr *h = (hdr *)m;

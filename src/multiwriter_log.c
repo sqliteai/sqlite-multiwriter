@@ -22,6 +22,7 @@
 //
 
 #include <errno.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +33,7 @@
 #include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "multiwriter_io.h"
 #include "multiwriter_internal.h"
 #include "multiwriter_seglog.h"
 
@@ -80,6 +82,28 @@ bool mw_fault_hit (mw_fault_t f) {
     return true;
 }
 
+
+// ---- I/O fault injection (multiwriter_io.h) ----
+_Atomic int mw_io_armed;
+static _Atomic long io_left, io_calls; static _Atomic int io_kinds, io_err, io_sticky, io_short, io_fired;
+void mw_io_fault_arm (int kinds, long nth, int err, int sticky, int shortw) {
+    atomic_store(&io_calls, 0); atomic_store(&io_fired, 0); atomic_store(&io_kinds, kinds); atomic_store(&io_err, err ? err : EIO);
+    atomic_store(&io_sticky, sticky || shortw); atomic_store(&io_short, shortw); atomic_store(&io_left, nth);
+    atomic_store(&mw_io_armed, 1);
+}
+void mw_io_fault_disarm (void) { atomic_store(&mw_io_armed, 0); atomic_store(&io_fired, 0); }
+long mw_io_fault_calls (void) { return atomic_load(&io_calls); }
+int mw_io_fault (int kind, size_t *partial) {
+    if (!(kind & atomic_load(&io_kinds))) return 0;
+    atomic_fetch_add(&io_calls, 1);
+    if (atomic_load(&io_fired)) return atomic_load(&io_sticky) ? (kind == MW_IO_MAP ? ENOMEM : atomic_load(&io_err)) : 0;
+    if (atomic_fetch_sub(&io_left, 1) != 1) return 0;
+    atomic_store(&io_fired, 1);
+    if (getenv("MW_IO_TRACE")) { void *bt[24]; int n = backtrace(bt, 24); fprintf(stderr, "io fault fires (kind %d):\n", kind); backtrace_symbols_fd(bt, n, 2); }
+    if (partial && atomic_load(&io_short)) *partial = 1;
+    return kind == MW_IO_MAP ? ENOMEM : atomic_load(&io_err);
+}
+
 // MARK: - checksums and I/O helpers -
 
 // 64-bit word-at-a-time multiply/xor mixer (about 10x faster than byte-wise FNV; profiling showed the log
@@ -102,7 +126,7 @@ static uint64_t fnv64 (uint64_t h, const void *p, size_t n) {
 static int pwrite_all (int fd, const void *buf, size_t n, off_t off) {
     const char *p = buf;
     while (n > 0) {
-        ssize_t w = pwrite(fd, p, n, off);
+        ssize_t w = mw_io_pwrite(fd, p, n, off);
         if (w < 0) { if (errno == EINTR) continue; return SQLITE_IOERR_WRITE; }
         p += w; off += w; n -= (size_t)w;
     }
@@ -112,7 +136,7 @@ static int pwrite_all (int fd, const void *buf, size_t n, off_t off) {
 static int pread_all (int fd, void *buf, size_t n, off_t off) {
     char *p = buf;
     while (n > 0) {
-        ssize_t r = pread(fd, p, n, off);
+        ssize_t r = mw_io_pread(fd, p, n, off);
         if (r < 0) { if (errno == EINTR) continue; return SQLITE_IOERR_READ; }
         if (r == 0) return SQLITE_IOERR_SHORT_READ;
         p += r; off += r; n -= (size_t)r;
@@ -133,7 +157,7 @@ static int hdr_write (mw_db *db, uint32_t pgsz, uint64_t base, uint64_t salt) {
     h.version = 1; h.pgsz = pgsz; h.base_epoch = base; h.salt = salt;
     h.cksum = hdr_cksum(&h);
     int rc = pwrite_all(db->logfd, &h, sizeof h, 0);
-    if (rc == SQLITE_OK && fsync(db->logfd) != 0) rc = SQLITE_IOERR_FSYNC;
+    if (rc == SQLITE_OK && mw_io_fsync(db->logfd) != 0) rc = SQLITE_IOERR_FSYNC;
     return rc;
 }
 
@@ -185,7 +209,7 @@ int mw_log_open (mw_db *db, int pgsz) {
     uint64_t base = 1;
     if (!valid) {                                            // new (or unusable) log: start empty from the real file
         sqlite3_randomness(sizeof db->log_salt, &db->log_salt);
-        if (ftruncate(db->logfd, 0) != 0) return SQLITE_IOERR;
+        if (mw_io_ftruncate(db->logfd, 0) != 0) return SQLITE_IOERR;
         int rc = hdr_write(db, (uint32_t)pgsz, base, db->log_salt);
         if (rc != SQLITE_OK) return rc;
         db->log_off = LOG_HDR_SIZE;
@@ -247,7 +271,7 @@ int mw_log_open (mw_db *db, int pgsz) {
     }
     free(buf);
     if (rc != SQLITE_OK) return rc;
-    if (limit == UINT64_MAX && sb.st_size > off && ftruncate(db->logfd, off) != 0) return SQLITE_IOERR;       // drop the torn tail (only the first process)
+    if (limit == UINT64_MAX && sb.st_size > off && mw_io_ftruncate(db->logfd, off) != 0) return SQLITE_IOERR;       // drop the torn tail (only the first process)
     db->log_off = (uint64_t)off;
     mw_log_stage_reset(db, db->log_off);
     pthread_mutex_lock(&st->seq_mu); mw_log_remap(db); pthread_mutex_unlock(&st->seq_mu);
@@ -300,7 +324,7 @@ void mw_log_remap (mw_db *db) {
     log_unmap(db, true);
     struct stat sb;
     db->logfile_size = fstat(db->logfd, &sb) == 0 ? log_usable(db, (uint64_t)sb.st_size) : 0;
-    void *m = mmap(NULL, LOG_MAP_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, db->logfd, 0);
+    void *m = mw_io_mmap(NULL, LOG_MAP_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, db->logfd, 0);
     log_mapped(db, m);
     mw_log_reserve_space(db);
 }
@@ -311,7 +335,7 @@ void mw_log_remap_ro (mw_db *db, uint64_t need_end) {
     struct stat sb;
     db->logfile_size = fstat(db->logfd, &sb) == 0 ? log_usable(db, (uint64_t)sb.st_size) : 0;
     if (db->logmap) return;                          // (the mapping always spans LOG_MAP_BYTES: only the file size changed, and other threads may be using the mapping)
-    void *m = mmap(NULL, LOG_MAP_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, db->logfd, 0);
+    void *m = mw_io_mmap(NULL, LOG_MAP_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, db->logfd, 0);
     log_mapped(db, m);
 }
 
@@ -423,7 +447,7 @@ void mw_log_reserve_space (mw_db *db) {
     struct stat cur;
     if (fstat(db->logfd, &cur) == 0 && (uint64_t)cur.st_size >= need) { db->logfile_size = (uint64_t)cur.st_size; return; }     // someone else already grew it
     uint64_t size = ((need + LOG_GROW_BYTES - 1) / LOG_GROW_BYTES) * LOG_GROW_BYTES;
-    if (size > LOG_MAP_BYTES || ftruncate(db->logfd, (off_t)size) != 0) return;     // cannot map further: records past logfile_size are pwritten (the mapping stays: appenders may be using it)
+    if (size > LOG_MAP_BYTES || mw_io_ftruncate(db->logfd, (off_t)size) != 0) return;     // cannot map further: records past logfile_size are pwritten (the mapping stays: appenders may be using it)
     db->logfile_size = size;
 }
 
@@ -470,7 +494,7 @@ static uint64_t ck_final (ckstream *c) { for (int i = 0; i < c->tn; i++) { c->h 
 static bool stage_alloc (mw_db *db) {
     if (db->stage_buf) return true;
     uint64_t R = 8ull << 20;
-    void *m = mmap(NULL, (size_t)R, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    void *m = mw_io_mmap(NULL, (size_t)R, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (m == MAP_FAILED) return false;
     db->stage_buf = m; db->stage_r = R;
     return true;
@@ -507,7 +531,7 @@ static int ring_write_file (mw_db *db, uint64_t from, uint64_t len) {
         uint64_t R = db->stage_r, pos = from & (R - 1);
         size_t first = len < R - pos ? (size_t)len : (size_t)(R - pos);
         struct iovec iov[2] = { { db->stage_buf + pos, first }, { db->stage_buf, (size_t)len - first } };
-        ssize_t w = pwritev(db->logfd, iov, len > first ? 2 : 1, (off_t)from);
+        ssize_t w = mw_io_pwritev(db->logfd, iov, len > first ? 2 : 1, (off_t)from);
         if (w < 0) { if (errno == EINTR) continue; return SQLITE_IOERR_WRITE; }
         from += (uint64_t)w; len -= (uint64_t)w;
     }
@@ -680,7 +704,7 @@ static int sync_staged (mw_db *db, uint64_t my_end) {
             uint64_t target = db->flushed_off, target_epoch = db->flushed_epoch;
             pthread_mutex_unlock(&db->log_mu);
             uint64_t tc0 = MW_T0();
-            int frc = mw_fault_hit(MW_FAULT_LOG_SYNC_ERR) ? -1 : fsync(db->logfd);
+            int frc = mw_fault_hit(MW_FAULT_LOG_SYNC_ERR) ? -1 : mw_io_fsync(db->logfd);
             MW_T1(MW_ST_SY_FSYNC, tc0);
             MW_T1(MW_ST_SY_CYCLE, tc0);
             pthread_mutex_lock(&db->log_mu);
@@ -799,10 +823,10 @@ int mw_log_sync (mw_db *db, uint64_t epoch, uint64_t my_end) {
                     if (!osp) osp = (uint64_t)sysconf(_SC_PAGESIZE);                   // msync needs OS-page alignment (16 KB on Apple silicon)
                     uint64_t from = lo & ~(osp - 1), to = (hi + osp - 1) & ~(osp - 1);
                     if (to > LOG_MAP_BYTES) to = LOG_MAP_BYTES;                      // (records past the mapping were pwritten: fsync covers them)
-                    if (to > from) frc = msync(map + from, (size_t)(to - from), MS_SYNC); else frc = 0;
+                    if (to > from) frc = mw_io_msync(map + from, (size_t)(to - from), MS_SYNC); else frc = 0;
                     if (frc == 0) { pthread_mutex_lock(&db->log_mu); if (hi > db->logsync_off) db->logsync_off = hi; pthread_mutex_unlock(&db->log_mu); }
                 } else frc = 0;
-                if (frc == 0) frc = fsync(fd);
+                if (frc == 0) frc = mw_io_fsync(fd);
             }
             pthread_mutex_lock(&db->log_mu);
             db->sync_running = false;
@@ -948,8 +972,8 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch) {
         pos += n; out += n;
     }
     free(buf);
-    if (rc == SQLITE_OK && fsync(nfd) != 0) rc = SQLITE_IOERR_FSYNC;
-    if (rc == SQLITE_OK && rename(tmp, db->logpath) != 0) rc = SQLITE_IOERR;
+    if (rc == SQLITE_OK && mw_io_fsync(nfd) != 0) rc = SQLITE_IOERR_FSYNC;
+    if (rc == SQLITE_OK && mw_io_rename(tmp, db->logpath) != 0) rc = SQLITE_IOERR;
     if (rc == SQLITE_OK) mw_fault_hit(MW_CRASH_LOG_RENAME);
     if (rc != SQLITE_OK) { close(nfd); unlink(tmp); sqlite3_free(tmp); return rc; }
     sqlite3_free(tmp);
@@ -1002,7 +1026,7 @@ int mw_log_reopen (mw_db *db) {
     db->logfd = nfd;
     struct stat sb;
     db->logfile_size = fstat(nfd, &sb) == 0 ? (uint64_t)sb.st_size : 0;     // (a new file: the caller of the replacement publishes its size as shm->log_ready)
-    void *m = mmap(NULL, LOG_MAP_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, nfd, 0);
+    void *m = mw_io_mmap(NULL, LOG_MAP_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, nfd, 0);
     log_mapped(db, m);
     sync_resume(db);
     return db->logmap ? SQLITE_OK : SQLITE_IOERR;

@@ -28,6 +28,8 @@ LIB_OBJ := $(ENGINE_OBJ) $(CRDT_OBJ) $(LZ4_OBJ) $(BUILD)/sqlite3.o
 
 TEST_SRC := $(wildcard test/mw_*.c)
 TEST_BIN := $(patsubst test/%.c,$(DIST)/%,$(TEST_SRC))
+IO_TESTS := $(DIST)/mw_ioerr $(DIST)/mw_diskfull                       # (minutes: make test-io)
+FAST_BIN := $(filter-out $(IO_TESTS),$(TEST_BIN))
 
 .PHONY: all test bench clean
 all: $(TEST_BIN)
@@ -52,8 +54,13 @@ $(DIST)/mw_%: $(BUILD)/t_mw_%.o $(LIB_OBJ)
 	$(CC) $^ -o $@ $(LDFLAGS)
 .PRECIOUS: $(BUILD)/t_%.o
 
-test: $(TEST_BIN)
-	@set -e; for t in $(TEST_BIN); do echo "== $$t"; ./$$t; done
+test: $(FAST_BIN)
+	@set -e; for t in $(FAST_BIN); do echo "== $$t"; ./$$t; done
+
+# errors of the file system: a fault at every n-th file call of a workload, and a real full disk (a small disk image)
+.PHONY: test-io
+test-io: $(IO_TESTS)
+	@set -e; for t in $(IO_TESTS); do echo "== $$t"; ./$$t; done
 
 bench: $(DIST)/mw_bench
 $(BUILD)/b_mw_bench.o: bench/mw_bench.c $(HEADERS)

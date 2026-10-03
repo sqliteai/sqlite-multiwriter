@@ -451,6 +451,13 @@ static int flush_impl (mw_meta *m, bool wait) {
     mw_shm *sh = m->shared ? m->db->shm : NULL;
     pthread_mutex_lock(&m->file_mu);
     if (sh && !mw_mp_meta_lock(m->db, 1, wait)) { pthread_mutex_unlock(&m->file_mu); return 0; }
+    if (sh && !wait) {
+        // The flushers of all the processes wake up for the same dirty count, and the one that gets the lock takes everything: the others, behind it, would write a run of what
+        // the commits since then added (a few rows). They look again with the lock held, and leave it to the next time unless there is enough or it is long since the last flush.
+        const char *er = getenv("MW_META_FLUSH_ROWS"); uint64_t rows = er ? (uint64_t)atoll(er) : 16384;
+        uint64_t d = mw_meta_dirty(m), age = now_ns() - atomic_load(&sh->meta_flush_ns);
+        if (d < rows / 2 && age < 20ull * 1000000ull) { mw_mp_meta_unlock(m->db, 1); pthread_mutex_unlock(&m->file_mu); return 0; }
+    }
     uint64_t t0 = now_ns();
     int64_t origin = mw_meta_origin(m);
     uint64_t Ve = sh ? atomic_load_explicit(&sh->committed_epoch, memory_order_acquire) : atomic_load(&m->db->epoch);
@@ -497,6 +504,7 @@ static int flush_impl (mw_meta *m, bool wait) {
     }
     atomic_fetch_add(&m->flush_ns, now_ns() - t0);
     m->last_flush_ns = now_ns();
+    if (sh) atomic_store(&sh->meta_flush_ns, m->last_flush_ns);
 out:
     if (taken) collect_done(m, det, false);                                      // (failed: the entries are dirty again)
     free(purge);
@@ -540,7 +548,8 @@ static void *flusher_main (void *arg) {
         const char *er = getenv("MW_META_FLUSH_ROWS"), *em = getenv("MW_META_FLUSH_MS");           // (tests: flush very often)
         uint64_t rows = er ? (uint64_t)atoll(er) : 16384, ms = em ? (uint64_t)atoll(em) : 250;
         d = mw_meta_dirty(m);
-        uint64_t age = now_ns() - m->last_flush_ns;
+        uint64_t lastf = m->last_flush_ns; if (m->shared) { uint64_t o = atomic_load(&m->db->shm->meta_flush_ns); if (o > lastf) lastf = o; }          // (several processes: the newest flush of anybody)
+        uint64_t age = now_ns() - lastf;
         const char *ek = getenv("MW_META_KICK_MS"); uint64_t kick_ns = (ek ? (uint64_t)atoll(ek) : 20) * 1000000ull;
         // a flush is a transaction of its own (a log record, a sync): small ones at a high rate cost the writers more than they save, so a kick is heard only when the last flush is not too recent
         if (d && ((kicked && (age > kick_ns || d >= 4 * rows)) || d >= rows || age > ms * 1000000ull)) flush_impl(m, false);

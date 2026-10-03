@@ -99,6 +99,7 @@ typedef struct mw_shm {
 #define MW_MAX_PURGE 64
     _Atomic uint64_t  dv_origin;          // db_version = epoch + dv_origin (an incarnation of the database starts its epochs again at 1; the db_versions go on from the largest one the file has seen)
     _Atomic uint64_t  dv_hwm;             // the largest db_version written to the file tables
+    _Atomic uint64_t  meta_flush_ns;      // when (CLOCK_MONOTONIC) the last flush of any process ended: the flushers of all the processes pace themselves by it
     _Atomic uint64_t  meta_flushed;       // db_version up to which the cells are in the file tables
     _Atomic uint64_t  rx_gc_base;          // the last garbage collection of the metadata index ran with this base (nothing older than it is in a chain's head any more)
     _Atomic uint64_t  meta_last;          // epoch of the newest commit that carried metadata

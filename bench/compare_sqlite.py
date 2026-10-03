@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Multi-Writer vs stock SQLite (WAL, synchronous=FULL), bulk inserts of 100 rows per transaction, every run on a fresh database.
 usage: compare_sqlite.py threads|procs <out.jsonl> [duration] [points...]
-Variants: mw (Multi-Writer with the CRDT capture on: every table tracked; the shared multi-process mode for processes), mw0 (the same engine without the capture), sqlite (stock WAL, busy_timeout 60 s: the library waits inside the call, the application sees no
+Variants: mw (Multi-Writer with the CRDT capture on: every table tracked; the engine of one process for threads, the shared multi-process mode for processes), mw0 (the same engine without the capture), sqlite (stock WAL, busy_timeout 60 s: the library waits inside the call, the application sees no
 retry), sqlite0 (stock WAL, busy_timeout 0: the application retries a refused transaction with jittered backoff, retries are counted).
 Measures per run: tx/s, retries, transactions that gave up, the time a transaction waits before its write may start (first attempt -> BEGIN IMMEDIATE + first
 read done: for SQLite that is the write lock, for Multi-Writer the admission), latency, memory (per-process RSS; for processes also the system-wide growth of
@@ -27,7 +27,7 @@ def clean(db):
     for f in glob.glob(db + "*"): os.unlink(f)
 
 def common(mode, extra, db, n):
-    mp = 1 if mode == "multiwriter" else 0
+    mp = (1 if kind == "procs" or os.environ.get("THREADS_MP") else 0) if mode == "multiwriter" else 0       # (threads: the engine of one process, mw_mp=0; THREADS_MP=1: the shared mode with threads)
     return [BIN, "--mode", mode, "--workload", "bulk", "--path", db, "--mp", str(mp), "--sync", "full", "--retry", "1000", "--begin-wait"] + extra
 
 def run(variant, n):

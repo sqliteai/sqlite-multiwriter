@@ -255,14 +255,20 @@ int shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint
     uint32_t room = h->n_free + (h->max_entries - h->arena_top);
     if (room < need) return -1;
     for (int i = 0; i < n; i++) if ((pgnos[i] >> BLOCK_BITS) >= h->dir_n || pgnos[i] == 0) return -2;
-    if (!head_ref(ix, 0, true)) return -2;
-    for (int i = 0; i < n; i++) if (!head_ref(ix, pgnos[i], true)) return -2;       // (blocks first: a failure here must leave no half-installed commit; an allocated block is harmless)
+    // (blocks first: a failure here must leave no half-installed commit; an allocated block is harmless. The head cells are looked up once, and fetched into the cache all together: a commit of
+    // a hundred rows of metadata touches a hundred cells of a file of some hundred MB, and one miss after the other was most of its time under the publication lock)
+    _Atomic uint32_t *hrs_small[130]; _Atomic uint32_t **hrs = (size_t)n + 1 <= 130 ? hrs_small : malloc(((size_t)n + 1) * sizeof *hrs);
+    if (!hrs) return -2;
+    for (int i = -1; i < n; i++) {
+        _Atomic uint32_t *hr = head_ref(ix, i < 0 ? 0 : pgnos[i], true);
+        if (!hr) { if (hrs != hrs_small) free(hrs); return -2; }
+        hrs[i + 1] = hr; __builtin_prefetch((const void *)hr, 1);
+    }
     // (the size record first, then the pages: all with the same epoch, invisible to snapshots until shidx_publish)
     for (int i = -1; i < n; i++) {
         uint32_t pgno = i < 0 ? 0 : pgnos[i];
         uint64_t loc = i < 0 ? dbsize : locs[i];
-        _Atomic uint32_t *hr = head_ref(ix, pgno, true);
-        if (!hr) return -2;
+        _Atomic uint32_t *hr = hrs[i + 1];
         uint32_t e = arena_alloc(ix);
         ver *v = &ix->arena[e];
         uint32_t oldw = atomic_load_explicit(hr, memory_order_relaxed), old = HIDX(oldw);
@@ -275,6 +281,7 @@ int shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint
         if (!q) { cand_push(ix, pgno); q = QBIT; }                              // every page with a version waits for GC: a second version, or the base passing the first
         atomic_store_explicit(hr, e | q, memory_order_release);                 // publishes the entry
     }
+    if (hrs != hrs_small) free(hrs);
     h->installed = epoch;
     h->st_installs++;
     return 0;

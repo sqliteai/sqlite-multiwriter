@@ -247,11 +247,12 @@ int rs_builder_finish (rs_builder *b, uint8_t **meta, size_t *metalen, uint64_t 
 }
 
 // ---- merging ----
-typedef struct { const rs_run *run; uint32_t blk; uint8_t *buf; size_t buflen; uint8_t *raw; rs_blk b; uint32_t i; bool done; rs_key k; int64_t dv; const uint8_t *cells; uint32_t nc; } mit;
+typedef struct { const rs_run *run; uint32_t blk; uint8_t *buf; size_t buflen; uint8_t *raw; rs_blk b; uint32_t i; bool done; rs_key k; uint64_t pfx; int64_t dv; const uint8_t *cells; uint32_t nc; } mit;
 static int mit_advance (mit *it, const rs_merge_opts *o) {
     for (;;) {
         if (it->buf && it->i < it->b.nrows) {
             if (!rs_blk_row(&it->b, it->i, &it->k, &it->dv, &it->cells, &it->nc)) return -2;
+            { uint64_t p = 0; uint32_t n = it->k.pklen < 8 ? it->k.pklen : 8; for (uint32_t q = 0; q < 8; q++) p = (p << 8) | (q < n ? it->k.pk[q] : 0); it->pfx = p; }
             it->i++; return 0;
         }
         if (it->buf) { free(it->buf); free(it->raw); it->buf = NULL; it->raw = NULL; it->blk++; }
@@ -261,16 +262,31 @@ static int mit_advance (mit *it, const rs_merge_opts *o) {
         it->i = 0;
     }
 }
+// The order of the iterators in the merge: by key (the table, the first 8 bytes of the key as a number, and only then the whole key), the newer run first among equal keys.
+static inline int mit_cmp (const mit *x, const mit *y) {
+    if (x->k.tbl != y->k.tbl) return x->k.tbl < y->k.tbl ? -1 : 1;
+    if (x->pfx != y->pfx) return x->pfx < y->pfx ? -1 : 1;
+    return rs_key_cmp(&x->k, &y->k);
+}
+static inline bool mit_before (const mit *its, int a, int b) { int c = mit_cmp(&its[a], &its[b]); return c ? c < 0 : a < b; }
+static void heap_down (const mit *its, int *h, int n, int i) {
+    int x = h[i];
+    for (;;) { int c = 2 * i + 1; if (c >= n) break; if (c + 1 < n && mit_before(its, h[c + 1], h[c])) c++; if (!mit_before(its, h[c], x)) break; h[i] = h[c]; i = c; }
+    h[i] = x;
+}
+static void heap_up (const mit *its, int *h, int i) {
+    int x = h[i];
+    while (i > 0) { int p = (i - 1) / 2; if (!mit_before(its, x, h[p])) break; h[i] = h[p]; i = p; }
+    h[i] = x;
+}
 int rs_merge (rs_run *const *runs, int nruns, const rs_merge_opts *o, uint64_t *rows_out) {
-    mit *its = calloc((size_t)nruns, sizeof *its); if (!its) return -1;
-    int rc = 0; uint64_t total = 0, out = 0;
+    mit *its = calloc((size_t)nruns, sizeof *its); int *heap = malloc((size_t)nruns * sizeof *heap); if (!its || !heap) { free(its); free(heap); return -1; }
+    int rc = 0; uint64_t total = 0, out = 0; int hn = 0;
     for (int i = 0; i < nruns; i++) { its[i].run = runs[i]; total += runs[i]->nrows; }
-    for (int i = 0; i < nruns && !rc; i++) rc = mit_advance(&its[i], o);
+    for (int i = 0; i < nruns && !rc; i++) { rc = mit_advance(&its[i], o); if (!rc && !its[i].done) { heap[hn] = i; heap_up(its, heap, hn); hn++; } }
     rs_builder *b = NULL; uint64_t inpart = 0; bool inside = false;
-    while (!rc) {
-        int best = -1;
-        for (int i = 0; i < nruns; i++) if (!its[i].done && (best < 0 || rs_key_cmp(&its[i].k, &its[best].k) < 0)) best = i;      // (the first of equal keys is the newest run)
-        if (best < 0) break;
+    while (!rc && hn > 0) {
+        int best = heap[0];                                                  // (the smallest key; of equal keys the newest run)
         const mit *w = &its[best];
         bool keep = !(w->nc == 0 && o->drop_deleted);
         if (keep && o->keep && w->nc && !o->keep(o->kctx, &w->k, w->dv, w->cells, w->nc)) keep = false;
@@ -284,10 +300,13 @@ int rs_merge (rs_run *const *runs, int nruns, const rs_merge_opts *o, uint64_t *
             rc = rs_builder_add(b, &w->k, w->dv, w->cells, w->nc); if (rc) break;
             out++; inpart++;
         }
-        rs_key cur = w->k; uint8_t *kc = NULL;                                                   // (the winner's key may point into a block that is about to be replaced)
-        if (nruns > 1) { kc = malloc(cur.pklen ? cur.pklen : 1); if (!kc) { rc = -1; break; } memcpy(kc, cur.pk, cur.pklen); cur.pk = kc; }
-        for (int i = 0; i < nruns && !rc; i++) if (!its[i].done && rs_key_cmp(&its[i].k, &cur) == 0) rc = mit_advance(&its[i], o);
-        free(kc);
+        // the older runs that hold the same key: skipped (the winner's key is still in its block: it is advanced last)
+        hn--; heap[0] = heap[hn]; if (hn) heap_down(its, heap, hn, 0);
+        while (!rc && hn > 0 && its[heap[0]].k.tbl == w->k.tbl && its[heap[0]].pfx == w->pfx && rs_key_cmp(&its[heap[0]].k, &w->k) == 0) {
+            int j = heap[0]; hn--; heap[0] = heap[hn]; if (hn) heap_down(its, heap, hn, 0);
+            rc = mit_advance(&its[j], o); if (!rc && !its[j].done) { heap[hn] = j; heap_up(its, heap, hn); hn++; }
+        }
+        if (!rc) { rc = mit_advance(&its[best], o); if (!rc && !its[best].done) { heap[hn] = best; heap_up(its, heap, hn); hn++; } }
         if (!rc && b && o->part_rows && inpart >= o->part_rows) {
             uint8_t *meta; size_t ml; uint64_t nr; uint32_t nb; int64_t dvm;
             rc = rs_builder_finish(b, &meta, &ml, &nr, &nb, &dvm); b = NULL; inside = false;
@@ -302,7 +321,7 @@ int rs_merge (rs_run *const *runs, int nruns, const rs_merge_opts *o, uint64_t *
     (void)inside;
     if (b) rs_builder_free(b);
     for (int i = 0; i < nruns; i++) { free(its[i].buf); free(its[i].raw); }
-    free(its);
+    free(its); free(heap);
     if (rows_out) *rows_out = out;
     return rc;
 }

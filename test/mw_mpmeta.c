@@ -75,7 +75,7 @@ int main (void) {
         int bad_live = 0, looks = 0; struct timespec ts = { 0, 150 * 1000000L };
         for (int k = 0; k < 6; k++) { nanosleep(&ts, NULL); int64_t sum; int rows; sqlite3_stmt *st; (void)st; mw_exec(p, "BEGIN"); int bad = check_rows_x(p, &sum, &rows, true); mw_exec(p, "COMMIT"); bad_live += bad; looks++; }
         long total = 0;
-        for (int i = 0; i < W; i++) { int stt; waitpid(pid[i], &stt, 0); long last = 0, v; while (read(pfd[i][0], &v, sizeof v) == sizeof v) last = v; close(pfd[i][0]); total += last; }
+        for (int i = 0; i < W; i++) { int stt; long last = 0, v; while (read(pfd[i][0], &v, sizeof v) == sizeof v) last = v; close(pfd[i][0]); waitpid(pid[i], &stt, 0); total += last; }       // (drain the pipe first: a worker that is faster than 64 KB of acknowledgements blocks in write() and never exits)
         int64_t sum; int rows; int bad = check_rows(p, &sum, &rows);
         printf("round %d: %d processes, %ld commits acknowledged, sum(n)=%lld (expected %lld), live checks %d (disagreeing rows seen: %d), final disagreeing rows: %d\n", round, W, total, (long long)sum, (long long)(2 * total), looks, bad_live, bad);
         CHECK(bad == 0); CHECK(bad_live == 0); CHECK(sum == 2 * total); CHECK(integrity_ok(p));
@@ -126,7 +126,7 @@ int main (void) {
             sqlite3_close(d); _exit(0);
         }
         long total = 0;
-        for (int i = 0; i < W; i++) { int stt; waitpid(pid[i], &stt, 0); long last = 0, v; while (read(pfd[i][0], &v, sizeof v) == sizeof v) last = v; close(pfd[i][0]); total += last; }
+        for (int i = 0; i < W; i++) { int stt; long last = 0, v; while (read(pfd[i][0], &v, sizeof v) == sizeof v) last = v; close(pfd[i][0]); waitpid(pid[i], &stt, 0); total += last; }       // (drain the pipe first: a worker that is faster than 64 KB of acknowledgements blocks in write() and never exits)
         { int stt; waitpid(pid[W], &stt, 0); }
         int64_t sum; int rows; int bad = check_rows(p, &sum, &rows);
         // the surviving x tables: row 2 was updated once: its b has cv 3 and the other rows cv 1

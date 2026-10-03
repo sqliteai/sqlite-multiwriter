@@ -225,6 +225,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     int rc = SQLITE_OK;
     if (atomic_load(&db->failed)) { ADOPT_FREE(); return SQLITE_IOERR; }
 
+    uint64_t tv0 = MW_T0();
     // ---- validate -----------------------------------------------------------------------------------
     if (v) {
         uint32_t *used = NULL; int nused = 0; bool used_built = false;
@@ -269,6 +270,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
         if (rc == SQLITE_OK && db->rx) rc = mm_validate(db, lane);               // the buckets of the metadata this commit writes: unchanged since the transaction read them
         if (rc != SQLITE_OK) { ADOPT_FREE(); return rc; }
     }
+    MW_T1(MW_ST_SH_VALIDATE, tv0);
 
     // ---- room in the index (it is full only if compaction cannot keep up): a record must not reach the log if its versions cannot be installed ----
     if (shidx_room(ix) < (uint32_t)n + 2) {
@@ -294,11 +296,16 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     mw_fault_hit(MW_CRASH_SHARED_APPENDED);                                           // (the record is complete, nothing is installed)
     MW_T1(MW_ST_APPEND, ta0);
     if (rc != SQLITE_OK) { if (n > 16) free(locs); ADOPT_FREE(); return rc; }          // (the append failed before it touched anything the others can see: this commit fails, the database does not)
+    uint64_t ti0 = MW_T0();
     if (shidx_install(ix, epoch, new_dbsize, n, pgnos, locs) != 0) { if (n > 16) free(locs); ADOPT_FREE(); atomic_store(&db->failed, 1); return SQLITE_FULL; }
+    MW_T1(MW_ST_SH_INSTALL, ti0);
     if (n > 16) free(locs);
     if (db->cdc && lane) {                                                       // the metadata of the commit: its buckets in the shared index, the owner maps follow the commit's pages
+        uint64_t to0 = MW_T0();
         mw_cdc_apply_owner(db, lane, pgnos, images, n);
+        MW_T1(MW_ST_SH_OWNER, to0); to0 = MW_T0();
         if (db->rx) { int mrc = mm_install(db, lane, epoch, ext_loc); if (mrc != SQLITE_OK) { ADOPT_FREE(); atomic_store(&db->failed, 1); return mrc; } }
+        MW_T1(MW_ST_SH_MM, to0);
     }
     ADOPT_FREE();
     if (lane) { lane->sl_seg = seg; lane->sl_end = end; }
@@ -307,7 +314,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     atomic_store_explicit(&sh->log_pos, MW_LOG_POS(seg, end), memory_order_release);
     shidx_publish(ix, epoch);
     if (db->rx) shidx_publish(db->rx, epoch);
-    if (db->cdc && lane) mw_cdc_apply_cells(db, lane, epoch);
+    if (db->cdc && lane) { uint64_t tc0 = MW_T0(); mw_cdc_apply_cells(db, lane, epoch); MW_T1(MW_ST_SH_CELLS, tc0); }
     atomic_store_explicit(&sh->committed_epoch, epoch, memory_order_release);        // (the record is visible to the other processes before it is durable: as in the other mode, an acknowledged commit is never lost)
     atomic_store(&db->epoch, epoch);
     atomic_store_explicit(&sh->pend_epoch, 0, memory_order_release);                 // (visible: nothing is pending any more)
@@ -321,7 +328,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
         if (mw_seglog_bytes(db) > db->log_max_bytes * 8) {                                         // the log is far ahead of its compaction: commits slow down in proportion to the overshoot (after the lock is released: mw_db_publish_finish)
             atomic_fetch_add(&db->n_backpressure, 1);
             uint64_t over = mw_seglog_bytes(db) / (db->log_max_bytes * 8);
-            if (lane) lane->bp_wait_us = (uint32_t)(over > 20 ? 20000 : over * 1000); else { struct timespec ts = { 0, 500000 }; nanosleep(&ts, NULL); }
+            if (lane) { lane->bp_wait_us = (uint32_t)(over > 20 ? 20000 : over * 1000); extern _Atomic uint64_t mw_bp[4]; atomic_fetch_add(&mw_bp[0], lane->bp_wait_us); atomic_fetch_add(&mw_bp[1], 1); } else { struct timespec ts = { 0, 500000 }; nanosleep(&ts, NULL); }
         }
     }
     atomic_fetch_add(&db->n_commits, 1);
@@ -398,6 +405,7 @@ int mw_shared_compact (mw_db *db, mw_compact_result *out) {
     if (db->cdc) { uint64_t lim = mw_cdc_safe_epoch(db); if (T > lim) T = lim; }       // (the metadata of the commits above the last flush lives in the log records only)
     base = atomic_load(&sh->base_epoch);
     if (T > base) atomic_store(&sh->compact_busy_T, T);
+    if (getenv("MW_COMPACT_TRACE")) fprintf(stderr, "compact: t=%.0fms pid=%d waited=%.0fms base=%llu T=%llu visible=%llu safe=%llu log=%.1f MB\n", (double)(now_ns() / 1000000ull % 100000), (int)getpid(), (double)(now_ns() - t0) / 1e6, (unsigned long long)base, (unsigned long long)T, (unsigned long long)visible, (unsigned long long)(db->cdc ? mw_cdc_safe_epoch(db) : 0), (double)mw_seglog_bytes(db) / 1048576.0);
     mw_mp_unlock(db);
     if (T <= base) goto done;
     int fd = real_fd(db);
@@ -437,6 +445,7 @@ done:
     free(c.page); free(c.list); free(c.locs);
     out->duration_ns = now_ns() - t0;
     atomic_fetch_add(&db->n_compaction_ns, out->duration_ns);
+    if (getenv("MW_COMPACT_TRACE")) fprintf(stderr, "compact: end t=%.0fms pid=%d took=%.0fms pages=%llu rc=%d\n", (double)(now_ns() / 1000000ull % 100000), (int)getpid(), (double)(now_ns() - t0) / 1e6, (unsigned long long)out->pages_written, rc);
     atomic_store(&sh->compact_end_ns, now_ns());
     if (db->compact_claimed) { db->compact_claimed = false; atomic_store(&sh->compact_req_ns, 0); }
     pthread_mutex_unlock(&db->compact_mu);

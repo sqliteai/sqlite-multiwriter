@@ -21,6 +21,7 @@ static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS mw_resv(pid INTEGER PRIMARY KEY, slots BLOB NOT NULL);"
     "CREATE TABLE IF NOT EXISTS mw_drops(tbl INTEGER PRIMARY KEY, dv INTEGER NOT NULL);";
 
+_Atomic uint64_t mw_ft[10];                                         // flush phases in ns (MW_CDC_STATS): collect, sort, reserve, build+slots, commit, finish, collect_done
 static uint64_t now_ns (void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 static bool busyish (int rc) { int p = rc & 0xff; return p == SQLITE_BUSY || p == SQLITE_LOCKED; }
 
@@ -289,6 +290,7 @@ static int collect (mw_meta *m, uint64_t F, fbatch *out, dlist *det) {
 // What is done with the taken vectors: after a flush that wrote them the entries nobody changed since are clean; the others (and all of them when the flush failed) are dirty again.
 static void collect_done (mw_meta *m, dlist *det, bool ok) {
     uint64_t cleaned = 0;
+    const size_t cap_hi = m->cap_bytes / STRIPES + 1;
     for (int s = 0; s < STRIPES; s++) {
         stripe *st = &m->st[s]; mentry **v = det[s].v; size_t n = det[s].n;
         for (size_t i = 0; i < n; ) {
@@ -299,7 +301,14 @@ static void collect_done (mw_meta *m, dlist *det, bool ok) {
                 mentry *e = v[i];
                 if (i + 16 < n) __builtin_prefetch(v[i + 16]);
                 if (e->tbl == 0xFFFFFFFFu) { entry_free(e); cleaned++; }
-                else if (ok && e->fver == e->ver) { e->in_dirty = false; cleaned++; }
+                else if (ok && e->fver == e->ver) {
+                    e->in_dirty = false; cleaned++;
+                    if (st->bytes > cap_hi) {                                           // over its share of the cache: the entry we just touched (it is in the cache of the processor) goes now, instead of being found again by a scan
+                        mentry **pp = &st->b[(e->h >> 8) & (st->nb - 1)];
+                        while (*pp && *pp != e) pp = &(*pp)->next;
+                        if (*pp) { size_t eb = sizeof *e + e->pklen + (size_t)e->cap * sizeof(mw_mcell); *pp = e->next; st->n--; st->bytes -= eb; atomic_fetch_sub(&m->bytes, eb); atomic_fetch_sub(&m->rows, 1); st->gen++; entry_free(e); }
+                    }
+                }
                 else if (!dq_push(st, e)) { e->in_dirty = false; cleaned++; }     // (no memory to remember it: it stays in the table as a clean entry that the next change of the row marks again; the file lacks this state until then: it is also in the log)
             }
             pthread_mutex_unlock(&st->mu);
@@ -357,7 +366,9 @@ static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool l
     int rc;
     if (!atomic_load_explicit(&m->schema_seen, memory_order_relaxed)) { rc = mw_meta_schema(c); if (rc != SQLITE_OK) return rc; atomic_store(&m->schema_seen, true); }
     atomic_store(&m->tables_ok, true);
-    if (i1 > i0 && (rc = rsx_reserve_items(m->rsx, c, v, i0, i1)) != SQLITE_OK) return rc;              // (the slots the blocks will be written to: taken before the transaction)
+    uint64_t tp0 = now_ns();
+    if (i1 > i0 && (rc = rsx_reserve_items(m->rsx, c, v, i0, i1)) != SQLITE_OK) return rc;
+    atomic_fetch_add(&mw_ft[2], now_ns() - tp0);              // (the slots the blocks will be written to: taken before the transaction)
     rsx_wlock(m->rsx);
     if ((rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL)) != SQLITE_OK) { rsx_wunlock(m->rsx); return rc; }
     rsx_tx *t = rsx_tx_begin(m->rsx, c);
@@ -369,7 +380,9 @@ static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool l
     rc = (site && state && hw) ? SQLITE_OK : SQLITE_ERROR;
     for (int i = 0; i0 == 0 && i < npurge && rc == SQLITE_OK; i++) rc = rsx_tx_drop_table(t, c, purge[i].tbl, (int64_t)purge[i].epoch);
     uint64_t cells = 0;
+    tp0 = now_ns();
     if (rc == SQLITE_OK) rc = rsx_tx_add_items(t, c, v, i0, i1);
+    atomic_fetch_add(&mw_ft[3], now_ns() - tp0);
     for (int i = i0; i < i1; i++) cells += v[i].n;
     for (uint32_t o = sflushed; last && o < nsites && rc == SQLITE_OK; o++) {
         uint8_t id[16]; if (!mw_meta_site_id(m, o, id)) continue;
@@ -382,7 +395,9 @@ static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool l
     if (last) m->new_hwm = hwm;
     if (rc == SQLITE_OK) rc = rsx_tx_finish(t, c);
     sqlite3_finalize(site); sqlite3_finalize(state); sqlite3_finalize(hw);
+    tp0 = now_ns();
     if (rc == SQLITE_OK) rc = sqlite3_exec(c, "COMMIT", NULL, NULL, NULL);
+    atomic_fetch_add(&mw_ft[4], now_ns() - tp0);
     if (rc != SQLITE_OK) sqlite3_exec(c, "ROLLBACK", NULL, NULL, NULL);
     else atomic_fetch_add(&m->flushed_cells, cells);
     rsx_tx_end(t, rc == SQLITE_OK);
@@ -477,11 +492,15 @@ static int flush_impl (mw_meta *m, bool wait) {
     if (!m->wr) { rc = SQLITE_CANTOPEN; goto out; }
     fbatch fb = {0};
     if (!sh) { memset(det, 0, sizeof det); taken = true; }
+    uint64_t tc0 = now_ns();
     if ((sh ? mm_collect(m, F, Fe, &fb) : collect(m, F, &fb, det)) != 0) { rc = SQLITE_NOMEM; goto out; }
     fitem *v = fb.v; int n = fb.n;
+    atomic_fetch_add(&mw_ft[0], now_ns() - tc0); tc0 = now_ns();
     sort_items(v, n);
+    atomic_fetch_add(&mw_ft[1], now_ns() - tc0);
     uint64_t hw0 = sh ? atomic_load(&sh->dv_hwm) : atomic_load(&m->hwm);
     for (int i = 0; i < n; i++) if ((uint64_t)v[i].dv > hw0) hw0 = (uint64_t)v[i].dv;
+    if (getenv("MW_EXP_SKIPWRITE")) rc = SQLITE_OK; else          // (experiment: the cost of everything but the file)
     rc = write_range(m, m->wr, v, 0, n, true, V, hw0, nsites, sflushed, purge, npurge);
     mw_fbatch_free(&fb);
     if (rc == SQLITE_OK) {
@@ -495,7 +514,7 @@ static int flush_impl (mw_meta *m, bool wait) {
             for (int i = 0; i < npurge; i++) for (int q = 0; q < m->npurge; q++) if (m->purge[q].tbl == purge[i].tbl && m->purge[q].epoch == purge[i].epoch) { m->purge[q] = m->purge[--m->npurge]; break; }
             pthread_mutex_unlock(&m->purge_mu);
             atomic_store(&m->flushed, V); atomic_store(&m->hwm, m->new_hwm); m->sites_flushed = nsites;
-            collect_done(m, det, true); taken = false;
+            { uint64_t td = now_ns(); collect_done(m, det, true); atomic_fetch_add(&mw_ft[6], now_ns() - td); } taken = false;
         }
         atomic_fetch_add(&m->n_flushes, 1);
     }

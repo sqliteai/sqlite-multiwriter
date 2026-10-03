@@ -484,10 +484,11 @@ static int pool_reserve (mw_rstore *s, sqlite3 *c, int want) {            // (no
     if (!rc) pool_put(s, x.got, x.n);
     free(x.got); return rc;
 }
+static size_t pool_batch (void) { static size_t b; if (!b) { const char *e = getenv("MW_POOL_BATCH"); b = e && atol(e) > 0 ? (size_t)atol(e) : 1024; } return b; }
 static int pool_ensure (mw_rstore *s, sqlite3 *c, size_t need) {
     pthread_mutex_lock(&s->pmu); size_t have = s->npool; pthread_mutex_unlock(&s->pmu);
     if (have >= need) return 0;
-    size_t want = need - have + 64; if (want < 1024) want = 1024;                          // (a transaction for every few slots would be all the writing of the flush and the merge: take them by the thousand)
+    size_t want = need - have + 64; if (want < pool_batch()) want = pool_batch();                          // (a transaction for every few slots would be all the writing of the flush and the merge: take them by the thousand)
     return pool_reserve(s, c, (int)want);
 }
 

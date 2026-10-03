@@ -479,7 +479,7 @@ static inline void mw_spinlock (pthread_mutex_t *m) {
 }
 
 // Optional per-stage timing (env MW_TIMING): nanoseconds, calls, calls slower than 500 us, worst call. Off by default: one predictable branch.
-enum { MW_ST_PUBLISH, MW_ST_LOCKS, MW_ST_APPEND, MW_ST_SYNC, MW_ST_VISIBLE, MW_ST_RELOC, MW_ST_TURN, MW_ST_SNAPBEGIN, MW_ST_RELOCLOCK, MW_ST_RELOCHOLD, MW_ST_MERGE, MW_ST_H_HEAD, MW_ST_H_PREP, MW_ST_H_STRIPES, MW_ST_H_VALIDATE, MW_ST_H_SEQ, MW_ST_H_INSTALL, MW_ST_SY_PREFIX, MW_ST_SY_BEHIND, MW_ST_SY_CYCLE, MW_ST_SY_WRITE, MW_ST_SY_FSYNC, MW_ST_VIS_SPIN, MW_ST_VIS_PARK, MW_ST_MP_CATCH, MW_ST_MP_WAIT, MW_ST_MP_HELD, MW_ST_MP_APPLY, MW_ST_MP_GEN, MW_ST_MP_REOPEN, MW_ST_MP_SCAN, MW_ST_MP_REWRITE, MW_ST_MP_REWRITE_WAIT, MW_ST_ADM_WAIT, MW_ST_ADM_HOLD, MW_ST_SYNC_FOLLOW, MW_ST_ADM_GAP, MW_ST_COUNT };
+enum { MW_ST_PUBLISH, MW_ST_LOCKS, MW_ST_APPEND, MW_ST_SYNC, MW_ST_VISIBLE, MW_ST_RELOC, MW_ST_TURN, MW_ST_SNAPBEGIN, MW_ST_RELOCLOCK, MW_ST_RELOCHOLD, MW_ST_MERGE, MW_ST_H_HEAD, MW_ST_H_PREP, MW_ST_H_STRIPES, MW_ST_H_VALIDATE, MW_ST_H_SEQ, MW_ST_H_INSTALL, MW_ST_SY_PREFIX, MW_ST_SY_BEHIND, MW_ST_SY_CYCLE, MW_ST_SY_WRITE, MW_ST_SY_FSYNC, MW_ST_VIS_SPIN, MW_ST_VIS_PARK, MW_ST_MP_CATCH, MW_ST_MP_WAIT, MW_ST_MP_HELD, MW_ST_MP_APPLY, MW_ST_MP_GEN, MW_ST_MP_REOPEN, MW_ST_MP_SCAN, MW_ST_MP_REWRITE, MW_ST_MP_REWRITE_WAIT, MW_ST_ADM_WAIT, MW_ST_ADM_HOLD, MW_ST_SYNC_FOLLOW, MW_ST_ADM_GAP, MW_ST_SH_VALIDATE, MW_ST_SH_INSTALL, MW_ST_SH_OWNER, MW_ST_SH_MM, MW_ST_SH_CELLS, MW_ST_SH_REST, MW_ST_COUNT };
 extern bool mw_timing_on;
 void mw_stage_add (int stage, uint64_t ns);
 void mw_count_add (int counter, uint64_t v);      // (timing) named counters: see mw_timing_dump
@@ -630,8 +630,10 @@ static inline bool mw_knob_flag (_Atomic int *cache, const char *name) {        
 }
 
 // The log's size, read under seq_mu (it is written there): for the threads that only look at it (compactor, statistics).
+uint64_t mw_seglog_bytes (mw_db *db);
 static inline uint64_t mw_log_end_locked (mw_db *db) {
     if (!db->store) return 0;                                       // (no private lanes, no log)
+    if (db->shared) return mw_seglog_bytes(db);                     // (the shared mode keeps its log in segments: log_off is not used there)
     mw_spinlock(&db->store->seq_mu);
     uint64_t v = db->log_off;
     pthread_mutex_unlock(&db->store->seq_mu);
@@ -663,7 +665,7 @@ static inline uint64_t mw_log_limit (const mw_db *db) {
     int mb = mw_knob_int(&ovr, "MW_LOG_LIMIT_MB", 0);
     if (mb > 0) return (uint64_t)mb << 20;
     uint64_t m = db->log_max_bytes;
-    return (db->mp && m > (8ull << 20) && atomic_load_explicit(&db->mp_nprocs, memory_order_relaxed) > 16) ? (8ull << 20) : m;
+    return (db->mp && !db->shared && m > (8ull << 20) && atomic_load_explicit(&db->mp_nprocs, memory_order_relaxed) > 16) ? (8ull << 20) : m;       // (the private-store mode keeps its working set small; the shared mode compacts by size like the others, and fewer, bigger compactions cost less)
 }
 
 #endif

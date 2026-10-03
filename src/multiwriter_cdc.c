@@ -35,6 +35,7 @@ typedef struct {
     _Atomic uint64_t commits, changes, unowned, builds, ovfl_scans, ovfl_unattributed, ns_prepare, ns_build;
 } mw_cdc;
 
+_Atomic uint64_t mw_bp[4];                                             // back-pressure requested (us) and times: dirty rows, run count
 static uint64_t now_ns (void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 static uint32_t be32 (const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 static int be16 (const uint8_t *p) { return (p[0] << 8) | p[1]; }
@@ -60,6 +61,7 @@ void mw_cdc_close (mw_db *db) {
     if (!c) return;
     if (getenv("MW_CDC_STATS")) fprintf(stderr, "cdc: %llu commits, %llu row changes (%llu in pages of unknown owner), catalog/owner map built %llu times (%.1f ms), overflow map scanned %llu times, %llu overflow writes unattributed; prepare %.2f us per commit\n",
         (unsigned long long)c->commits, (unsigned long long)c->changes, (unsigned long long)c->unowned, (unsigned long long)c->builds, (double)c->ns_build / 1e6, (unsigned long long)c->ovfl_scans, (unsigned long long)c->ovfl_unattributed, c->commits ? (double)c->ns_prepare / 1000.0 / (double)c->commits : 0.0);
+    if (getenv("MW_CDC_STATS")) { extern _Atomic uint64_t mw_ft[10]; fprintf(stderr, "back-pressure: dirty %llu ms in %llu commits, runs %llu ms in %llu commits\n", (unsigned long long)mw_bp[0] / 1000, (unsigned long long)mw_bp[1], (unsigned long long)mw_bp[2] / 1000, (unsigned long long)mw_bp[3]); fprintf(stderr, "flush phases (ms): collect %.0f, sort %.0f, reserve %.0f, build+slots %.0f, commit %.0f, collect_done %.0f\n", (double)mw_ft[0] / 1e6, (double)mw_ft[1] / 1e6, (double)mw_ft[2] / 1e6, (double)mw_ft[3] / 1e6, (double)mw_ft[4] / 1e6, (double)mw_ft[6] / 1e6); }
     if (getenv("MW_CDC_STATS")) { uint64_t f, cl, ns, rt; mw_meta_flush_stats(c->meta, &f, &cl, &ns, &rt); fprintf(stderr, "meta flusher: %llu flushes, %llu cells written, %.1f ms (%.2f us per cell), %llu retries\n", (unsigned long long)f, (unsigned long long)cl, (double)ns / 1e6, cl ? (double)ns / 1000.0 / (double)cl : 0.0, (unsigned long long)rt); uint64_t rs[13]; mw_meta_run_stats(c->meta, rs); fprintf(stderr, "meta runs: %llu lookups, %llu runs probed (%llu skipped by the filter), %llu block reads, %llu cache hits; %llu runs written, %llu merges of %llu rows, %llu runs now (%llu age groups at level 0, %llu in all), %llu retries of merge transactions\n", (unsigned long long)rs[0], (unsigned long long)rs[1], (unsigned long long)rs[2], (unsigned long long)rs[3], (unsigned long long)rs[4], (unsigned long long)rs[7], (unsigned long long)rs[5], (unsigned long long)rs[6], (unsigned long long)rs[8], (unsigned long long)rs[9], (unsigned long long)rs[10], (unsigned long long)rs[11]); }
     mw_cat_free(c->cat); mw_meta_free(c->meta);
     if (db->shared) { if (c->owner) munmap((void *)c->owner, 2 * (size_t)OWNER_PAGES * sizeof(uint32_t)); }
@@ -375,8 +377,8 @@ void mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch) {
     lane->cdc_ng = 0;
     if (act && lane->cdc_ext_len && !db->shared) { mw_meta_apply(c->meta, act, epoch); uint64_t d = mw_meta_dirty(c->meta); if (d >= 16384) mw_meta_kick(c->meta);
         uint64_t lim = mw_meta_dirty_limit(c->meta);                           // back-pressure: the flusher is far behind the writers; they wait (outside the lock, in publish_finish), more as the backlog grows
-        if (d > lim) { uint64_t w = (d - lim) * 1000 / lim; lane->bp_wait_us = (uint32_t)(w > 20000 ? 20000 : w < 20 ? 20 : w); } }
-    if (!lane->sys) { uint32_t rp = mw_meta_run_pressure(c->meta); if (rp > lane->bp_wait_us) lane->bp_wait_us = rp; }       // (the metadata store's own commits are not slowed: they are what the others wait for)
+        if (d > lim) { uint64_t w = (d - lim) * 1000 / lim; lane->bp_wait_us = (uint32_t)(w > 20000 ? 20000 : w < 20 ? 20 : w); atomic_fetch_add(&mw_bp[0], lane->bp_wait_us); atomic_fetch_add(&mw_bp[1], 1); } }
+    if (!lane->sys) { uint32_t rp = mw_meta_run_pressure(c->meta); if (rp > lane->bp_wait_us) lane->bp_wait_us = rp; if (rp) { atomic_fetch_add(&mw_bp[2], rp); atomic_fetch_add(&mw_bp[3], 1); } }       // (the metadata store's own commits are not slowed: they are what the others wait for)
     if (lane->cdc_ovl) mw_ovl_clear(lane->cdc_ovl);
     free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
     mw_cat_free(lane->cdc_cat); lane->cdc_cat = NULL;

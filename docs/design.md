@@ -146,6 +146,18 @@ the metadata tests with the store under pressure.
   the first opener failed, metadata silently lost (an I/O error taken for "nothing there" in four places, a failed attach of the maps), a commit of a stale schema written without its
   metadata in the shared mode, and a false conflict in the shared mode when the versions of a bucket were retired between the read and the validation.
 
+### What limits the throughput with the capture on (measured, bulk inserts of 100 rows, synchronous=FULL)
+- **The flusher and the merger of the metadata.** With the capture on, every row written is also a row of a run of the file tables, and the runs are merged (tiers of 8, about 3 rewrites of a row). At
+  20k commits a second that is 2M rows a second written and 6M merged: the flusher and the merger are the first threads of the process to be 100% busy, and when the merger falls behind the
+  number of runs slows the writers (back-pressure) - the usual reason for a throughput that is half of what a short run gave. What was done, in the order of what it gave (16 threads, 30-40 s):
+  the changes wait for the flusher as packed rows in the stripes (a flush takes the buffers and visits no entry); entries come from free lists; a flush writes 131072 rows, not 16384 (130 runs a
+  second were more than the merger could take: 4 threads gave 8k or 20k tx/s depending on whether it ever fell behind); 8192 slots a reservation; the k-way merge by a heap with the first 8 bytes of the
+  key compared as a number; the runs are built before the write lock and in three helper threads. 16 threads: 19k -> 28.8k tx/s sustained; 32 threads 22k -> 28k.
+- **Several processes.** The flushers of all the processes pace themselves by one clock (a second flusher behind the first wrote a run of a few rows); the compactor decided "by size" from a counter the
+  shared mode does not keep (it ran on its 0.5 s timer, the log sat at 270 MB, where the commits are slowed): 4 processes 12.4k -> 17.4k tx/s, and untracked 17.5k -> 25k.
+- **What is left** (one process, 16 threads: 31k against 46k untracked; 8 processes 15k against 25k): the capture's own work on the way of a commit (the rows of the pages decoded and the CRDT state of
+  every row looked up: ~30 us outside the locks, ~20 us in the publication of the shared mode) and the flush itself (0.25-0.4 us a row in one thread).
+
 ## Capture and DDL
 
 Tables are tracked when they are not internal (`mw_*`, `sqlite_*`) and are not virtual: with an explicit primary key (INTEGER, composite, text, WITHOUT ROWID), or without one, in which case the **rowid is the key** (a column that is itself called `rowid` moves the key to `_rowid_` or `oid`). A table without a primary key has no identity that is the same on every peer: if peers insert into it concurrently, equal rowids are taken for the same row (a choice: the application that wants otherwise declares a primary key).

@@ -29,6 +29,7 @@ typedef struct { mw_chg *chg; int n; uint32_t *freed; int nfreed; mw_ovupd *ovup
 
 
 typedef struct mw_db   mw_db;
+#define MW_LOG_OFF(db) __atomic_load_n(&(db)->log_off, __ATOMIC_RELAXED)      // (log_off is written under the store's seq_mu and read by the log's threads under log_mu: both sides are atomic accesses)
 typedef struct { uint64_t epoch, end; } mw_pend;   // a record that was copied out of order: its epoch and the file offset where it ends
 typedef struct mw_lane mw_lane;
 
@@ -255,7 +256,7 @@ struct mw_lane {
     int         retry_credit;   // >0: the lane recently conflicted; its next transactions are serialised (hot spots); decays per successful commit
     bool        holds_hot;      // this lane's current snapshot holds db->hot_mu
     bool        ddl_active;     // this lane owns the schema barrier (released when its transaction ends)
-    bool        write_locked;   // WAL write lock held inside the current snapshot
+    _Atomic bool write_locked;   // WAL write lock held inside the current snapshot
     bool        snapshot_held;  // registered in db->lanes as an active snapshot
     mw_lane    *next_active;    // intrusive list of lanes holding a snapshot (protected by db->mu)
     mw_lane    *prev_active;
@@ -293,7 +294,7 @@ struct mw_db {
     mw_db            *next;             // global registry list
     sqlite3_mutex    *mu;               // snapshot registry + lane list
     mw_lane          *active;           // lanes holding a snapshot
-    mw_store         *store;            // private-lane mode only; created by the first lane
+    _Atomic(mw_store *) store;         // private-lane mode only; created by the first lane (atomic: a recovery in place replaces it)
     _Atomic uint64_t  epoch;            // last committed epoch
     _Atomic int       vis_parked;       // committers parked in mw_db_make_visible
     _Atomic uint64_t  next_tx_id;
@@ -303,7 +304,7 @@ struct mw_db {
     _Atomic uint64_t  n_ddl_barriers;
     pthread_mutex_t   ddl_mu;              // exclusive schema barrier: one DDL statement at a time,
     pthread_cond_t    ddl_cv;              //   new write transactions are refused while it runs
-    mw_lane          *ddl_owner;           //   (protected by ddl_mu)
+    _Atomic(mw_lane *) ddl_owner;      //   (written under ddl_mu; read without it by the lanes that start a write: only an optimisation of when they start)
     _Atomic uint64_t  n_commits, n_aborts, n_snapshots;
     int64_t           dbv_counter;      // highest db_version ever reserved (protected by mu)
     _Atomic uint64_t  n_rebases, n_rebase_retries, n_rebase_max_attempts, n_rebase_ns, n_unrebasable;
@@ -370,7 +371,10 @@ struct mw_db {
     // multi-process mode (mw_mp=1)
     bool              mp_req, mp;          // requested at open / active
     bool              has_log;             // a log file exists (set once when it is opened, before any commit): read by publishers instead of the logfd that a rewrite replaces
-    bool              open_done;           // the first connection finished opening (a database whose open failed has nothing to flush: no connection of the metadata store is opened for it)
+    _Atomic int       inflight;            // commits inside lane_publish (the recovery of a failed log waits for them to leave)
+    _Atomic int       recovering;          // a recovery in place is running
+    mw_store         *retired[8]; int nretired;   // stores replaced by a recovery: readers that were inside them may still look (freed with the database)
+    _Atomic bool      open_done;           // the first connection finished opening (a database whose open failed has nothing to flush: no connection of the metadata store is opened for it)
     _Atomic int       mp_nprocs;           // processes registered on this database, as last counted by the admission control
     bool              compact_claimed;     // this process holds the compaction claim (shared mode)
     bool              shared;              // multi-process in shared mode (mw_mp=2): shared version index + segmented log, no private store
@@ -501,6 +505,9 @@ typedef struct mw_rext { uint64_t epoch; uint8_t *data; uint32_t len; } mw_rext;
 int       mw_recovered_ext_add (mw_db *db, uint64_t epoch, const uint8_t *ext, uint32_t len);          // recovery: an extension seen in the log, kept for the change capture to replay
 int       mw_log_sync (mw_db *db, uint64_t epoch, uint64_t my_end);   // my_end: file offset where this commit's record ends (staged mode)
 int       mw_log_set_base (mw_db *db, uint64_t base_epoch);
+char     *mw_sidecar_path (const char *dbpath, const char *suffix);        // where the files the processes of the shared mode map together live (sqlite3_free the result)
+void      mw_cdc_reset (mw_db *db);                                   // the metadata store forgets its memory table (recovery in place)
+int       mw_db_recover (mw_db *db);                                 // a failed log (single process, staged): roll back to the last durable commit and go on, without a reopen
 int       mw_log_ensure_room (mw_db *db, uint64_t record_size);      // staged log: reserve the disk for the next records before an offset is assigned (SQLITE_FULL when there is no room: nothing was assigned yet)
 void      mw_log_reserve_space (mw_db *db);                          // caller holds store->seq_mu: grow the file ahead of log_off
 void      mw_log_remap (mw_db *db);                                  // after the file was replaced/truncated (seq_mu held)

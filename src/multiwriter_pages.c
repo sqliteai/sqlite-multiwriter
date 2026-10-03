@@ -398,7 +398,7 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     st->sizes[st->nsizes].dbsize = new_dbsize;
     size_note(st, epoch, new_dbsize);
     uint64_t log_off = 0, log_end = 0;                           // log_end: the log's size after our record, taken under seq_mu (the compaction check below must not read db->log_off unlocked)
-    if (db->has_log) { log_off = db->log_off; db->log_off += mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0); mw_log_reserve_space(db); log_end = db->log_off; }
+    if (db->has_log) { log_off = db->log_off; __atomic_store_n(&db->log_off, log_off + mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0), __ATOMIC_RELAXED); mw_log_reserve_space(db); log_end = db->log_off; }
     st->sizes[st->nsizes].log_off = log_off;
     st->nsizes++;
     atomic_store(&db->next_epoch, epoch);                        // assigned; NOT visible yet (db->epoch is untouched)
@@ -428,11 +428,11 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
         // uninstall, return the log space. Otherwise a successor may already sit behind the hole: the
         // database is failed (sticky) and recovers by reopening (the log stops at the hole).
         mw_spinlock(&st->seq_mu);
-        bool latest = atomic_load(&db->next_epoch) == epoch && db->log_off == log_off + mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0);
+        bool latest = atomic_load(&db->next_epoch) == epoch && MW_LOG_OFF(db) == log_off + mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0);
         if (latest) {
             st->nsizes--;
             atomic_store(&db->next_epoch, epoch - 1);
-            db->log_off = log_off;
+            __atomic_store_n(&db->log_off, log_off, __ATOMIC_RELAXED);
         } else {
             atomic_store(&db->failed, 1);
         }

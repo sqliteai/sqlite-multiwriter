@@ -23,23 +23,35 @@
 static char img[256], mnt[256], ballast[300];
 
 static bool vol_make (long mb) {
-#ifndef __APPLE__
-    (void)mb; return false;
-#else
     char cmd[900];
-    snprintf(img, sizeof img, "/tmp/mw_full_%d.sparseimage", (int)getpid()); snprintf(mnt, sizeof mnt, "/tmp/mw_full_mnt_%d", (int)getpid());
+    snprintf(img, sizeof img, "/tmp/mw_full_%d.img", (int)getpid()); snprintf(mnt, sizeof mnt, "/tmp/mw_full_mnt_%d", (int)getpid());
+    snprintf(ballast, sizeof ballast, "%s/ballast", mnt);
+#ifdef __APPLE__
+    snprintf(img, sizeof img, "/tmp/mw_full_%d.sparseimage", (int)getpid());
     snprintf(cmd, sizeof cmd, "hdiutil create -size %ldm -fs APFS -type SPARSE -volname mwfull '%s' >/dev/null 2>&1", mb, img);
     if (system(cmd) != 0) return false;
     mkdir(mnt, 0755);
     snprintf(cmd, sizeof cmd, "hdiutil attach '%s' -nobrowse -mountpoint '%s' >/dev/null 2>&1", img, mnt);
     if (system(cmd) != 0) { unlink(img); return false; }
-    snprintf(ballast, sizeof ballast, "%s/ballast", mnt);
+    return true;
+#else
+    // Linux: MW_DF_FS=tmpfs (default; sparse files, a write into a hole of a mapped file is a SIGBUS on a full volume) or ext4 on a loop device. Needs root (a container with --privileged).
+    const char *fs = getenv("MW_DF_FS") ? getenv("MW_DF_FS") : "tmpfs";
+    mkdir(mnt, 0755);
+    if (!strcmp(fs, "tmpfs")) snprintf(cmd, sizeof cmd, "mount -t tmpfs -o size=%ldm tmpfs '%s' >/dev/null 2>&1", mb, mnt);
+    else snprintf(cmd, sizeof cmd, "dd if=/dev/zero of='%s' bs=1M count=0 seek=%ld >/dev/null 2>&1 && mkfs.%s -q -F '%s' >/dev/null 2>&1 && mount -o loop '%s' '%s' >/dev/null 2>&1", img, mb, fs, img, img, mnt);
+    if (system(cmd) != 0) { rmdir(mnt); unlink(img); return false; }
     return true;
 #endif
 }
 static void vol_drop (void) {
     char cmd[900];
-    snprintf(cmd, sizeof cmd, "hdiutil detach '%s' -force >/dev/null 2>&1", mnt); (void)system(cmd);
+#ifdef __APPLE__
+    snprintf(cmd, sizeof cmd, "hdiutil detach '%s' -force >/dev/null 2>&1", mnt);
+#else
+    snprintf(cmd, sizeof cmd, "umount '%s' >/dev/null 2>&1", mnt);
+#endif
+    (void)system(cmd);
     rmdir(mnt); unlink(img);
 }
 

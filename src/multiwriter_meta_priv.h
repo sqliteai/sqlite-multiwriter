@@ -69,6 +69,7 @@ int      mw_metafile_load_tombstones (mw_meta *m);                              
 int      mw_metafile_load (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n);       // the row's cells from the file tables (n = 0: none / no tables)
 void     mw_meta_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]);
 void     mw_metafile_free (mw_meta *m);
+void     mw_meta_reset (mw_meta *m);                                            // forget the memory table (see multiwriter_metafile.c)
 int      mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]);
 #endif
 

@@ -2,12 +2,32 @@
 #ifndef MW_TEST_H
 #define MW_TEST_H
 #include <glob.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include "sqlite3.h"
+
+
+#ifdef __linux__
+// kill -USR1 <pid> prints the stack of every thread (a hung test in a container with no debugger)
+#include <execinfo.h>
+#include <signal.h>
+#include <dirent.h>
+#include <sys/syscall.h>
+static volatile sig_atomic_t mw_dump_fan;
+static void mw_dump_handler (int sig) {
+    (void)sig; void *bt[40]; int n = backtrace(bt, 40); char hdr[64]; int l = snprintf(hdr, sizeof hdr, "--- thread %ld ---\n", (long)syscall(SYS_gettid)); (void)!write(2, hdr, (size_t)l);
+    backtrace_symbols_fd(bt, n, 2);
+    if (!mw_dump_fan) {
+        mw_dump_fan = 1; DIR *d = opendir("/proc/self/task");
+        if (d) { struct dirent *e; while ((e = readdir(d))) { long t = atol(e->d_name); if (t > 0 && t != (long)syscall(SYS_gettid)) syscall(SYS_tgkill, (long)getpid(), t, SIGUSR1); } closedir(d); }
+    }
+}
+__attribute__((constructor)) static void mw_dump_init (void) { signal(SIGUSR1, mw_dump_handler); }
+#endif
 
 static int mw_failures = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); mw_failures++; } } while (0)
@@ -34,6 +54,11 @@ static inline void mw_rmfiles (const char *path) {
     for (int i = 0; i < 4; i++) { snprintf(p, sizeof p, "%s%s", path, sfx[i]); unlink(p); }
     glob_t g; snprintf(p, sizeof p, "%s-mw*", path);
     if (glob(p, 0, NULL, &g) == 0) { for (size_t i = 0; i < g.gl_pathc; i++) unlink(g.gl_pathv[i]); globfree(&g); }
+#ifdef __linux__
+    { uint64_t h = 1469598103934665603ull; for (const char *c = path; *c; c++) { h ^= (unsigned char)*c; h *= 1099511628211ull; }          // (the files of the shared mode live in /dev/shm there: mw_sidecar_path)
+      snprintf(p, sizeof p, "/dev/shm/mw-%016llx-*", (unsigned long long)h);
+      if (glob(p, 0, NULL, &g) == 0) { for (size_t i = 0; i < g.gl_pathc; i++) unlink(g.gl_pathv[i]); globfree(&g); } }
+#endif
 }
 static inline char *mw_tmpdb (char *buf, size_t n, const char *tag) {
     snprintf(buf, n, "/tmp/mw_%s_%d.db", tag, (int)getpid());

@@ -82,7 +82,7 @@ static int replay_cb (void *ctx, uint64_t epoch, uint32_t dbsize, int n, const u
 }
 
 int mw_shared_open (mw_db *db) {
-    char *ixp = sqlite3_mprintf("%s-mwidx", db->path);
+    char *ixp = mw_sidecar_path(db->path, "mwidx");
     if (!ixp) return SQLITE_NOMEM;
     if (db->mp_first) shidx_unlink(ixp);                                        // volatile: rebuilt from the log below
     shidx_params p = { 24, 4u << 20, MW_MP_SLOTS, 0 };
@@ -96,7 +96,7 @@ int mw_shared_open (mw_db *db) {
     else if (atomic_load(&db->shm->cdc_on) && !db->cdc) { int crc = mw_cdc_open(db); if (crc != SQLITE_OK) return crc; }           // the database captures metadata: so does every process
     else if (db->cdc && !atomic_load(&db->shm->cdc_on)) return SQLITE_MISUSE;                                                   // ... and one that was opened without cannot start to
     if (db->cdc) {                                                              // the shared index of the CRDT metadata (volatile: rebuilt from the log below), and the owner maps
-        char *rxp = sqlite3_mprintf("%s-mwrow", db->path); if (!rxp) return SQLITE_NOMEM;
+        char *rxp = mw_sidecar_path(db->path, "mwrow"); if (!rxp) return SQLITE_NOMEM;
         if (db->mp_first) { shidx_unlink(rxp); int crc = mw_cdc_shared_create(db); if (crc != SQLITE_OK) { sqlite3_free(rxp); return crc; } }
         shidx_params rp = { 21, 4u << 20, 16, 0 };
         const char *re = getenv("MW_ROWIDX_ENTRIES"); if (re && atoi(re) > 1000) rp.max_entries = (uint32_t)atoi(re);
@@ -129,7 +129,7 @@ int mw_shared_open_finish (mw_db *db) {
 }
 
 void mw_shared_close (mw_db *db, bool sole) {
-    char *ixp = sole ? sqlite3_mprintf("%s-mwidx", db->path) : NULL;
+    char *ixp = sole ? mw_sidecar_path(db->path, "mwidx") : NULL;
     if (db->sl) {
         if (sole) {                                                              // the last process: everything is in the real file now (or the log stays for recovery)
             uint32_t mn = atomic_load(&db->shm->seg_min), cur = atomic_load(&db->shm->sl_seg);
@@ -143,7 +143,7 @@ void mw_shared_close (mw_db *db, bool sole) {
     }
     if (db->ix) { shidx_close(db->ix); db->ix = NULL; }
     if (db->rx) { shidx_close(db->rx); db->rx = NULL; }
-    if (ixp) { shidx_unlink(ixp); sqlite3_free(ixp); char *rxp = sqlite3_mprintf("%s-mwrow", db->path); if (rxp) { shidx_unlink(rxp); sqlite3_free(rxp); } mw_cdc_shared_unlink(db); }
+    if (ixp) { shidx_unlink(ixp); sqlite3_free(ixp); char *rxp = mw_sidecar_path(db->path, "mwrow"); if (rxp) { shidx_unlink(rxp); sqlite3_free(rxp); } mw_cdc_shared_unlink(db); }
 }
 
 // MARK: - a publisher died inside the publication lock -

@@ -110,7 +110,23 @@ static bool lane_can_rebase (mw_lane *lane, const uint8_t *pg1, uint32_t snapsho
 // Consecutive refusals after which a long transaction takes the turn (MW_LONG_STARVE).
 static int long_starve (void) { static _Atomic int c = MW_KNOB_UNSET; return mw_knob_int(&c, "MW_LONG_STARVE", 2); }
 
+static int lane_publish_inner (mw_lane *lane);
+// Every commit is counted while it is inside (the recovery of a failed log waits for the others to leave), and the first commit that finds the database failed tries to recover it.
 static int lane_publish (mw_lane *lane) {
+    mw_db *db = lane->db;
+    for (;;) {
+        atomic_fetch_add(&db->inflight, 1);
+        if (!atomic_load(&db->recovering)) break;
+        atomic_fetch_sub(&db->inflight, 1);                                  // (a recovery is running: it stops the threads of the metadata store, so those must not wait for it)
+        if (lane->sys) return SQLITE_IOERR;                                 // (an error, not a busy: the loops of the store retry a busy for ever, and the recovery waits for them to stop)
+        for (int i = 0; i < 5000 && atomic_load(&db->recovering); i++) usleep(1000);
+    }
+    if (atomic_load(&db->failed) && !db->mp && !lane->sys) (void)mw_db_recover(db);
+    int rc = lane_publish_inner(lane);
+    atomic_fetch_sub(&db->inflight, 1);
+    return rc;
+}
+static int lane_publish_inner (mw_lane *lane) {
     mw_db *db = lane->db;
     mw_memwal *w = &lane->wal;
     size_t fs = (size_t)w->pgsz + 24;

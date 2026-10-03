@@ -701,3 +701,28 @@ uint32_t mw_meta_run_pressure (mw_meta *m) {
     if (over <= 0) return 0;
     uint32_t w = (uint32_t)over * 150u; return w > 20000u ? 20000u : w;
 }
+
+// The memory table forgets everything (a recovery in place rolled the database back to its last durable commit: the cells of the commits that were rolled back must not be flushed, and
+// the rest is rebuilt from the file and the log as at an open). The flusher and the merger stop first; the next commit starts them again and brings the state in (mw_meta_ready).
+void mw_meta_reset (mw_meta *m) {
+    if (!m->attached) return;
+    pthread_mutex_lock(&m->th_mu); m->th_stop = true; pthread_cond_broadcast(&m->th_cv); bool run = m->th_running; pthread_mutex_unlock(&m->th_mu);
+    if (run) { pthread_join(m->th, NULL); m->th_running = false; }
+    pthread_mutex_lock(&m->mth_mu); m->mth_stop = true; pthread_cond_broadcast(&m->mth_cv); bool mrun = m->mth_running; pthread_mutex_unlock(&m->mth_mu);
+    if (mrun) { pthread_join(m->mth, NULL); m->mth_running = false; }
+    pthread_mutex_lock(&m->file_mu);
+    for (int i = 0; i < STRIPES; i++) {
+        stripe *s = &m->st[i]; pthread_mutex_lock(&s->mu);
+        for (size_t k = 0; k < s->nb; k++) for (mentry *e = s->b[k], *nx; e; e = nx) { nx = e->next; entry_free(e); }
+        memset(s->b, 0, s->nb * sizeof *s->b); s->n = 0; s->bytes = 0; s->ndq = 0; s->backoff = 0; s->gen++;
+        pthread_mutex_unlock(&s->mu);
+    }
+    atomic_store(&m->ndirty, 0); atomic_store(&m->rows, 0); atomic_store(&m->bytes, 0);
+    pthread_mutex_lock(&m->purge_mu); m->npurge = 0; pthread_mutex_unlock(&m->purge_mu);
+    if (m->bloom) memset(m->bloom, 0, ((size_t)1 << 23) / 8);
+    m->kicked = false; m->kick_pending = false;
+    atomic_store(&m->ready, false);
+    pthread_mutex_unlock(&m->file_mu);
+    pthread_mutex_lock(&m->th_mu); m->th_stop = false; pthread_mutex_unlock(&m->th_mu);
+    pthread_mutex_lock(&m->mth_mu); m->mth_stop = false; pthread_mutex_unlock(&m->mth_mu);
+}

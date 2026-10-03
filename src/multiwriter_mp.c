@@ -81,8 +81,8 @@ static bool pid_alive (mw_db *db, int32_t pid) {
 // MARK: - open / close -
 
 int mw_mp_open (mw_db *db) {
-    db->mp_path = sqlite3_mprintf("%s-mwlock", db->path);
-    db->mp_pubpath = sqlite3_mprintf("%s-mwlk", db->path);
+    db->mp_path = mw_sidecar_path(db->path, "mwlock");
+    db->mp_pubpath = mw_sidecar_path(db->path, "mwlk");
     if (!db->mp_path || !db->mp_pubpath) return SQLITE_NOMEM;
     size_t len = (sizeof(mw_shm) + 4095) & ~(size_t)4095;
     for (int attempt = 0; attempt < 500; attempt++) {

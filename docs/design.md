@@ -116,10 +116,23 @@ the metadata tests with the store under pressure.
   The shared mode appends through mapped segments that are written whole beforehand: a segment that cannot be made (no room) fails the commit that needed it, leaves nothing behind,
   and is made again by the next one; the append fails before it touched anything the other processes can see, so the database is not failed. Measured with a real full volume: the
   connection that got `SQLITE_FULL` commits again 2000 times after the space returns, with no reopen, in both modes.
-- **Other failures.** A commit whose record cannot be written or fsynced for another reason (EIO, a write that fails inside the reservation) fails and is not visible; when the record never
-  reached the log and nothing was assigned after it, the commit is taken back cleanly; otherwise (a group write or an fsync that fails, where the outcome is uncertain) the database is
-  *failed*: every later commit of the process returns an error until the database is closed and opened again. Opening it again is recovery as after a crash: the valid prefix of the log is
-  replayed, so a transaction is there if its record was complete and nothing else is.
+- **A failed log recovers in place (single process).** A write or an fsync of the log that does not succeed leaves the outcome of the commits of the group unknown, and they are refused. Nothing
+  is visible beyond the last durable commit (a commit becomes visible when its fsync is done), so the next commit that finds the log failed goes back to exactly that point, without a reopen
+  (`mw_db_recover`): it waits (bounded) for the commits inside to leave; the log is cut to the end of the last durable record (what lies beyond may be on the disk in part, and the commits it
+  holds were refused: they must not come back); the page store is rebuilt from the log as an open does (the old store stays allocated until the database is closed, for a reader that was
+  inside it); the memory table of the metadata is dropped and brought in again from the file and the log; the counters of the log and of the epochs go back. The metadata flusher and merger
+  stop for it and start again with the next commit. If anything does not fit (the log is not what it was) the database stays failed and is reopened, as it was before. Measured: a fault at
+  every file call of a workload (EIO, ENOSPC, a torn write, fsync, rename), once or from there on, then lifted: the connection takes transactions again, every acknowledged one is there, none is
+  half, and the metadata agrees with the rows.
+- **A write that finds the disk full is tried again** for up to 2 s (`MW_ENOSPC_WAIT_MS`) before the log is failed: the bytes are still in the staging ring and nobody was told. This covers
+  another process taking the space between the reservation and the write.
+- **The shared mode (several processes) does not roll back.** A commit is visible to the other processes before its fsync (an acknowledged commit is never lost), so a failed fsync cannot be
+  taken back: that database is failed until it is reopened. A segment that cannot be made (no room) is not such a failure: it fails the one commit that needed it.
+- **Linux.** The files the processes of the shared mode map together (`-mwidx`, `-mwrow`, `-mwown`, `-mwlock`) are sparse files of some hundred MB of which a few pages are touched. On a full
+  file system a first touch of a page of a sparse file is a SIGBUS, not an error (measured on tmpfs: the first test run was killed by signal 7 in every shared-mode scenario). On Linux they
+  therefore live in `/dev/shm` (`MW_SIDECAR_DIR`; `db` puts them next to the database); what they hold is rebuilt by the first process that opens the database. The log's reservation uses
+  `fallocate(KEEP_SIZE)`. Tested in a container (gcc 14, arm64): the whole suite, `mw_ioerr`, and `mw_diskfull` on a size-limited tmpfs (`MW_DF_FS=tmpfs`, the default there).
+- **Found on Linux.** A committer waiting for the group fsync compared file offsets: a compaction that finds nothing in flight cuts the log back to its header (offsets restart) while a commit that the group leader has just made visible is still on its way out of the wait, and it waited for ever (1 run of 20 of `mw_compact`). It now also leaves when everything up to its epoch is durable.
 - **Closing with metadata that could not be flushed** (the last connection closes on a full disk): the log is kept, not dropped as compacted, and the next open replays it.
 - **A tracked database never runs untracked.** If the capture cannot build the metadata of a commit (the metadata store cannot be read, no memory, the maps of the shared mode cannot be
   attached) the commit is refused with the error; it is not written without its metadata. The state of the store (list of runs, identity, epochs, the filter of known keys) is never
@@ -168,4 +181,4 @@ stores (`mw_mp=3`: the metadata design needs the shared mode; opening it with `m
 
 `make test` (the engine and the metadata: capture against a model, the store across restarts and SIGKILL, DDL, sync convergence and atomicity, multi-process with a live reader
 and SIGKILL rounds), `make oracle-test` (differential tests against sqlite-sync: primary-key encoding, local generation, merge of 37 thousand changes, 4000 transactions of the
-live store, features, 300 rounds of two peers exchanging payloads through the real encoder and decoder), `make test-mp` (the metadata tests again with the processes mode), `make test-io` (errors of the file system and a full disk: see above).
+live store, features, 300 rounds of two peers exchanging payloads through the real encoder and decoder), `make test-mp` (the metadata tests again with the processes mode), `make test-io` (errors of the file system and a full disk: see above). All of it also runs on Linux (a gcc 14 container, `--privileged` for the size-limited tmpfs of `mw_diskfull`; `kill -USR1 <pid>` of a test prints the stacks of its threads).

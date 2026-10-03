@@ -169,17 +169,17 @@ int main (void) {
         CHECK(mw_exec(db, "INSERT INTO log(tag,k) VALUES(4,0),(4,1),(4,2)") != SQLITE_OK);
         CHECK_RC(mw_exec(db, "INSERT INTO log(tag,k) VALUES(5,0),(5,1),(5,2)"), SQLITE_OK);
         CHECK(mw_scalar(db, "SELECT count(DISTINCT tag) FROM log") == 3);
-        // an fsync failure leaves the outcome uncertain: the database refuses further commits until reopened
+        // an fsync failure leaves the outcome of the commit unknown: it is refused, the log goes back to the last durable commit, and the next commit recovers the database in place
         mw_fault_arm(MW_FAULT_LOG_SYNC_ERR, 1);
         CHECK(mw_exec(db, "INSERT INTO log(tag,k) VALUES(6,0),(6,1),(6,2)") != SQLITE_OK);
-        CHECK(mw_exec(db, "INSERT INTO log(tag,k) VALUES(7,0),(7,1),(7,2)") != SQLITE_OK);
-        sqlite3_close(db);                                                                           // failed db: log kept for recovery
+        CHECK(mw_scalar(db, "SELECT count(*) FROM log WHERE tag=6") == 0);
+        CHECK_RC(mw_exec(db, "INSERT INTO log(tag,k) VALUES(7,0),(7,1),(7,2)"), SQLITE_OK);          // no reopen needed
+        sqlite3_close(db);
         char lp[300]; snprintf(lp, sizeof lp, "%s-mw", path);
-        CHECK(access(lp, F_OK) == 0);
         CHECK_RC(open_lane(path, &db, ""), SQLITE_OK);
-        int64_t tags = mw_scalar(db, "SELECT count(DISTINCT tag) FROM log");
-        CHECK(tags == 3 || tags == 4);                                                               // tag 6 may or may not have reached the log
-        CHECK(mw_scalar(db, "SELECT count(*) FROM log WHERE tag=7") == 0);
+        CHECK(mw_scalar(db, "SELECT count(DISTINCT tag) FROM log") == 4);                            // 1, 3, 5, 7: the refused one did not come back
+        CHECK(mw_scalar(db, "SELECT count(*) FROM log WHERE tag=6") == 0);
+        CHECK(mw_scalar(db, "SELECT count(*) FROM log WHERE tag=7") == 3);
         CHECK(integrity_ok(db));
         sqlite3_close(db);
         mw_rmdb(path); unlink(lp);

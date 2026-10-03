@@ -13,6 +13,11 @@
 #include <time.h>
 #include <unistd.h>
 #include "multiwriter_vstore.h"
+#ifdef F_NOCACHE
+#define MW_NOCACHE(fd) fcntl((fd), F_NOCACHE, 1)
+#else
+#define MW_NOCACHE(fd) ((void)(fd))          // (not on Linux: the page cache is left alone)
+#endif
 
 #define BLOCK_ENTRIES 170                                   // 170 * 24 = 4080 bytes: one block is one 4 KB read
 #define BLOOM_BITS_PER_KEY 10
@@ -79,7 +84,7 @@ static run *run_write (vstore *vs, const ent *e, uint64_t n) {
     snprintf(r->path, sizeof r->path, "%s/run.%llu", vs->p.dir, (unsigned long long)r->id);
     int fd = open(r->path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { free(r); return NULL; }
-    if (vs->p.cold) fcntl(fd, F_NOCACHE, 1);                                  // (before the first write: the pages never enter the cache)
+    if (vs->p.cold) MW_NOCACHE(fd);                                  // (before the first write: the pages never enter the cache)
     const uint8_t *p = (const uint8_t *)e; uint64_t left = r->size, off = 0;
     while (left) { size_t c = left > (1u << 24) ? (1u << 24) : (size_t)left; ssize_t w = pwrite(fd, p + off, c, (off_t)off); if (w <= 0) { close(fd); free(r); return NULL; } off += (uint64_t)w; left -= (uint64_t)w; }
     fsync(fd);
@@ -191,7 +196,7 @@ void vstore_flush (vstore *vs) {
         snprintf(fs->path, sizeof fs->path, "%s/feed.%llu", vs->p.dir, (unsigned long long)vs->next_id++);
         fs->fd = open(fs->path, O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fs->fd >= 0) {
-            if (vs->p.cold) fcntl(fs->fd, F_NOCACHE, 1);
+            if (vs->p.cold) MW_NOCACHE(fs->fd);
             uint64_t left = vs->feed_n * sizeof(ent), off = 0; const uint8_t *pp = (const uint8_t *)vs->feed;
             while (left) { size_t c = left > (1u << 24) ? (1u << 24) : (size_t)left; ssize_t w = pwrite(fs->fd, pp + off, c, (off_t)off); if (w <= 0) break; off += (uint64_t)w; left -= (uint64_t)w; }
             fsync(fs->fd);

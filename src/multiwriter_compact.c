@@ -151,8 +151,8 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
     if (db->mp) {
         /* handled after seq_mu is released (needs the publication lock) */
     } else if (atomic_load(&db->next_epoch) == T && atomic_load(&db->epoch) == T) {
-        if (mw_io_ftruncate(db->logfd, 64) == 0) { db->log_off = 64; mw_log_stage_reset(db, 64); mw_log_remap(db); }
-    } else if (db->log_off > 8 * 4096) {
+        if (mw_io_ftruncate(db->logfd, 64) == 0) { __atomic_store_n(&db->log_off, 64, __ATOMIC_RELAXED); mw_log_stage_reset(db, 64); mw_log_remap(db); }
+    } else if (MW_LOG_OFF(db) > 8 * 4096) {
         mw_log_rewrite_tail(db, T);                                // busy: keep only the records newer than T
     }
     pthread_mutex_unlock(&st->seq_mu);

@@ -17,6 +17,10 @@ LDFLAGS += -lpthread -lm
 ifeq ($(shell uname -s),Darwin)
 LDFLAGS += -framework Security
 endif
+ifeq ($(shell uname -s),Linux)
+CFLAGS += -D_GNU_SOURCE
+LDFLAGS += -ldl
+endif
 
 ENGINE_SRC := $(wildcard $(SRC_DIR)/*.c)
 CRDT_SRC := $(wildcard $(SRC_DIR)/crdt/*.c)

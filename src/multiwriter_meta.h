@@ -62,6 +62,7 @@ void     mw_meta_flush_stats (mw_meta *m, uint64_t *flushes, uint64_t *cells, ui
 
 // ---- the file tables and the flusher (multiwriter_metafile.c) ----
 int      mw_meta_attach (mw_meta *m, const char *path, int mode, int mpmode);      // where the database is (so the store can open its own connections to it)
+void     mw_meta_reset (mw_meta *m);                                               // forget the memory table; the next commit brings the state in again (recovery in place)
 int      mw_meta_ready (mw_meta *m);                                              // (an error: the file's state could not be read; nothing is assumed then)
 int      mw_ovl_err (const mw_ovl *o);                                             // non-zero: a row of the overlay could not be read or built; its metadata must not be used                                              // bring in the file's state and replay the extensions the log held at recovery (idempotent)
 int      mw_meta_flush (mw_meta *m);                                              // write what changed since the last flush to the file tables, in one commit

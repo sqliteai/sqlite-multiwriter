@@ -72,19 +72,19 @@ void mw_cdc_close (mw_db *db) {
 // ---- the owner maps in shared mode: one file, mapped by every process; reset by the first opener ----
 #define OWN_FILE_BYTES (2 * (size_t)OWNER_PAGES * sizeof(uint32_t))
 int mw_cdc_shared_create (mw_db *db) {                                      // the first opener of the database
-    char *p = sqlite3_mprintf("%s-mwown", db->path); if (!p) return SQLITE_NOMEM;
+    char *p = mw_sidecar_path(db->path, "mwown"); if (!p) return SQLITE_NOMEM;
     unlink(p);
     int fd = open(p, O_RDWR | O_CREAT, 0644); sqlite3_free(p);
     if (fd < 0) return SQLITE_CANTOPEN;
     int rc = mw_io_ftruncate(fd, (off_t)OWN_FILE_BYTES) == 0 ? SQLITE_OK : SQLITE_IOERR;
     close(fd); return rc;
 }
-void mw_cdc_shared_unlink (mw_db *db) { char *p = sqlite3_mprintf("%s-mwown", db->path); if (p) { unlink(p); sqlite3_free(p); } }
+void mw_cdc_shared_unlink (mw_db *db) { char *p = mw_sidecar_path(db->path, "mwown"); if (p) { unlink(p); sqlite3_free(p); } }
 static int maps_attach (mw_db *db, mw_cdc *c) {
     if (c->owner) return SQLITE_OK;
     pthread_mutex_lock(&c->mu);
     if (!c->owner) {
-        char *p = sqlite3_mprintf("%s-mwown", db->path); int fd = p ? open(p, O_RDWR) : -1; sqlite3_free(p);
+        char *p = mw_sidecar_path(db->path, "mwown"); int fd = p ? open(p, O_RDWR) : -1; sqlite3_free(p);
         if (fd >= 0) { void *m = mw_io_mmap(NULL, OWN_FILE_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0); close(fd); if (m != MAP_FAILED) { c->ovo = (_Atomic uint32_t *)m + OWNER_PAGES; c->owner = m; } }
     }
     pthread_mutex_unlock(&c->mu);
@@ -389,6 +389,7 @@ void mw_cdc_lane_free (mw_lane *lane) {
     mw_ovl_free(lane->cdc_ovl); lane->cdc_ovl = NULL;
 }
 
+void mw_cdc_reset (mw_db *db) { mw_cdc *c = db->cdc; if (!c) return; mw_meta_reset(c->meta); c->ready = false; }
 mw_meta *mw_cdc_meta (mw_db *db) { mw_cdc *c = db->cdc; return c ? c->meta : NULL; }
 
 // the last user connection is closing: the metadata goes to the file now (the log is about to be dropped), and the store's own connections close

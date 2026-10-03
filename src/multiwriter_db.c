@@ -85,6 +85,23 @@ mw_db *mw_db_acquire (const char *path, int mode, int mpmode, bool sys) {
     return db;
 }
 
+
+// The path of one of the files the processes of the shared mode map and lock together (suffix "mwidx", "mwrow", "mwown", "mwlock", "mwlk"). They are sparse files of some hundred MB of which a few
+// pages are touched, and what they hold is rebuilt by the first process that opens the database. On Linux a first touch of a page of a sparse file on a full file system is a SIGBUS (not an
+// error), so there they live in /dev/shm (MW_SIDECAR_DIR changes it, "db" puts them next to the database, as on macOS, where the same test did not fault); the name carries a hash of the
+// database's path. The caller frees the result with sqlite3_free.
+char *mw_sidecar_path (const char *dbpath, const char *suffix) {
+    const char *dir = getenv("MW_SIDECAR_DIR");
+#if defined(__linux__)
+    if (!dir) dir = access("/dev/shm", W_OK) == 0 ? "/dev/shm" : "db";
+#else
+    if (!dir) dir = "db";
+#endif
+    if (!strcmp(dir, "db")) return sqlite3_mprintf("%s-%s", dbpath, suffix);
+    uint64_t h = 1469598103934665603ull; for (const char *c = dbpath; *c; c++) { h ^= (unsigned char)*c; h *= 1099511628211ull; }
+    return sqlite3_mprintf("%s/mw-%016llx-%s", dir, (unsigned long long)h, suffix);
+}
+
 void mw_db_release_ex (mw_db *db, bool sys);
 void mw_db_release (mw_db *db) { mw_db_release_ex(db, false); }
 
@@ -162,6 +179,7 @@ void mw_db_release_ex (mw_db *db, bool sys) {
         for (int i = 0; db->vis && i < MW_VIS_SLOTS; i++) { pthread_mutex_destroy(&db->vis[i].mu); pthread_cond_destroy(&db->vis[i].cv); }
         sqlite3_free(db->vis);
         free(db->p1_cache);
+        for (int i = 0; i < db->nretired; i++) mw_store_free(db->retired[i]);
         mw_store_free(db->store);
         pthread_cond_destroy(&db->ddl_cv);
         pthread_mutex_destroy(&db->ddl_mu);

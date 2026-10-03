@@ -189,46 +189,11 @@ uint64_t mw_log_record_size (mw_db *db, int n, uint32_t ext_len) {
 
 // MARK: - open / recovery -
 
-int mw_log_open (mw_db *db, int pgsz) {
-    db->logpath = sqlite3_mprintf("%s-mw", db->path);
-    if (!db->logpath) return SQLITE_NOMEM;
-    db->logfd = open(db->logpath, O_RDWR | O_CREAT, 0644);
-    db->has_log = db->logfd >= 0;
-    if (db->logfd < 0) return SQLITE_CANTOPEN;
-    // single-process mode owns the log exclusively; multi-process mode shares it (a non-mp opener asking for EX is refused)
-    if (flock(db->logfd, (db->mp_req ? LOCK_SH : LOCK_EX) | LOCK_NB) != 0) {          // another process owns this database
-        close(db->logfd); db->logfd = -1; db->has_log = false;
-        return SQLITE_BUSY;
-    }
-    struct stat sb;
-    if (fstat(db->logfd, &sb) != 0) return SQLITE_IOERR;
-
-    log_hdr h;
-    bool valid = sb.st_size >= LOG_HDR_SIZE && pread_all(db->logfd, &h, sizeof h, 0) == SQLITE_OK &&
-                 memcmp(h.magic, LOG_MAGIC, 8) == 0 && h.cksum == hdr_cksum(&h) && h.pgsz == (uint32_t)pgsz;
-    uint64_t base = 1;
-    if (!valid) {                                            // new (or unusable) log: start empty from the real file
-        sqlite3_randomness(sizeof db->log_salt, &db->log_salt);
-        if (mw_io_ftruncate(db->logfd, 0) != 0) return SQLITE_IOERR;
-        int rc = hdr_write(db, (uint32_t)pgsz, base, db->log_salt);
-        if (rc != SQLITE_OK) return rc;
-        db->log_off = LOG_HDR_SIZE;
-        mw_log_stage_reset(db, db->log_off);
-    } else {
-        base = h.base_epoch;
-        db->log_salt = h.salt;
-    }
-    db->base_epoch = base;
-    atomic_store(&db->epoch, base);
-    atomic_store(&db->next_epoch, base);
-    db->written_upto = db->synced_upto = base;
-    if (!valid) { pthread_mutex_lock(&db->store->seq_mu); mw_log_remap(db); pthread_mutex_unlock(&db->store->seq_mu); return SQLITE_OK; }
-
-    // ---- recovery: replay the valid, contiguous prefix of records
-    mw_store *st = db->store;
+// Replays the valid, contiguous prefix of the log's records newer than `base` into `st` (and collects their metadata extensions in db->rext). *off_out: where the prefix ends,
+// *last_out: the epoch of its last record.
+static int log_replay (mw_db *db, mw_store *st, int pgsz, uint64_t base, uint64_t limit, uint64_t *last_out, off_t *off_out) {
     off_t off = LOG_HDR_SIZE;
     uint64_t last = base, prev_epoch = 0;
-    uint64_t limit = (db->mp && !db->mp_first) ? MW_LOG_END(atomic_load(&db->shm->log_pos)) : UINT64_MAX;   // a later process replays exactly what is committed
     size_t rec_cap = 0;
     uint8_t *buf = NULL;
     int rc = SQLITE_OK;
@@ -270,6 +235,50 @@ int mw_log_open (mw_db *db, int pgsz) {
         off += (off_t)REC_HDR_SIZE + (off_t)body;
     }
     free(buf);
+    *last_out = last; *off_out = off;
+    return rc;
+}
+
+int mw_log_open (mw_db *db, int pgsz) {
+    db->logpath = sqlite3_mprintf("%s-mw", db->path);
+    if (!db->logpath) return SQLITE_NOMEM;
+    db->logfd = open(db->logpath, O_RDWR | O_CREAT, 0644);
+    db->has_log = db->logfd >= 0;
+    if (db->logfd < 0) return SQLITE_CANTOPEN;
+    // single-process mode owns the log exclusively; multi-process mode shares it (a non-mp opener asking for EX is refused)
+    if (flock(db->logfd, (db->mp_req ? LOCK_SH : LOCK_EX) | LOCK_NB) != 0) {          // another process owns this database
+        close(db->logfd); db->logfd = -1; db->has_log = false;
+        return SQLITE_BUSY;
+    }
+    struct stat sb;
+    if (fstat(db->logfd, &sb) != 0) return SQLITE_IOERR;
+
+    log_hdr h;
+    bool valid = sb.st_size >= LOG_HDR_SIZE && pread_all(db->logfd, &h, sizeof h, 0) == SQLITE_OK &&
+                 memcmp(h.magic, LOG_MAGIC, 8) == 0 && h.cksum == hdr_cksum(&h) && h.pgsz == (uint32_t)pgsz;
+    uint64_t base = 1;
+    if (!valid) {                                            // new (or unusable) log: start empty from the real file
+        sqlite3_randomness(sizeof db->log_salt, &db->log_salt);
+        if (mw_io_ftruncate(db->logfd, 0) != 0) return SQLITE_IOERR;
+        int rc = hdr_write(db, (uint32_t)pgsz, base, db->log_salt);
+        if (rc != SQLITE_OK) return rc;
+        db->log_off = LOG_HDR_SIZE;
+        mw_log_stage_reset(db, db->log_off);
+    } else {
+        base = h.base_epoch;
+        db->log_salt = h.salt;
+    }
+    db->base_epoch = base;
+    atomic_store(&db->epoch, base);
+    atomic_store(&db->next_epoch, base);
+    db->written_upto = db->synced_upto = base;
+    if (!valid) { pthread_mutex_lock(&db->store->seq_mu); mw_log_remap(db); pthread_mutex_unlock(&db->store->seq_mu); return SQLITE_OK; }
+
+    // ---- recovery: replay the valid, contiguous prefix of records
+    mw_store *st = db->store;
+    uint64_t limit = (db->mp && !db->mp_first) ? MW_LOG_END(atomic_load(&db->shm->log_pos)) : UINT64_MAX;   // a later process replays exactly what is committed
+    uint64_t last = base; off_t off = LOG_HDR_SIZE;
+    int rc = log_replay(db, st, pgsz, base, limit, &last, &off);
     if (rc != SQLITE_OK) return rc;
     if (limit == UINT64_MAX && sb.st_size > off && mw_io_ftruncate(db->logfd, off) != 0) return SQLITE_IOERR;       // drop the torn tail (only the first process)
     db->log_off = (uint64_t)off;
@@ -304,6 +313,64 @@ void mw_log_close (mw_db *db, bool remove_file) {
     free(db->written_pending);
     db->written_pending = NULL;
     if (db->stage_buf) { munmap(db->stage_buf, (size_t)db->stage_r); db->stage_buf = NULL; }
+}
+
+
+static void sync_quiesce (mw_db *db);
+static void sync_resume (mw_db *db);
+// ---- recovery in place ----
+// A failed log (a write or an fsync that did not succeed: the outcome of the commits of the group is unknown, and they were told so) does not need the database to be opened again.
+// Nothing is visible beyond the last durable commit (a commit becomes visible when its fsync is done), so the state to go back to is exactly that one:
+//   - the log is cut to the end of the last durable record (what lies beyond may be on the disk in part; the commits it holds were refused, they must not come back);
+//   - the page store is rebuilt from the log, as an open does (the old store stays allocated until the database is closed: a reader that was inside it finishes there);
+//   - the memory table of the metadata is dropped, and the next commit brings the state in from the file and the log, as an open does;
+//   - the counters of the log and of the epochs go back to the durable point.
+// It runs when the next commit finds the database failed and every other commit has left (a bounded wait); if anything does not fit (the log is not what it was) the database stays
+// failed and the application reopens it, as before.
+int mw_db_recover (mw_db *db) {
+    if (db->mp || db->shared || db->logfd < 0 || !db->store || atomic_load(&db->log_mode) != 2 || db->nretired >= 8) return SQLITE_IOERR;
+    int expect = 0; if (!atomic_compare_exchange_strong(&db->recovering, &expect, 1)) return SQLITE_BUSY;
+    int rc = SQLITE_IOERR;
+    for (int i = 0; i < 3000 && atomic_load(&db->inflight) > 1; i++) usleep(1000);
+    if (atomic_load(&db->inflight) > 1) { atomic_store(&db->recovering, 0); return rc; }
+    pthread_mutex_lock(&db->compact_mu);
+    sync_quiesce(db);
+    mw_store *old = db->store, *nst = NULL;
+    uint64_t V = atomic_load(&db->epoch), E, D;
+    pthread_mutex_lock(&db->log_mu); E = db->synced_off; D = db->synced_upto; pthread_mutex_unlock(&db->log_mu);
+    if (V != D || E < LOG_HDR_SIZE) goto out;
+    if (mw_io_ftruncate(db->logfd, (off_t)E) != 0) goto out;
+    nst = mw_store_create(old->pgsz, old->base_dbsize);
+    if (!nst) { rc = SQLITE_NOMEM; goto out; }
+    nst->reserved = old->reserved;
+    for (int i = 0; i < db->nrext; i++) free(db->rext[i].data);
+    db->nrext = 0;
+    uint64_t last = db->base_epoch; off_t off = LOG_HDR_SIZE;
+    rc = log_replay(db, nst, old->pgsz, db->base_epoch, E, &last, &off);
+    if (rc != SQLITE_OK || last != V || (uint64_t)off != E) { mw_store_free(nst); nst = NULL; rc = SQLITE_IOERR; goto out; }
+    sqlite3_mutex_enter(db->mu);
+    db->retired[db->nretired++] = old;
+    db->store = nst;
+    sqlite3_mutex_leave(db->mu);
+    free(db->p1_cache); db->p1_cache = NULL; db->p1_cache_epoch = 0;
+    pthread_mutex_lock(&nst->seq_mu);
+    __atomic_store_n(&db->log_off, E, __ATOMIC_RELAXED);
+    atomic_store(&db->next_epoch, V);
+    pthread_mutex_unlock(&nst->seq_mu);
+    pthread_mutex_lock(&db->log_mu);
+    db->written_upto = db->synced_upto = db->flushed_epoch = V;
+    db->npending = 0;
+    pthread_mutex_unlock(&db->log_mu);
+    mw_log_stage_reset(db, E);
+    if (db->cdc) mw_cdc_reset(db);
+    atomic_store(&db->failed, 0);
+    rc = SQLITE_OK;
+out:
+    sync_resume(db);
+    pthread_mutex_unlock(&db->compact_mu);
+    mw_db_wake_all_visibility(db);
+    atomic_store(&db->recovering, 0);
+    return rc;
 }
 
 // MARK: - mapped log -
@@ -410,7 +477,7 @@ static bool prefill_claim (mw_db *db, bool wait) {
 }
 static void log_prefill (mw_db *db) {                                      // (under the publication lock)
     mw_shm *sh = db->shm;
-    uint64_t need = db->log_off + LOG_PREFILL_AHEAD / 3;                      // the space this record needs, plus a margin for the next ones
+    uint64_t need = MW_LOG_OFF(db) + LOG_PREFILL_AHEAD / 3;                      // the space this record needs, plus a margin for the next ones
     uint64_t ready = atomic_load_explicit(&sh->log_ready, memory_order_acquire);
     if (ready < need) {                                                       // the background filler is behind (or nobody filled yet): do it here
         prefill_claim(db, true);
@@ -444,14 +511,14 @@ void mw_log_fill_release (mw_db *db) { atomic_store(&db->shm->log_fill_pid, 0); 
 #define LOG_RES_STEP (4ull << 20)
 #define LOG_RES_SLACK (2ull << 20)
 int mw_log_ensure_room (mw_db *db, uint64_t record_size) {
-    if (db->mp || db->logfd < 0 || atomic_load_explicit(&db->log_mode, memory_order_acquire) != 2) return SQLITE_OK;
-    uint64_t need = db->log_off + record_size + LOG_RES_SLACK;                       // (log_off read without its lock: a little behind at worst, the slack covers it)
+    if (db->mp || atomic_load_explicit(&db->log_mode, memory_order_acquire) != 2) return SQLITE_OK;
+    uint64_t need = __atomic_load_n(&db->log_off, __ATOMIC_RELAXED) + record_size + LOG_RES_SLACK;                       // (log_off read without its lock: a little behind at worst, the slack covers it)
     if (need <= atomic_load_explicit(&db->log_res_end, memory_order_acquire)) return SQLITE_OK;
     pthread_mutex_lock(&db->log_mu);
     uint64_t have = atomic_load(&db->log_res_end), want = need + LOG_RES_STEP;
     if (have < db->written_end) have = db->written_end;                               // (the data already in the file is its own reservation)
     int rc = SQLITE_OK;
-    if (need > atomic_load(&db->log_res_end)) {
+    if (db->logfd >= 0 && need > atomic_load(&db->log_res_end)) {
         int e = mw_io_reserve(db->logfd, have, want);
         if (e) rc = mw_io_rc(e, SQLITE_IOERR_WRITE); else atomic_store(&db->log_res_end, want);
     }
@@ -464,7 +531,7 @@ void mw_log_reserve_space (mw_db *db) {
     // allocate blocks inside every write (measured: group sync 70-290 us against 40-50 us when the file simply grows, 2 writers 5-11k against 17k tx/s).
     if (!db->logmap || atomic_load(&db->log_mode) != 1) return;
     if (db->mp) { log_prefill(db); return; }
-    uint64_t need = db->log_off + LOG_GROW_BYTES / 4;
+    uint64_t need = MW_LOG_OFF(db) + LOG_GROW_BYTES / 4;
     if (need <= db->logfile_size) return;
     struct stat cur;
     if (fstat(db->logfd, &cur) == 0 && (uint64_t)cur.st_size >= need) { db->logfile_size = (uint64_t)cur.st_size; return; }     // someone else already grew it
@@ -560,6 +627,17 @@ static int ring_write_file (mw_db *db, uint64_t from, uint64_t len) {
     return SQLITE_OK;
 }
 
+
+// A write that finds the disk full is tried again for a while (MW_ENOSPC_WAIT_MS, default 2000) before it is given up: the bytes are still in the ring, nothing was told to the
+// committers, and the space that another process took between the reservation and the write may well be back in a moment. Only after that the log is failed.
+static int enospc_wait_ms (void) { static _Atomic int c = MW_KNOB_UNSET; return mw_knob_int(&c, "MW_ENOSPC_WAIT_MS", 2000); }
+static int ring_write_file (mw_db *db, uint64_t from, uint64_t len);
+static int ring_write_retry (mw_db *db, uint64_t from, uint64_t len) {
+    int rc = ring_write_file(db, from, len);
+    for (int waited = 0; rc == SQLITE_FULL && waited < enospc_wait_ms(); waited += 10) { usleep(10000); rc = ring_write_file(db, from, len); }
+    return rc;
+}
+
 // Writes the contiguous prefix of finished records that is not in the file yet (no fsync). Does nothing if a flush or sync is already running.
 static bool leader_vis_on (void);
 static bool nosync_group_vis_on (void) { static _Atomic int c = MW_KNOB_UNSET; return mw_knob_flag(&c, "MW_NOSYNC_GROUP_VIS"); }   // opt-in: measured slower at 32 agents (§32)
@@ -572,7 +650,7 @@ static int stage_flush (mw_db *db, bool publish) {
     db->stage_writing = true;
     uint64_t from = db->flushed_off, hi = db->written_end, hi_epoch = db->written_upto;
     pthread_mutex_unlock(&db->log_mu);
-    int rc = ring_write_file(db, from, hi - from);
+    int rc = ring_write_retry(db, from, hi - from);
     pthread_mutex_lock(&db->log_mu);
     db->stage_writing = false;
     if (rc == SQLITE_OK) { db->flushed_off = hi; db->flushed_epoch = hi_epoch; } else atomic_store(&db->failed, 1);
@@ -666,6 +744,7 @@ static int append_staged (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsi
         if (ext_len) memcpy(p, ext, ext_len);
         if (fault_fires(MW_CRASH_MID_LOG)) { pwrite_all(db->logfd, buf, (size_t)size / 2, (off_t)off); _exit(9); }
         int rc = pwrite_all(db->logfd, buf, (size_t)size, (off_t)off);
+        for (int waited = 0; rc == SQLITE_FULL && waited < enospc_wait_ms(); waited += 10) { usleep(10000); rc = pwrite_all(db->logfd, buf, (size_t)size, (off_t)off); }
         free(buf);
         if (rc != SQLITE_OK) return rc;
         pthread_mutex_lock(&db->log_mu);
@@ -695,12 +774,14 @@ static int append_staged (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsi
 static bool leader_vis_on (void) { static _Atomic int c = MW_KNOB_UNSET; return !mw_knob_flag(&c, "MW_NO_LEADER_VIS"); }
 
 // Staged group commit: the first committer whose record is inside the prefix and finds no sync running becomes the leader: it writes the prefix and fsyncs.
-static int sync_staged (mw_db *db, uint64_t my_end) {
+static int sync_staged (mw_db *db, uint64_t my_epoch, uint64_t my_end) {
     int rc = SQLITE_OK;
     bool did_io = false; int wakes = 0;
     const bool pipe = pipeline_on();
     pthread_mutex_lock(&db->log_mu);
-    while (db->synced_off < my_end) {
+    // (done when the file is synced up to the record, or when everything up to its epoch is durable: a compaction that finds nothing in flight cuts the log back to its header and the
+    // offsets restart, while a commit whose epoch the group leader has just made visible is still on its way out of this loop)
+    while (db->synced_off < my_end && db->synced_upto < my_epoch) {
         if (atomic_load(&db->failed)) { rc = SQLITE_IOERR_FSYNC; break; }
         // Two roles, each held by one thread at a time, and (unless MW_NO_PIPELINE) working at the same time: the *writer* pwritev's the contiguous prefix of
         // finished records that is not in the file yet; the *syncer* fsyncs everything that was written before its fsync started. While one thread is in
@@ -712,7 +793,7 @@ static int sync_staged (mw_db *db, uint64_t my_end) {
             uint64_t from = db->flushed_off, hi = db->written_end, hi_epoch = db->written_upto;
             pthread_mutex_unlock(&db->log_mu);
             uint64_t tw = MW_T0();
-            int wrc = ring_write_file(db, from, hi - from);
+            int wrc = ring_write_retry(db, from, hi - from);
             MW_T1(MW_ST_SY_WRITE, tw);
             pthread_mutex_lock(&db->log_mu);
             db->stage_writing = false;
@@ -765,7 +846,7 @@ static int sync_staged (mw_db *db, uint64_t my_end) {
 static bool stage_drained (mw_db *db) {
     stage_flush(db, false);
     pthread_mutex_lock(&db->log_mu);
-    bool done = db->written_upto >= atomic_load(&db->next_epoch) && db->flushed_off >= db->log_off;
+    bool done = db->written_upto >= atomic_load(&db->next_epoch) && db->flushed_off >= MW_LOG_OFF(db);
     pthread_mutex_unlock(&db->log_mu);
     return done;
 }
@@ -824,8 +905,7 @@ int mw_log_append (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsize, int
 // Group commit: an fsync that *starts* after this record was written makes it durable, so concurrent
 // committers share one fsync (leader/follower on a generation counter).
 int mw_log_sync (mw_db *db, uint64_t epoch, uint64_t my_end) {
-    (void)epoch;
-    if (atomic_load_explicit(&db->log_mode, memory_order_acquire) == 2) return sync_staged(db, my_end);
+    if (atomic_load_explicit(&db->log_mode, memory_order_acquire) == 2) return sync_staged(db, epoch, my_end);
     int rc = SQLITE_OK;
     pthread_mutex_lock(&db->log_mu);
     uint64_t need = db->sync_started + 1;           // the first fsync to begin after our pwrite completed
@@ -835,7 +915,7 @@ int mw_log_sync (mw_db *db, uint64_t epoch, uint64_t my_end) {
             uint64_t mine = ++db->sync_started;
             uint8_t *map = db->logmap;                                 // (one consistent view of the mapping, the fd and the range for the whole sync)
             int fd = db->logfd;
-            uint64_t hi = db->log_off, lo = db->logsync_off;
+            uint64_t hi = MW_LOG_OFF(db), lo = db->logsync_off;
             if (db->logsync_low1 && db->logsync_low1 - 1 < lo) lo = db->logsync_low1 - 1;
             db->logsync_low1 = 0;
             pthread_mutex_unlock(&db->log_mu);
@@ -957,7 +1037,7 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch) {
     // The size records cannot be used to find it: local GC prunes them up to this process's oldest snapshot, which in
     // multi-process mode can be newer than base_epoch (a missing record would make the new log start after base+1: a gap).
     // Scan the headers instead.
-    uint64_t tail_off = db->logmap ? mw_log_scan_after(db, base_epoch, db->log_off) : 0;
+    uint64_t tail_off = db->logmap ? mw_log_scan_after(db, base_epoch, MW_LOG_OFF(db)) : 0;
     if (tail_off == 0) return SQLITE_OK;                                  // no map: leave the log alone
     // wait for in-flight record writes (bounded)
     for (int spin = 0; spin < 200000; spin++) {
@@ -970,7 +1050,7 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch) {
         if (spin == 199999) return SQLITE_BUSY;
         sched_yield();
     }
-    uint64_t end = db->log_off;
+    uint64_t end = MW_LOG_OFF(db);
     if (tail_off > end) return SQLITE_OK;
     char *tmp = sqlite3_mprintf("%s.new", db->logpath);
     if (!tmp) return SQLITE_NOMEM;
@@ -1007,7 +1087,7 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch) {
     db->logfd = nfd;
     int64_t shift = (int64_t)LOG_HDR_SIZE - (int64_t)tail_off;
     for (int i = 0; i < st->nsizes; i++) if (st->sizes[i].log_off >= tail_off) st->sizes[i].log_off = (uint64_t)((int64_t)st->sizes[i].log_off + shift); else st->sizes[i].log_off = 0;
-    db->log_off = out;
+    __atomic_store_n(&db->log_off, out, __ATOMIC_RELAXED);
     mw_log_stage_reset(db, out);
     mw_log_remap(db);
     pthread_mutex_lock(&db->log_mu); db->base_epoch = base_epoch; pthread_mutex_unlock(&db->log_mu);

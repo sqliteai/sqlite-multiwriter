@@ -157,6 +157,10 @@ the metadata tests with the store under pressure.
   shared mode does not keep (it ran on its 0.5 s timer, the log sat at 270 MB, where the commits are slowed): 4 processes 12.4k -> 17.4k tx/s, and untracked 17.5k -> 25k.
 - **What is left** (one process, 16 threads: 31k against 46k untracked; 8 processes 15k against 25k): the capture's own work on the way of a commit (the rows of the pages decoded and the CRDT state of
   every row looked up: ~30 us outside the locks, ~20 us in the publication of the shared mode) and the flush itself (0.25-0.4 us a row in one thread).
+- **Smaller cells (tried, neutral).** The cells of a row (extension of a commit, rows of the runs) are written as deltas: the first whole, each next one a control byte that says which of
+  column+1, version, db_version, site and sequence repeat (`cz_put`/`cz_get`; row format 2, extension 0x4f; format-1 rows are still read). A row of 100 narrow cells took ~7 bytes a cell and takes ~1.
+  Measured (30 s): 16 threads 28.2k tx/s (tracked) against 45.4k untracked; 4 processes 14.8k against 25.6k; 8 processes 15.0k against 24.8k - no gain over before: the volume of the metadata is not what limits the
+  gap, the CPU of the capture, the apply and the merge is. Kept for the smaller log and runs.
 
 ## Capture and DDL
 

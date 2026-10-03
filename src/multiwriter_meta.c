@@ -423,7 +423,12 @@ static bool touched (const orow *r) { if (r->flags) return true; for (int k = 0;
 // the bucket holds (the touched ones in their new state, the others as the transaction read them); otherwise there is one group.
 static void put_row (wbuf *w, const uint32_t tbl, const uint8_t *pk, uint32_t pklen, const mw_mcell *c, int n) {
     w_var(w, tbl); w_var(w, pklen); w_bytes(w, pk, pklen); w_var(w, (uint64_t)n);
-    for (int k = 0; k < n; k++) { w_var(w, c[k].col); w_var(w, (uint64_t)c[k].cv); w_var(w, c[k].dv == OV_CHG ? 0 : (uint64_t)c[k].dv + 1); w_var(w, c[k].site); w_var(w, c[k].seq); }
+    uint8_t buf[CZ_MAX * 64]; size_t bn = 0; uint64_t prev[5];                // (the cells go through a small buffer: one append for every 64)
+    for (int k = 0; k < n; k++) {
+        uint64_t v[5] = { c[k].col, (uint64_t)c[k].cv, c[k].dv == OV_CHG ? 0 : (uint64_t)c[k].dv + 1, c[k].site, c[k].seq };
+        bn += cz_put(buf + bn, v, k ? prev : NULL); memcpy(prev, v, sizeof prev);
+        if (bn > sizeof buf - CZ_MAX || k == n - 1) { w_bytes(w, buf, bn); bn = 0; }
+    }
 }
 static void put_group (wbuf *w, uint32_t bucket, wbuf *body, int nrows) {            // body: the rows; framed as [length][bucket][nrows][rows]
     wbuf h = {0}; w_var(&h, bucket); w_var(&h, (uint64_t)nrows);
@@ -573,10 +578,11 @@ int mw_ext_walk (const uint8_t *ext, uint32_t len, uint64_t epoch, mw_ext_row_fn
             const uint8_t *pk = p; p += pklen;
             if (r_var(&p, end, &nc) || nc > (1u << 20)) { free(cells); return -1; }
             if ((int)nc > ccap) { ccap = (int)nc * 2 + 4; mw_mcell *nm = realloc(cells, (size_t)ccap * sizeof *nm); if (!nm) { free(cells); return -1; } cells = nm; }
+            uint64_t pv[5];
             for (uint64_t k = 0; k < nc; k++) {
-                uint64_t col, cv, dvp, site, seq;
-                if (r_var(&p, end, &col) || r_var(&p, end, &cv) || r_var(&p, end, &dvp) || r_var(&p, end, &site) || r_var(&p, end, &seq)) { free(cells); return -1; }
-                cells[k] = (mw_mcell){ (int64_t)cv, dvp ? (int64_t)(dvp - 1) : (int64_t)epoch, (uint32_t)col, (uint32_t)site, (uint32_t)seq };
+                uint64_t v[5]; if (cz_get(&p, end, v, k ? pv : NULL)) { free(cells); return -1; }
+                memcpy(pv, v, sizeof pv);
+                cells[k] = (mw_mcell){ (int64_t)v[1], v[2] ? (int64_t)(v[2] - 1) : (int64_t)epoch, (uint32_t)v[0], (uint32_t)v[3], (uint32_t)v[4] };
             }
             if (row_cb && row_cb(arg, (uint32_t)bucket, (uint32_t)tbl, pk, (size_t)pklen, cells, (int)nc) != 0) { free(cells); return -1; }
         }

@@ -15,7 +15,7 @@ struct mw_db; struct mw_lane;
 #define STRIPES 64
 #define SEN CRDT_COL_SENTINEL
 #define OV_CHG INT64_MIN                 // in an overlay cell: written by this commit (its db_version is the commit's epoch, not known yet)
-#define EXT_VERSION 0x4e                // the format of the extension of a commit record (bumped when it changes)
+#define EXT_VERSION 0x4f                // the format of the extension of a commit record (bumped when it changes)
 #define F_DROP 1                         // the non-sentinel cells of the row are removed
 #define F_ZERO 2                         // the non-sentinel cells get version 0 and the db_version of the commit
 
@@ -99,6 +99,38 @@ void     mw_meta_site_install (mw_meta *m, uint32_t ord, const uint8_t id[16]);
 void     mw_metafile_free (mw_meta *m);
 void     mw_meta_reset (mw_meta *m);                                            // forget the memory table (see multiwriter_metafile.c)
 int      mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]);
+
+// ---- the cells of a row, packed (the extension of a commit and the rows of the runs) ----
+// A cell is five numbers, (column, version, db_version, site, sequence). The first cell of a row is written whole; each of the others as a control byte that says which numbers repeat (the column
+// is the previous one + 1, the version, the db_version and the site are the previous ones, the sequence is the previous one + 1) followed by the numbers that do not. A row inserted by one commit is
+// then 7 bytes for its first cell and one for every other (it was 7 for each: the log record of a commit of 100 rows lost 7 KB and a run of the file 3 times what it needed).
+static inline size_t cz_var (uint8_t *p, uint64_t v) { size_t n = 0; while (v >= 0x80) { p[n++] = (uint8_t)(v | 0x80); v >>= 7; } p[n++] = (uint8_t)v; return n; }
+static inline int cz_rvar (const uint8_t **p, const uint8_t *end, uint64_t *v) {
+    uint64_t r = 0; int sh = 0;
+    while (*p < end && sh < 64) { uint8_t b = *(*p)++; r |= (uint64_t)(b & 0x7f) << sh; if (!(b & 0x80)) { *v = r; return 0; } sh += 7; }
+    return -1;
+}
+#define CZ_MAX 52                                                        // the most one cell takes
+static inline size_t cz_put (uint8_t *out, const uint64_t v[5], const uint64_t *prev) {
+    size_t w = 0;
+    if (!prev) { for (int i = 0; i < 5; i++) w += cz_var(out + w, v[i]); return w; }
+    unsigned ctl = (v[0] == prev[0] + 1) | (unsigned)(v[1] == prev[1]) << 1 | (unsigned)(v[2] == prev[2]) << 2 | (unsigned)(v[3] == prev[3]) << 3 | (unsigned)(v[4] == prev[4] + 1) << 4;
+    out[w++] = (uint8_t)ctl;
+    for (int i = 0; i < 5; i++) if (!(ctl & (1u << i))) w += cz_var(out + w, v[i]);
+    return w;
+}
+static inline int cz_get (const uint8_t **p, const uint8_t *end, uint64_t v[5], const uint64_t *prev) {
+    if (!prev) { for (int i = 0; i < 5; i++) if (cz_rvar(p, end, &v[i])) return -1; return 0; }
+    if (*p >= end) return -1;
+    unsigned ctl = *(*p)++;
+    if (ctl & ~0x1fu) return -1;
+    for (int i = 0; i < 5; i++) {
+        if (ctl & (1u << i)) v[i] = (i == 1 || i == 2 || i == 3) ? prev[i] : prev[i] + 1;
+        else if (cz_rvar(p, end, &v[i])) return -1;
+    }
+    return 0;
+}
+
 #endif
 
 void *mw_fbatch_alloc (fbatch *b, size_t n);

@@ -295,6 +295,7 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
     } else build_delta(lane, c, plan.purge, plan.npurge);
     { mw_ovl *act = lane->cdc_decl ? lane->cdc_decl : lane->cdc_ovl; if (act && lane->cdc_ext_len) lane->cdc_ng = mw_ovl_groups(act, (const uint32_t **)&lane->cdc_gbucket, (const uint32_t **)&lane->cdc_goff, (const uint64_t **)&lane->cdc_gseen); }
     free(plan.skip); free(plan.skip_old); free(plan.purge);
+    { static int noext = -1; if (noext < 0) noext = getenv("MW_EXP_NOEXT") != NULL; if (noext) { free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0; } }      // (experiment: the work of the capture without its bytes in the log)
     // the rows point into the catalog they were decoded with: it stays alive until the apply step of the same commit
     if (newcat) { mw_cat_free(cat); lane->cdc_cat = newcat; } else lane->cdc_cat = cat;
     atomic_fetch_add(&c->ns_prepare, now_ns() - t0);
@@ -375,7 +376,8 @@ void mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch) {
     mw_cdc *c = db->cdc;
     mw_ovl *act = lane->cdc_decl ? lane->cdc_decl : lane->cdc_ovl;
     lane->cdc_ng = 0;
-    if (act && lane->cdc_ext_len && !db->shared) { mw_meta_apply(c->meta, act, epoch); uint64_t d = mw_meta_dirty(c->meta); if (d >= 16384) mw_meta_kick(c->meta);
+    static int noapply = -1; if (noapply < 0) noapply = getenv("MW_EXP_NOAPPLY") != NULL;          // (experiment: what the memory table and the flush cost)
+    if (act && lane->cdc_ext_len && !db->shared && !noapply) { mw_meta_apply(c->meta, act, epoch); uint64_t d = mw_meta_dirty(c->meta); if (d >= 16384) mw_meta_kick(c->meta);
         uint64_t lim = mw_meta_dirty_limit(c->meta);                           // back-pressure: the flusher is far behind the writers; they wait (outside the lock, in publish_finish), more as the backlog grows
         if (d > lim) { uint64_t w = (d - lim) * 1000 / lim; lane->bp_wait_us = (uint32_t)(w > 20000 ? 20000 : w < 20 ? 20 : w); atomic_fetch_add(&mw_bp[0], lane->bp_wait_us); atomic_fetch_add(&mw_bp[1], 1); } }
     if (!lane->sys) { uint32_t rp = mw_meta_run_pressure(c->meta); if (rp > lane->bp_wait_us) lane->bp_wait_us = rp; if (rp) { atomic_fetch_add(&mw_bp[2], rp); atomic_fetch_add(&mw_bp[3], 1); } }       // (the metadata store's own commits are not slowed: they are what the others wait for)

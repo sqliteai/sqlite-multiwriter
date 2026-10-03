@@ -179,7 +179,8 @@ static int flush_block (rs_builder *b) {
     if (!nocomp && len >= 512 && len < (1u << 26)) {                                 // compressed when that gains a tenth or more
         int bound = LZ4_compressBound((int)len); cmp = malloc((size_t)bound + 5);
         if (cmp) {
-            int cl = LZ4_compress_default((const char *)buf, (char *)cmp + 5, (int)len, bound);
+            static int accel = -1; if (accel < 0) { const char *e = getenv("MW_META_LZ4_ACCEL"); accel = e && atoi(e) > 0 ? atoi(e) : 1; }
+            int cl = LZ4_compress_fast((const char *)buf, (char *)cmp + 5, (int)len, bound, accel);
             if (cl > 0 && (size_t)cl + 5 <= len - len / 10) { cmp[0] = 2; uint32_t rl = (uint32_t)len; memcpy(cmp + 1, &rl, 4); stored = cmp; slen = (size_t)cl + 5; }
         }
     }

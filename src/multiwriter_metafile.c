@@ -238,7 +238,7 @@ int mw_meta_ready (mw_meta *m) {
 void *mw_fbatch_alloc (fbatch *b, size_t n) {
     n = (n + 7) & ~(size_t)7;
     if (!b->nblocks || b->used + n > b->blockcap) {
-        size_t cap = n > (1u << 20) ? n : (1u << 20);
+        size_t mn = b->blockmin ? b->blockmin : (1u << 20), cap = n > mn ? n : mn;
         if (b->nblocks == b->capblocks) { int nc = b->capblocks ? b->capblocks * 2 : 16; uint8_t **nb = realloc(b->blocks, (size_t)nc * sizeof *nb); if (!nb) return NULL; b->blocks = nb; b->capblocks = nc; }
         uint8_t *blk = malloc(cap); if (!blk) return NULL;
         b->blocks[b->nblocks++] = blk; b->used = 0; b->blockcap = cap;
@@ -259,64 +259,49 @@ fitem *mw_fbatch_add_row (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t p
 }
 void mw_fbatch_free (fbatch *b) { for (int i = 0; i < b->nblocks; i++) free(b->blocks[i]); free(b->blocks); free(b->v); free(b->tmp); memset(b, 0, sizeof *b); }
 
-// The dirty vectors are taken away from the stripes whole (a moment under the lock) and then read in blocks, the lock released between them: a flusher that holds a stripe for the whole of
-// a long vector (a million rows when it lags) is what the writers of that stripe would wait for. The entries of a taken vector cannot be freed (they are dirty) and a writer that changes one
-// of them does not link it again. Each entry is read once, packed into the batch on the spot, with the entries a few places ahead already being fetched into the cache.
-#define DIRTY_BLOCK 256
-static int collect (mw_meta *m, uint64_t F, fbatch *out, dlist *det) {
+// The changes that wait for the flusher are kept by the stripes as packed rows, in the order they happened (multiwriter_meta.c: install_row). A flush takes each stripe's buffer whole, a
+// moment under its lock, and reads nothing else: the entries of the table are not visited (visiting every entry twice, once to read it and once to clean it, was a quarter of the
+// flusher's time: a cache miss each). The items are listed for the sort; the bytes they point to stay in the taken buffers until the flush is over.
+static int collect (mw_meta *m, uint64_t F, fbatch *out, dpend *det) {
+    (void)F;
+    size_t total = 0;
     for (int s = 0; s < STRIPES; s++) {
         stripe *st = &m->st[s];
-        pthread_mutex_lock(&st->mu); det[s] = (dlist){ st->dq, st->ndq }; st->dq = NULL; st->ndq = st->capdq = 0; pthread_mutex_unlock(&st->mu);
-        mentry **v = det[s].v; size_t n = det[s].n;
-        for (size_t i = 0; i < n; ) {
-            size_t end = i + DIRTY_BLOCK < n ? i + DIRTY_BLOCK : n;
-            for (size_t k = i; k < end && k < i + 16; k++) __builtin_prefetch(v[k]);
-            pthread_mutex_lock(&st->mu);
-            for (; i < end; i++) {
-                mentry *e = v[i];
-                if (i + 16 < n) __builtin_prefetch(v[i + 16]);
-                if (i + 8 < n) __builtin_prefetch(v[i + 8]->cells);
-                if (e->tbl == 0xFFFFFFFFu) continue;                                  // (its table was dropped meanwhile)
-                bool changed = e->drop_ver > F; for (int c = 0; c < e->n && !changed; c++) if (e->cells[c].dv > (int64_t)F) changed = true;
-                e->fver = e->ver;
-                if (!changed) continue;
-                if (!mw_fbatch_add_row(out, e->tbl, e->pk, e->pklen, e->cells, e->n)) { pthread_mutex_unlock(&st->mu); mw_fbatch_free(out); return -1; }     // (the whole state of the row: the file replaces its copy)
-            }
-            pthread_mutex_unlock(&st->mu);
-        }
+        pthread_mutex_lock(&st->mu); det[s].b = st->pend; det[s].seq = st->seq; memset(&st->pend, 0, sizeof st->pend); st->pend.blockmin = det[s].b.blockmin; pthread_mutex_unlock(&st->mu);
+        total += (size_t)det[s].b.n;
     }
+    out->v = malloc((total ? total : 1) * sizeof *out->v); if (!out->v) return -1;
+    out->cap = (int)(total ? total : 1);
+    for (int s = 0; s < STRIPES; s++) { if (det[s].b.n) memcpy(out->v + out->n, det[s].b.v, (size_t)det[s].b.n * sizeof *out->v); out->n += det[s].b.n; }
     return 0;
 }
-// What is done with the taken vectors: after a flush that wrote them the entries nobody changed since are clean; the others (and all of them when the flush failed) are dirty again.
-static void collect_done (mw_meta *m, dlist *det, bool ok) {
-    uint64_t cleaned = 0;
-    const size_t cap_hi = m->cap_bytes / STRIPES + 1;
+// What is done with the taken buffers: a flush that wrote them moves the stripes' flushed points (their entries are clean now, and the flusher frees the ones over the cache's share); one
+// that did not puts them back in front of what came meanwhile.
+static void collect_done (mw_meta *m, dpend *det, bool ok) {
+    uint64_t done = 0;
     for (int s = 0; s < STRIPES; s++) {
-        stripe *st = &m->st[s]; mentry **v = det[s].v; size_t n = det[s].n;
-        for (size_t i = 0; i < n; ) {
-            size_t end = i + DIRTY_BLOCK < n ? i + DIRTY_BLOCK : n;
-            for (size_t k = i; k < end && k < i + 16; k++) __builtin_prefetch(v[k]);
+        stripe *st = &m->st[s]; dpend *d = &det[s];
+        if (ok) {
+            pthread_mutex_lock(&st->mu); if (d->seq > st->flushed_seq) st->flushed_seq = d->seq; pthread_mutex_unlock(&st->mu);
+            done += (uint64_t)d->b.n;
+            mw_fbatch_free(&d->b);
+        } else if (d->b.n) {
             pthread_mutex_lock(&st->mu);
-            for (; i < end; i++) {
-                mentry *e = v[i];
-                if (i + 16 < n) __builtin_prefetch(v[i + 16]);
-                if (e->tbl == 0xFFFFFFFFu) { entry_free(e); cleaned++; }
-                else if (ok && e->fver == e->ver) {
-                    e->in_dirty = false; cleaned++;
-                    if (st->bytes > cap_hi) {                                           // over its share of the cache: the entry we just touched (it is in the cache of the processor) goes now, instead of being found again by a scan
-                        mentry **pp = &st->b[(e->h >> 8) & (st->nb - 1)];
-                        while (*pp && *pp != e) pp = &(*pp)->next;
-                        if (*pp) { size_t eb = sizeof *e + e->pklen + (size_t)e->cap * sizeof(mw_mcell); *pp = e->next; st->n--; st->bytes -= eb; atomic_fetch_sub(&m->bytes, eb); atomic_fetch_sub(&m->rows, 1); st->gen++; entry_free(e); }
-                    }
-                }
-                else if (!dq_push(st, e)) { e->in_dirty = false; cleaned++; }     // (no memory to remember it: it stays in the table as a clean entry that the next change of the row marks again; the file lacks this state until then: it is also in the log)
-            }
+            fbatch *a = &d->b, *z = &st->pend;                                   // a (older) then z (newer), in one buffer
+            int nn = a->n + z->n; fitem *nv = malloc((size_t)(nn ? nn : 1) * sizeof *nv);
+            uint8_t **nb = malloc((size_t)(a->nblocks + z->nblocks + 1) * sizeof *nb);
+            if (nv && nb) {
+                memcpy(nv, a->v, (size_t)a->n * sizeof *nv); memcpy(nv + a->n, z->v, (size_t)z->n * sizeof *nv);
+                memcpy(nb, a->blocks, (size_t)a->nblocks * sizeof *nb); memcpy(nb + a->nblocks, z->blocks, (size_t)z->nblocks * sizeof *nb);
+                fbatch merged = *z; merged.v = nv; merged.n = merged.cap = nn; merged.blocks = nb; merged.nblocks = merged.capblocks = a->nblocks + z->nblocks;
+                free(a->v); free(a->blocks); free(a->tmp); free(z->v); free(z->blocks); *z = merged; memset(a, 0, sizeof *a);
+            } else { free(nv); free(nb); done += 0; }                          // (no memory: the taken changes are lost to this process's file until the rows change again; the log still has them)
             pthread_mutex_unlock(&st->mu);
+            if (a->n) mw_fbatch_free(a);
         }
-        free(v); det[s] = (dlist){ NULL, 0 };
-        mw_meta_trim(m, s);
+        if (ok) mw_meta_trim(m, s);
     }
-    atomic_fetch_sub(&m->ndirty, cleaned);
+    if (done) atomic_fetch_sub(&m->ndirty, done);
 }
 
 // the batch in the order of the table's key (table, then key bytes): inserts into the b-tree then walk it instead of jumping about. Sorting fitems directly chases a pointer per
@@ -330,12 +315,14 @@ static int skey_cmp (const void *a, const void *b) {
     const skey *x = a, *y = b;
     if (x->tbl != y->tbl) return x->tbl < y->tbl ? -1 : 1;
     if (x->pfx != y->pfx) return x->pfx < y->pfx ? -1 : 1;
-    return fitem_full(x->it, y->it);
+    int c = fitem_full(x->it, y->it);
+    return c ? c : (x->it < y->it ? -1 : x->it > y->it);                       // (the same key twice: the order they were made in)
 }
-static void sort_items (fitem *v, int n) {
-    if (n < 2) return;
+// Sorts, and keeps the last of the items that have one key (a row changed twice between two flushes: only its newest state goes to the file). Returns the number of items left.
+static int sort_items (fitem *v, int n) {
+    if (n < 2) return n;
     skey *a = malloc((size_t)n * sizeof *a), *b = malloc((size_t)n * sizeof *b); fitem *copy = malloc((size_t)n * sizeof *copy);
-    if (!a || !b || !copy) { free(a); free(b); free(copy); return; }
+    if (!a || !b || !copy) { free(a); free(b); free(copy); return n; }
     for (int i = 0; i < n; i++) {
         uint64_t p = 0; for (int q = 0; q < 8; q++) p = (p << 8) | (q < (int)v[i].pklen ? v[i].pk[q] : 0);
         a[i] = (skey){ v[i].tbl, p, &v[i] };
@@ -355,9 +342,14 @@ static void sort_items (fitem *v, int n) {
         if (j - i > 1) qsort(&a[i], (size_t)(j - i), sizeof *a, skey_cmp);
         i = j;
     }
-    for (int i = 0; i < n; i++) copy[i] = *a[i].it;
-    memcpy(v, copy, (size_t)n * sizeof *v);
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (i + 1 < n && a[i].tbl == a[i + 1].tbl && a[i].pfx == a[i + 1].pfx && fitem_full(a[i].it, a[i + 1].it) == 0) continue;       // (a later one with the same key follows)
+        copy[k++] = *a[i].it;
+    }
+    memcpy(v, copy, (size_t)k * sizeof *v);
     free(a); free(b); free(copy);
+    return k;
 }
 
 // One transaction of the flush: the items [i0, i1) as a run of level 0 and, in the last one, the sites, the flushed point and the high-water mark. A flush is several of them (a transaction of
@@ -460,6 +452,7 @@ static void merge_kick (mw_meta *m) {
     pthread_mutex_unlock(&m->mth_mu);
 }
 
+static uint64_t flush_rows (void);
 static int flush_impl (mw_meta *m, bool wait) {
     if (!m->attached) return 0;
     mw_meta_ready(m);
@@ -469,7 +462,7 @@ static int flush_impl (mw_meta *m, bool wait) {
     if (sh && !wait) {
         // The flushers of all the processes wake up for the same dirty count, and the one that gets the lock takes everything: the others, behind it, would write a run of what
         // the commits since then added (a few rows). They look again with the lock held, and leave it to the next time unless there is enough or it is long since the last flush.
-        const char *er = getenv("MW_META_FLUSH_ROWS"); uint64_t rows = er ? (uint64_t)atoll(er) : 16384;
+        uint64_t rows = flush_rows();
         uint64_t d = mw_meta_dirty(m), age = now_ns() - atomic_load(&sh->meta_flush_ns);
         if (d < rows / 2 && age < 20ull * 1000000ull) { mw_mp_meta_unlock(m->db, 1); pthread_mutex_unlock(&m->file_mu); return 0; }
     }
@@ -482,7 +475,7 @@ static int flush_impl (mw_meta *m, bool wait) {
     uint32_t nsites = sh ? atomic_load(&sh->nsites) : 0, sflushed = sh ? atomic_load(&sh->sites_flushed) : m->sites_flushed;
     if (!sh) { pthread_mutex_lock(&m->site_mu); nsites = m->nsites; pthread_mutex_unlock(&m->site_mu); }
     int rc = SQLITE_OK;
-    dlist det[STRIPES]; bool taken = false;
+    dpend det[STRIPES]; bool taken = false;
     struct mw_purge *purge = NULL; int npurge = 0;
     if (sh) { uint32_t np = atomic_load_explicit(&sh->npurge, memory_order_acquire); if (np) { purge = malloc(np * sizeof *purge); if (purge) for (uint32_t i = 0; i < np; i++) purge[npurge++] = (struct mw_purge){ atomic_load(&sh->purge[i].tbl), atomic_load(&sh->purge[i].epoch) }; } }
     else { pthread_mutex_lock(&m->purge_mu); if (m->npurge) { purge = malloc((size_t)m->npurge * sizeof *purge); if (purge) { memcpy(purge, m->purge, (size_t)m->npurge * sizeof *purge); npurge = m->npurge; } } pthread_mutex_unlock(&m->purge_mu); }
@@ -496,7 +489,7 @@ static int flush_impl (mw_meta *m, bool wait) {
     if ((sh ? mm_collect(m, F, Fe, &fb) : collect(m, F, &fb, det)) != 0) { rc = SQLITE_NOMEM; goto out; }
     fitem *v = fb.v; int n = fb.n;
     atomic_fetch_add(&mw_ft[0], now_ns() - tc0); tc0 = now_ns();
-    sort_items(v, n);
+    n = sort_items(v, n);
     atomic_fetch_add(&mw_ft[1], now_ns() - tc0);
     uint64_t hw0 = sh ? atomic_load(&sh->dv_hwm) : atomic_load(&m->hwm);
     for (int i = 0; i < n; i++) if ((uint64_t)v[i].dv > hw0) hw0 = (uint64_t)v[i].dv;
@@ -552,6 +545,9 @@ uint64_t mw_meta_safe_epoch (mw_meta *m) {                                     /
 uint64_t mw_meta_dv (mw_meta *m, uint64_t epoch) { return epoch + (uint64_t)mw_meta_origin(m); }
 
 // ---- the flusher thread ----
+// Rows that wait before the flusher writes them as a run. Every flush is a run to merge, a transaction and a record in the log: at 20k commits a second 16384 rows were 130 runs a second, more than the
+// merger could take (it fell behind, the run count slowed the writers, and a run of the benchmark was 8k or 20k tx/s depending on whether it ever fell behind). 131072: stable, 20-29k (16 threads 26.7k -> 29.1k).
+static uint64_t flush_rows (void) { static uint64_t r; if (!r) { const char *e = getenv("MW_META_FLUSH_ROWS"); r = e && atoll(e) > 0 ? (uint64_t)atoll(e) : 131072; } return r; }
 static void *flusher_main (void *arg) {
     mw_meta *m = arg;
     for (;;) {
@@ -564,8 +560,8 @@ static void *flusher_main (void *arg) {
         pthread_mutex_unlock(&m->th_mu);
         if (stop) break;
         uint64_t d;
-        const char *er = getenv("MW_META_FLUSH_ROWS"), *em = getenv("MW_META_FLUSH_MS");           // (tests: flush very often)
-        uint64_t rows = er ? (uint64_t)atoll(er) : 16384, ms = em ? (uint64_t)atoll(em) : 250;
+        const char *em = getenv("MW_META_FLUSH_MS");           // (tests: flush very often)
+        uint64_t rows = flush_rows(), ms = em ? (uint64_t)atoll(em) : 250;
         d = mw_meta_dirty(m);
         uint64_t lastf = m->last_flush_ns; if (m->shared) { uint64_t o = atomic_load(&m->db->shm->meta_flush_ns); if (o > lastf) lastf = o; }          // (several processes: the newest flush of anybody)
         uint64_t age = now_ns() - lastf;
@@ -741,8 +737,8 @@ void mw_meta_reset (mw_meta *m) {
     pthread_mutex_lock(&m->file_mu);
     for (int i = 0; i < STRIPES; i++) {
         stripe *s = &m->st[i]; pthread_mutex_lock(&s->mu);
-        for (size_t k = 0; k < s->nb; k++) for (mentry *e = s->b[k], *nx; e; e = nx) { nx = e->next; entry_free(e); }
-        memset(s->b, 0, s->nb * sizeof *s->b); s->n = 0; s->bytes = 0; s->ndq = 0; s->backoff = 0; s->gen++;
+        for (size_t k = 0; k < s->nb; k++) for (mentry *e = s->b[k], *nx; e; e = nx) { nx = e->next; entry_free(s, e); }
+        memset(s->b, 0, s->nb * sizeof *s->b); s->n = 0; s->bytes = 0; { size_t bm = s->pend.blockmin; mw_fbatch_free(&s->pend); s->pend.blockmin = bm; } s->flushed_seq = s->seq; s->backoff = 0; s->gen++;
         pthread_mutex_unlock(&s->mu);
     }
     atomic_store(&m->ndirty, 0); atomic_store(&m->rows, 0); atomic_store(&m->bytes, 0);

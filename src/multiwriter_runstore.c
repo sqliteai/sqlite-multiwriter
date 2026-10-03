@@ -484,7 +484,7 @@ static int pool_reserve (mw_rstore *s, sqlite3 *c, int want) {            // (no
     if (!rc) pool_put(s, x.got, x.n);
     free(x.got); return rc;
 }
-static size_t pool_batch (void) { static size_t b; if (!b) { const char *e = getenv("MW_POOL_BATCH"); b = e && atol(e) > 0 ? (size_t)atol(e) : 1024; } return b; }
+static size_t pool_batch (void) { static size_t b; if (!b) { const char *e = getenv("MW_POOL_BATCH"); b = e && atol(e) > 0 ? (size_t)atol(e) : 8192; } return b; }
 static int pool_ensure (mw_rstore *s, sqlite3 *c, size_t need) {
     pthread_mutex_lock(&s->pmu); size_t have = s->npool; pthread_mutex_unlock(&s->pmu);
     if (have >= need) return 0;

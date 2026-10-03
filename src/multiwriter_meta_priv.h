@@ -19,19 +19,47 @@ struct mw_db; struct mw_lane;
 #define F_DROP 1                         // the non-sentinel cells of the row are removed
 #define F_ZERO 2                         // the non-sentinel cells get version 0 and the db_version of the commit
 
+typedef struct { uint32_t tbl; uint8_t *pk; uint32_t pklen; uint32_t n; uint32_t bloblen; uint8_t *blob; int64_t dv; } fitem;       // a row to write to the file: its key and its cells already packed (n of them; none: the row goes), dv the largest db_version among them
+// the rows of a flush: the items, and the bytes they point to (keys and cells) in blocks of their own (a flush holds hundreds of thousands of rows: no allocation per row)
+typedef struct { fitem *v; int n, cap; uint8_t **blocks; int nblocks, capblocks; size_t used, blockcap, blockmin; uint8_t *tmp; size_t tmpcap; } fbatch;
+
+// Entries come from per-stripe free lists in size classes of 32 bytes (a malloc and a free for every row of a flush that writes millions of them a second was a tenth of the flusher's time);
+// a list is used under the stripe's lock. Memory taken for the lists goes back when the store is freed.
+#define ESLAB_CLASSES 20
+#define ESLAB_BYTES (256u << 10)
 typedef struct mentry {
     struct mentry *next;
-    uint64_t h, ver, fver, drop_ver;           // ver: epoch of the last change; fver: ver as the flush in progress collected it; drop_ver: epoch of the last DROP (the file must lose the old cells too)
-    uint32_t tbl, pklen; int n, cap; bool in_dirty, inl;     // inl: the cells are in the same allocation as the entry (after the key)
+    uint64_t h, ver, dseq;                     // ver: epoch of the last change; dseq: the stripe's sequence number of its last change (it is dirty while that is above the stripe's flushed_seq)
+    uint32_t tbl, pklen; int n, cap; bool inl; uint8_t cls;     // inl: the cells are in the same allocation as the entry (after the key)
     mw_mcell *cells;
     uint8_t pk[];
 } mentry;
 
 void mw_meta_trim (mw_meta *m, int stripe_no);                       // drops clean entries of a stripe down to its share of the cache (the flusher calls it)
-static inline void entry_free (mentry *e) { if (!e->inl) free(e->cells); free(e); }
 
-typedef struct { pthread_mutex_t mu; mentry **b; size_t nb, n; mentry **dq; size_t ndq, capdq; size_t bytes; size_t hand; uint64_t gen; uint32_t backoff; } stripe;   // dq: the dirty entries, as a vector (read in order, with the next ones fetched ahead: a list would be a cache miss at a time)
-typedef struct { mentry **v; size_t n; } dlist;                          // a dirty vector taken from a stripe by a flush
+// A stripe: the table of its entries, and the changes waiting for the flusher (pend: one item for every change, the key and the whole new state of the row already packed, in the order
+// they happened; a flush takes the whole buffer in a moment and the entries are never visited again for it). An entry is dirty while its dseq is above flushed_seq.
+typedef struct { pthread_mutex_t mu; mentry **b; size_t nb, n; fbatch pend; uint64_t seq, flushed_seq; void *efree[ESLAB_CLASSES]; uint8_t **slabs; int nslabs, capslabs; size_t bytes; size_t hand; uint64_t gen; uint32_t backoff; } stripe;
+typedef struct { fbatch b; uint64_t seq; } dpend;
+
+static inline void *stripe_alloc (stripe *s, size_t sz, uint8_t *cls) {
+    size_t c = (sz + 31) / 32;
+    if (c == 0 || c >= ESLAB_CLASSES) { *cls = 0; return malloc(sz); }
+    *cls = (uint8_t)c;
+    void *p = s->efree[c];
+    if (p) { s->efree[c] = *(void **)p; return p; }
+    size_t bs = c * 32, per = ESLAB_BYTES / bs;
+    uint8_t *slab = malloc(per * bs); if (!slab) return NULL;
+    if (s->nslabs == s->capslabs) { int nc = s->capslabs ? s->capslabs * 2 : 8; uint8_t **ns = realloc(s->slabs, (size_t)nc * sizeof *ns); if (!ns) { free(slab); return NULL; } s->slabs = ns; s->capslabs = nc; }
+    s->slabs[s->nslabs++] = slab;
+    for (size_t i = 1; i < per; i++) { void *q = slab + i * bs; *(void **)q = s->efree[c]; s->efree[c] = q; }
+    return slab;
+}
+static inline void entry_free (stripe *s, mentry *e) {
+    if (!e->inl) free(e->cells);
+    if (!e->cls) { free(e); return; }
+    *(void **)e = s->efree[e->cls]; s->efree[e->cls] = e;
+}                        // a stripe's pending changes taken by a flush, and the sequence number they reach
 
 struct mw_meta {
     struct mw_db *db;
@@ -73,9 +101,6 @@ void     mw_meta_reset (mw_meta *m);                                            
 int      mw_metafile_load_state (mw_meta *m, uint64_t *F, uint64_t *hwm, uint32_t *sites_flushed, bool *have_own, uint8_t own[16]);
 #endif
 
-typedef struct { uint32_t tbl; uint8_t *pk; uint32_t pklen; uint32_t n; uint32_t bloblen; uint8_t *blob; int64_t dv; } fitem;       // a row to write to the file: its key and its cells already packed (n of them; none: the row goes), dv the largest db_version among them
-// the rows of a flush: the items, and the bytes they point to (keys and cells) in blocks of their own (a flush holds hundreds of thousands of rows: no allocation per row)
-typedef struct { fitem *v; int n, cap; uint8_t **blocks; int nblocks, capblocks; size_t used, blockcap; uint8_t *tmp; size_t tmpcap; } fbatch;
 void *mw_fbatch_alloc (fbatch *b, size_t n);
 fitem *mw_fbatch_add_row (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t pklen, const mw_mcell *c, int n);   // a new item: the key copied, the cells packed; NULL on memory failure
 void   mw_fbatch_free (fbatch *b);
@@ -103,8 +128,3 @@ int      mm_collect (mw_meta *m, uint64_t F, uint64_t Fe, fbatch *out);        /
 #include "multiwriter_internal.h"
 static inline int64_t mw_meta_origin (mw_meta *m) { return m->shared ? (int64_t)atomic_load_explicit(&m->db->shm->dv_origin, memory_order_acquire) : m->origin; }
 
-// the dirty vector of a stripe (the caller holds its lock)
-static inline bool dq_push (stripe *s, mentry *e) {
-    if (s->ndq == s->capdq) { size_t nc = s->capdq ? s->capdq * 2 : 256; mentry **nv = realloc(s->dq, nc * sizeof *nv); if (!nv) return false; s->dq = nv; s->capdq = nc; }
-    s->dq[s->ndq++] = e; return true;
-}

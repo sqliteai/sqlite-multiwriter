@@ -50,7 +50,7 @@ mw_meta *mw_meta_new (struct mw_db *db) {
     m->rsx = rsx_new(m->cap_bytes / 2); if (!m->rsx) { free(m); return NULL; }
     for (int i = 0; i < STRIPES; i++) {
         pthread_mutex_init(&m->st[i].mu, NULL);
-        m->st[i].nb = 64; m->st[i].b = calloc(m->st[i].nb, sizeof(mentry *));
+        m->st[i].nb = 64; m->st[i].b = calloc(m->st[i].nb, sizeof(mentry *)); m->st[i].pend.blockmin = 64u << 10;
         if (!m->st[i].b) { mw_meta_free(m); return NULL; }
     }
     pthread_mutex_init(&m->mth_mu, NULL); pthread_cond_init(&m->mth_cv, NULL);
@@ -65,8 +65,8 @@ mw_meta *mw_meta_new (struct mw_db *db) {
 void mw_meta_free (mw_meta *m) {
     if (!m) return;
     for (int i = 0; i < STRIPES; i++) {
-        for (size_t k = 0; m->st[i].b && k < m->st[i].nb; k++) for (mentry *e = m->st[i].b[k], *nx; e; e = nx) { nx = e->next; entry_free(e); }
-        free(m->st[i].b); free(m->st[i].dq); pthread_mutex_destroy(&m->st[i].mu);
+        for (size_t k = 0; m->st[i].b && k < m->st[i].nb; k++) for (mentry *e = m->st[i].b[k], *nx; e; e = nx) { nx = e->next; if (!e->inl) free(e->cells); if (!e->cls) free(e); }
+        for (int q = 0; q < m->st[i].nslabs; q++) free(m->st[i].slabs[q]); free(m->st[i].slabs); free(m->st[i].b); { size_t bm = m->st[i].pend.blockmin; mw_fbatch_free(&m->st[i].pend); (void)bm; } pthread_mutex_destroy(&m->st[i].mu);
     }
     mw_metafile_free(m); rsx_free(m->rsx); free(m->purge); free(m->bloom);
     pthread_mutex_destroy(&m->mth_mu); pthread_cond_destroy(&m->mth_cv);
@@ -97,7 +97,7 @@ static void evict_to (mw_meta *m, stripe *s, size_t limit, size_t maxscan) {
         mentry **pp = &s->b[k];
         while (*pp) {
             mentry *e = *pp;
-            if (!e->in_dirty && s->bytes > limit) { *pp = e->next; s->n--; s->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); entry_free(e); s->gen++; freed++; }
+            if (e->dseq <= s->flushed_seq && s->bytes > limit) { *pp = e->next; s->n--; s->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); entry_free(s, e); s->gen++; freed++; }
             else pp = &e->next;
         }
     }
@@ -116,12 +116,13 @@ void mw_meta_trim (mw_meta *m, int stripe_no) {
     }
 }
 
-static mentry *entry_new (uint64_t h, uint32_t tbl, const void *pk, size_t pklen, const mw_mcell *c, int n) {
-    size_t off = (sizeof(mentry) + pklen + 7) & ~(size_t)7;                          // (one allocation for the entry, its key and its cells: a row costs one malloc and one free)
-    mentry *e = calloc(1, off + (size_t)n * sizeof *c);
+static mentry *entry_new (stripe *s, uint64_t h, uint32_t tbl, const void *pk, size_t pklen, const mw_mcell *c, int n) {
+    size_t off = (sizeof(mentry) + pklen + 7) & ~(size_t)7;                          // (one allocation for the entry, its key and its cells: a row costs one take and one give back)
+    uint8_t cls; mentry *e = stripe_alloc(s, off + (size_t)n * sizeof *c, &cls);
     if (!e) return NULL;
+    memset(e, 0, off);
     e->h = h; e->tbl = tbl; e->pklen = (uint32_t)pklen; memcpy(e->pk, pk, pklen);
-    e->cap = n; e->n = n; e->inl = true;
+    e->cap = n; e->n = n; e->inl = true; e->cls = cls;
     if (n) { e->cells = (mw_mcell *)((uint8_t *)e + off); memcpy(e->cells, c, (size_t)n * sizeof *c); }
     return e;
 }
@@ -163,7 +164,7 @@ static int mem_peek (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_
 static void mem_cache (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, const mw_mcell *c, int n) {
     uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
     pthread_mutex_lock(&s->mu);
-    if (!find(s, h, tbl, pk, pklen)) { mentry *ne = entry_new(h, tbl, pk, pklen, c, n); if (ne) { insert_entry(m, s, ne); evict(m, s); } }
+    if (!find(s, h, tbl, pk, pklen)) { mentry *ne = entry_new(s, h, tbl, pk, pklen, c, n); if (ne) { insert_entry(m, s, ne); evict(m, s); } }
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -500,17 +501,15 @@ static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pkle
     pthread_mutex_lock(&s->mu);
     mentry *e = find(s, h, tbl, pk, pklen);
     if (!e) {                                                          // a new row: one allocation for the entry (its cells are the state), linked once
-        ne = entry_new(h, tbl, pk, pklen, c, n);
+        ne = entry_new(s, h, tbl, pk, pklen, c, n);
         if (!ne) { pthread_mutex_unlock(&s->mu); return -1; }
         for (int k = 0; k < n; k++) if (ne->cells[k].dv == OV_CHG) ne->cells[k].dv = (int64_t)epoch;
-        ne->ver = epoch; ne->in_dirty = true;
-        if (!dq_push(s, ne)) { entry_free(ne); pthread_mutex_unlock(&s->mu); return -1; }
-        insert_entry(m, s, ne); atomic_fetch_add(&m->ndirty, 1);
+        ne->ver = epoch;
+        if (!mw_fbatch_add_row(&s->pend, tbl, pk, (uint32_t)pklen, ne->cells, n)) { entry_free(s, ne); pthread_mutex_unlock(&s->mu); return -1; }        // (the change waits for the flusher with its own copy of the row's state)
+        ne->dseq = ++s->seq; atomic_fetch_add(&m->ndirty, 1);
+        insert_entry(m, s, ne);
     } else {
-        if (!e->in_dirty) { if (!dq_push(s, e)) { pthread_mutex_unlock(&s->mu); return -1; } e->in_dirty = true; atomic_fetch_add(&m->ndirty, 1); }
         size_t before = entry_bytes(e);
-        bool removed = false;                                          // a cell of the old state is not in the new one: the file has to forget it
-        for (int i = 0; i < e->n && !removed; i++) { bool f = false; for (int k = 0; k < n; k++) if (c[k].col == e->cells[i].col) { f = true; break; } if (!f) removed = true; }
         if (n > e->cap) {
             mw_mcell *nm;
             if (e->inl) { nm = malloc((size_t)n * sizeof *nm); if (nm && e->n) memcpy(nm, e->cells, (size_t)e->n * sizeof *nm); }
@@ -520,8 +519,9 @@ static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pkle
         }
         for (int k = 0; k < n; k++) { e->cells[k] = c[k]; if (c[k].dv == OV_CHG) e->cells[k].dv = (int64_t)epoch; }
         e->n = n;
-        if (removed) e->drop_ver = epoch;
         e->ver = epoch;
+        if (!mw_fbatch_add_row(&s->pend, tbl, pk, (uint32_t)pklen, e->cells, n)) { pthread_mutex_unlock(&s->mu); return -1; }
+        e->dseq = ++s->seq; atomic_fetch_add(&m->ndirty, 1);
         size_t after = entry_bytes(e);
         if (after != before) { s->bytes += after - before; atomic_fetch_add(&m->bytes, after - before); }
     }
@@ -534,9 +534,9 @@ static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pkle
 static void purge_table (mw_meta *m, uint32_t tbl, uint64_t epoch) {
     for (int s = 0; s < STRIPES; s++) {
         stripe *st = &m->st[s]; pthread_mutex_lock(&st->mu);
-        for (size_t k = 0; k < st->nb; k++) { mentry **pp = &st->b[k]; while (*pp) { mentry *e = *pp; if (e->tbl == tbl) { *pp = e->next; st->n--; st->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); if (e->in_dirty) e->tbl = 0xFFFFFFFFu; else entry_free(e); } else pp = &e->next; } }
-        // dirty entries of the table: unlinked from the dirty list too (the list owns them now)
-        { size_t k = 0; for (size_t i = 0; i < st->ndq; i++) { mentry *e = st->dq[i]; if (e->tbl == 0xFFFFFFFFu && e->in_dirty) { atomic_fetch_sub(&m->ndirty, 1); entry_free(e); } else st->dq[k++] = e; } st->ndq = k; }
+        for (size_t k = 0; k < st->nb; k++) { mentry **pp = &st->b[k]; while (*pp) { mentry *e = *pp; if (e->tbl == tbl) { *pp = e->next; st->n--; st->bytes -= entry_bytes(e); atomic_fetch_sub(&m->bytes, entry_bytes(e)); atomic_fetch_sub(&m->rows, 1); entry_free(st, e); } else pp = &e->next; } }
+        // the changes of the table that wait for the flusher are older than the drop: they go too (a flush that has them already is followed by the purge of the file's cells)
+        { int k = 0; for (int i = 0; i < st->pend.n; i++) { if (st->pend.v[i].tbl == tbl) { atomic_fetch_sub(&m->ndirty, 1); continue; } st->pend.v[k++] = st->pend.v[i]; } st->pend.n = k; }
         st->gen++; pthread_mutex_unlock(&st->mu);
     }
     pthread_mutex_lock(&m->purge_mu);

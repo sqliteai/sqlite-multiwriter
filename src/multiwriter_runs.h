@@ -55,6 +55,12 @@ rs_builder *rs_builder_new (uint64_t nrows_hint, rs_emit_fn emit, void *ctx);
 int  rs_builder_add (rs_builder *b, const rs_key *k, int64_t dv, const uint8_t *cells, uint32_t ncells);       // 0, or the error of emit / -1 memory
 int  rs_builder_finish (rs_builder *b, uint8_t **meta, size_t *metalen, uint64_t *nrows, uint32_t *nblk, int64_t *dvmax);   // flushes the last block; the builder is freed
 void rs_builder_free (rs_builder *b);
+rs_builder *rs_builder_new_deferred (uint64_t nrows_hint);                  // no emit: the blocks are kept until the run is finished with the places they were given
+int  rs_builder_seal (rs_builder *b);                                         // the last block is made
+uint32_t rs_builder_nblocks (const rs_builder *b);
+const uint8_t *rs_builder_block (const rs_builder *b, uint32_t i, size_t *len);
+size_t rs_builder_meta_bound (const rs_builder *b);                          // the most the run's meta takes, once the builder is sealed
+int  rs_builder_finish_locs (rs_builder *b, const uint8_t *const *locs, const uint32_t *llens, uint8_t **meta, size_t *metalen, uint64_t *nrows, uint32_t *nblk, int64_t *dvmax);      // the builder is not freed
 uint64_t rs_builder_rows (const rs_builder *b);
 
 // ---- merging ----

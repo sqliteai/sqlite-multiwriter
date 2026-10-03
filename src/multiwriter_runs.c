@@ -153,7 +153,11 @@ struct rs_builder {
     uint32_t *slen, *loff, *llen; uint8_t *larena; size_t larn, larcap;
     uint8_t *last; size_t lastcap; uint32_t lasttbl, lastl;
     uint64_t *bloom; uint64_t nbits;
+    bool defer; uint8_t **dblk; uint32_t *dlen, ndblk, capdblk;      // deferred: the finished blocks are kept (their places are given when the run is finished)
 };
+rs_builder *rs_builder_new_deferred (uint64_t nrows_hint) {
+    rs_builder *b = rs_builder_new(nrows_hint, NULL, NULL); if (b) b->defer = true; return b;
+}
 rs_builder *rs_builder_new (uint64_t nrows_hint, rs_emit_fn emit, void *ctx) {
     rs_builder *b = calloc(1, sizeof *b); if (!b) return NULL;
     b->emit = emit; b->ctx = ctx;
@@ -164,6 +168,8 @@ rs_builder *rs_builder_new (uint64_t nrows_hint, rs_emit_fn emit, void *ctx) {
 }
 void rs_builder_free (rs_builder *b) {
     if (!b) return;
+    for (uint32_t i = 0; i < b->ndblk; i++) free(b->dblk[i]);
+    free(b->dblk); free(b->dlen);
     free(b->rows); free(b->offs); free(b->first); free(b->ftbl); free(b->foff); free(b->flen); free(b->fdv); free(b->farena); free(b->slen); free(b->loff); free(b->llen); free(b->larena); free(b->last); free(b->bloom); free(b);
 }
 uint64_t rs_builder_rows (const rs_builder *b) { return b->total; }
@@ -185,7 +191,12 @@ static int flush_block (rs_builder *b) {
         }
     }
     const uint8_t *loc = NULL; size_t loclen = 0;
-    int rc = b->emit(b->ctx, b->blkno, stored, slen, &loc, &loclen);
+    int rc;
+    if (b->defer) {
+        rc = 0;
+        if (b->ndblk == b->capdblk) { uint32_t nc = b->capdblk ? b->capdblk * 2 : 16; uint8_t **nd = realloc(b->dblk, nc * sizeof *nd); uint32_t *nl = realloc(b->dlen, nc * sizeof *nl); if (nd) b->dblk = nd; if (nl) b->dlen = nl; if (!nd || !nl) rc = -1; else b->capdblk = nc; }
+        if (!rc) { uint8_t *copy = malloc(slen); if (!copy) rc = -1; else { memcpy(copy, stored, slen); b->dblk[b->ndblk] = copy; b->dlen[b->ndblk] = (uint32_t)slen; b->ndblk++; } }
+    } else rc = b->emit(b->ctx, b->blkno, stored, slen, &loc, &loclen);
     if (!rc) {
         if (b->nf == b->capf) {
             uint32_t nc = b->capf ? b->capf * 2 : 64;
@@ -229,22 +240,31 @@ int rs_builder_add (rs_builder *b, const rs_key *k, int64_t dv, const uint8_t *c
     if (b->nbytes + (size_t)b->noffs * 4 >= RS_BLOCK_TARGET) return flush_block(b);
     return 0;
 }
-int rs_builder_finish (rs_builder *b, uint8_t **meta, size_t *metalen, uint64_t *nrows, uint32_t *nblk, int64_t *dvmax) {
+static int builder_finish (rs_builder *b, bool keep, const uint8_t *const *locs, const uint32_t *llens, uint8_t **meta, size_t *metalen, uint64_t *nrows, uint32_t *nblk, int64_t *dvmax) {
     int rc = flush_block(b);
-    if (rc || !b->nf) { rs_builder_free(b); return rc ? rc : -1; }
-    size_t cap = 16 + (size_t)b->nf * 40 + b->farn + b->larn + b->lastl + 24 + (size_t)(b->nbits / 8);
-    uint8_t *m = malloc(cap); if (!m) { rs_builder_free(b); return -1; }
+    if (rc || !b->nf) { if (!keep) rs_builder_free(b); return rc ? rc : -1; }
+    size_t lsum = b->larn; if (locs) { lsum = 0; for (uint32_t i = 0; i < b->nf; i++) lsum += llens[i]; }
+    size_t cap = 16 + (size_t)b->nf * 40 + b->farn + lsum + b->lastl + 24 + (size_t)(b->nbits / 8);
+    uint8_t *m = malloc(cap); if (!m) { if (!keep) rs_builder_free(b); return -1; }
     size_t w = 0; m[w++] = 2; w += put_var(m + w, b->nf);
     for (uint32_t i = 0; i < b->nf; i++) {
         w += put_var(m + w, b->ftbl[i]); w += put_var(m + w, b->flen[i]); memcpy(m + w, b->farena + b->foff[i], b->flen[i]); w += b->flen[i]; w += put_var(m + w, (uint64_t)b->fdv[i]);
-        w += put_var(m + w, b->slen[i]); w += put_var(m + w, b->llen[i]); memcpy(m + w, b->larena + b->loff[i], b->llen[i]); w += b->llen[i];
+        const uint8_t *lp = locs ? locs[i] : b->larena + b->loff[i]; uint32_t ll = locs ? llens[i] : b->llen[i];
+        w += put_var(m + w, b->slen[i]); w += put_var(m + w, ll); memcpy(m + w, lp, ll); w += ll;
     }
     w += put_var(m + w, b->lasttbl); w += put_var(m + w, b->lastl); memcpy(m + w, b->last, b->lastl); w += b->lastl;
     w += put_var(m + w, b->nbits); memcpy(m + w, b->bloom, (size_t)(b->nbits / 8)); w += (size_t)(b->nbits / 8);
     *meta = m; *metalen = w; *nrows = b->total; *nblk = b->nf; *dvmax = b->dvmax;
-    rs_builder_free(b);
+    if (!keep) rs_builder_free(b);
     return 0;
 }
+int rs_builder_finish (rs_builder *b, uint8_t **meta, size_t *metalen, uint64_t *nrows, uint32_t *nblk, int64_t *dvmax) { return builder_finish(b, false, NULL, NULL, meta, metalen, nrows, nblk, dvmax); }
+// Deferred builders: the last block is flushed, then the blocks can be looked at (to be stored somewhere that gives each its place), then the run is finished with those places.
+int rs_builder_seal (rs_builder *b) { return flush_block(b); }
+uint32_t rs_builder_nblocks (const rs_builder *b) { return b->ndblk; }
+const uint8_t *rs_builder_block (const rs_builder *b, uint32_t i, size_t *len) { *len = b->dlen[i]; return b->dblk[i]; }
+int rs_builder_finish_locs (rs_builder *b, const uint8_t *const *locs, const uint32_t *llens, uint8_t **meta, size_t *metalen, uint64_t *nrows, uint32_t *nblk, int64_t *dvmax) { return builder_finish(b, true, locs, llens, meta, metalen, nrows, nblk, dvmax); }       // (the builder stays: a transaction that fails is tried again with the same blocks; rs_builder_free)
+size_t rs_builder_meta_bound (const rs_builder *b) { return 16 + (size_t)b->nf * 40 + b->farn + b->lastl + 24 + (size_t)(b->nbits / 8) + (size_t)b->nf * 24 + 1024; }
 
 // ---- merging ----
 typedef struct { const rs_run *run; uint32_t blk; uint8_t *buf; size_t buflen; uint8_t *raw; rs_blk b; uint32_t i; bool done; rs_key k; uint64_t pfx; int64_t dv; const uint8_t *cells; uint32_t nc; } mit;

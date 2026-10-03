@@ -609,6 +609,52 @@ int rsx_tx_add_items (rsx_tx *t, sqlite3 *c, const fitem *v, int i0, int i1) {
     rc = tx_insert_run(t, c, run, t->next_age++, 0, meta, ml, nr, nb, dvm); free(meta);
     return rc;
 }
+// ---- runs built before the transaction (the CPU of a flush, outside the write lock and in several threads) ----
+struct rsx_prebuilt { rs_builder *b; };
+rsx_prebuilt *rsx_prebuild (const fitem *v, int i0, int i1) {
+    if (i1 <= i0) return NULL;
+    rsx_prebuilt *pb = calloc(1, sizeof *pb); if (!pb) return NULL;
+    pb->b = rs_builder_new_deferred((uint64_t)(i1 - i0)); if (!pb->b) { free(pb); return NULL; }
+    for (int i = i0; i < i1; i++) {
+        if (i + 1 < i1 && v[i].tbl == v[i + 1].tbl && v[i].pklen == v[i + 1].pklen && !memcmp(v[i].pk, v[i + 1].pk, v[i].pklen)) continue;           // (the same key twice: the later one stands)
+        rs_key k = { v[i].tbl, v[i].pk, v[i].pklen };
+        if (rs_builder_add(pb->b, &k, v[i].n ? v[i].dv : 0, v[i].n ? v[i].blob : NULL, v[i].n ? v[i].bloblen : 0)) { rs_builder_free(pb->b); free(pb); return NULL; }
+    }
+    if (rs_builder_seal(pb->b)) { rs_builder_free(pb->b); free(pb); return NULL; }
+    return pb;
+}
+void rsx_prebuilt_free (rsx_prebuilt *pb) { if (!pb) return; rs_builder_free(pb->b); free(pb); }
+// the slots the run needs, to be taken before the transaction starts
+int rsx_reserve_prebuilt (mw_rstore *s, sqlite3 *c, const rsx_prebuilt *pb) {
+    uint32_t sb = atomic_load(&s->slot_bytes);
+    if (!sb) { sb = compute_slot_bytes(c); atomic_store(&s->slot_bytes, sb); }
+    size_t need = 16, data = sb - SLOT_HDR;
+    for (uint32_t i = 0; i < rs_builder_nblocks(pb->b); i++) { size_t len; rs_builder_block(pb->b, i, &len); need += (len + data - 1) / data; }
+    need += rs_builder_meta_bound(pb->b) / data + 2;
+    return pool_ensure(s, c, need);
+}
+int rsx_tx_add_prebuilt (rsx_tx *t, sqlite3 *c, rsx_prebuilt *pb) {
+    int rc = tx_prepare(t, c); if (rc) return rc;
+    uint32_t sb = t->sw.sb - SLOT_HDR, nb = rs_builder_nblocks(pb->b);
+    int64_t run = t->next_run++;
+    uint8_t **locs = calloc(nb ? nb : 1, sizeof *locs); uint32_t *llens = calloc(nb ? nb : 1, sizeof *llens); if (!locs || !llens) { free(locs); free(llens); return SQLITE_NOMEM; }
+    for (uint32_t i = 0; i < nb && !rc; i++) {
+        size_t len; const uint8_t *data = rs_builder_block(pb->b, i, &len);
+        int k = (int)((len + sb - 1) / sb); uint32_t small[16]; uint32_t *sl = k <= 16 ? small : malloc((size_t)k * sizeof *sl); if (!sl) { rc = SQLITE_NOMEM; break; }
+        rc = tx_take(t, k, sl);
+        for (int j = 0; !rc && j < k; j++) { size_t off = (size_t)j * sb, n = len - off < sb ? len - off : sb; rc = slotw_write(&t->sw, c, sl[j], run, i, (uint32_t)j, data + off, n); }
+        if (!rc) { uint8_t *lb = NULL; size_t lcap = 0, ll = 0; rc = loc_encode(sl, k, &lb, &lcap, &ll); locs[i] = lb; llens[i] = (uint32_t)ll; }
+        if (sl != small) free(sl);
+    }
+    uint8_t *meta = NULL; size_t ml = 0; uint64_t nr = 0; uint32_t nbk = 0; int64_t dvm = 0;
+    if (!rc) rc = rs_builder_finish_locs(pb->b, (const uint8_t *const *)locs, llens, &meta, &ml, &nr, &nbk, &dvm);
+    for (uint32_t i = 0; i < nb; i++) free(locs[i]);
+    free(locs); free(llens);
+    if (!rc) rc = tx_insert_run(t, c, run, t->next_age++, 0, meta, ml, nr, nbk, dvm);
+    free(meta);
+    return rc;
+}
+
 int rsx_tx_drop_table (rsx_tx *t, sqlite3 *c, uint32_t tbl, int64_t dv) {
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(c, "INSERT INTO mw_drops(tbl, dv) VALUES(?1, ?2) ON CONFLICT(tbl) DO UPDATE SET dv = max(dv, excluded.dv)", -1, &st, NULL);

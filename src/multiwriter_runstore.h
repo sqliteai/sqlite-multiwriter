@@ -46,6 +46,12 @@ typedef struct rsx_tx rsx_tx;
 rsx_tx *rsx_tx_begin (mw_rstore *s, sqlite3 *c);                           // in an open transaction of c; NULL: error
 // a run of level 0 from the items [i0, i1) of a batch in key order
 int rsx_tx_add_items (rsx_tx *t, sqlite3 *c, const fitem *v, int i0, int i1);
+// the same in two steps: the blocks are built (any thread, no database), then written in a transaction (the same blocks again if the transaction is tried again)
+typedef struct rsx_prebuilt rsx_prebuilt;
+rsx_prebuilt *rsx_prebuild (const fitem *v, int i0, int i1);                // NULL: no items, or no memory
+void rsx_prebuilt_free (rsx_prebuilt *pb);
+int rsx_reserve_prebuilt (mw_rstore *s, sqlite3 *c, const rsx_prebuilt *pb);   // the slots it needs, before the transaction
+int rsx_tx_add_prebuilt (rsx_tx *t, sqlite3 *c, rsx_prebuilt *pb);
 int rsx_tx_drop_table (rsx_tx *t, sqlite3 *c, uint32_t tbl, int64_t dv);
 int rsx_tx_finish (rsx_tx *t, sqlite3 *c);                                  // the version and counters into mw_state; call before COMMIT
 void rsx_tx_end (rsx_tx *t, bool committed);                                // after COMMIT (or ROLLBACK): publishes the new list of runs, or forgets it; frees t

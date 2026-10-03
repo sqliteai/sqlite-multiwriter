@@ -354,12 +354,12 @@ static int sort_items (fitem *v, int n) {
 
 // One transaction of the flush: the items [i0, i1) as a run of level 0 and, in the last one, the sites, the flushed point and the high-water mark. A flush is several of them (a transaction of
 // hundreds of thousands of rows would hold its whole write set in memory and in the log): the points move only with the last, and what the others wrote is what a replay would write again.
-static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool last, uint64_t V, uint64_t hwm, uint32_t nsites, uint32_t sflushed, const struct mw_purge *purge, int npurge) {
+static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, rsx_prebuilt *pb, bool last, uint64_t V, uint64_t hwm, uint32_t nsites, uint32_t sflushed, const struct mw_purge *purge, int npurge) {
     int rc;
     if (!atomic_load_explicit(&m->schema_seen, memory_order_relaxed)) { rc = mw_meta_schema(c); if (rc != SQLITE_OK) return rc; atomic_store(&m->schema_seen, true); }
     atomic_store(&m->tables_ok, true);
     uint64_t tp0 = now_ns();
-    if (i1 > i0 && (rc = rsx_reserve_items(m->rsx, c, v, i0, i1)) != SQLITE_OK) return rc;
+    if (pb && (rc = rsx_reserve_prebuilt(m->rsx, c, pb)) != SQLITE_OK) return rc;
     atomic_fetch_add(&mw_ft[2], now_ns() - tp0);              // (the slots the blocks will be written to: taken before the transaction)
     rsx_wlock(m->rsx);
     if ((rc = sqlite3_exec(c, "BEGIN", NULL, NULL, NULL)) != SQLITE_OK) { rsx_wunlock(m->rsx); return rc; }
@@ -373,7 +373,7 @@ static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool l
     for (int i = 0; i0 == 0 && i < npurge && rc == SQLITE_OK; i++) rc = rsx_tx_drop_table(t, c, purge[i].tbl, (int64_t)purge[i].epoch);
     uint64_t cells = 0;
     tp0 = now_ns();
-    if (rc == SQLITE_OK) rc = rsx_tx_add_items(t, c, v, i0, i1);
+    if (rc == SQLITE_OK && pb) rc = rsx_tx_add_prebuilt(t, c, pb);
     atomic_fetch_add(&mw_ft[3], now_ns() - tp0);
     for (int i = i0; i < i1; i++) cells += v[i].n;
     for (uint32_t o = sflushed; last && o < nsites && rc == SQLITE_OK; o++) {
@@ -397,22 +397,45 @@ static int write_batch (mw_meta *m, sqlite3 *c, fitem *v, int i0, int i1, bool l
     return rc;
 }
 
-// the items [i0, n) in transactions of RUN_ROWS rows (the first also does the purges, the last the sites and the points when `last_range`)
+// the items [i0, n) in transactions of RUN_ROWS rows (the first also does the purges, the last the sites and the points when `last_range`). The runs are built first, before the write lock is
+// taken and in several threads (the rows packed into blocks and compressed: most of what a flush does that is not the database); a transaction only gives the blocks their slots.
 #define RUN_ROWS 32768
+typedef struct { const fitem *v; int a, b; rsx_prebuilt *pb; int state; } pbjob;       // state: 0 to do, 1 being built, 2 done
+typedef struct { pbjob *jobs; int nj; pthread_mutex_t mu; pthread_cond_t cv; _Atomic int next; } pbctx;
+static void pb_do (pbctx *x, int j) { pbjob *q = &x->jobs[j]; q->pb = rsx_prebuild(q->v, q->a, q->b); pthread_mutex_lock(&x->mu); q->state = 2; pthread_cond_broadcast(&x->cv); pthread_mutex_unlock(&x->mu); }
+static bool pb_claim (pbctx *x, int j) { pthread_mutex_lock(&x->mu); bool mine = x->jobs[j].state == 0; if (mine) x->jobs[j].state = 1; pthread_mutex_unlock(&x->mu); return mine; }
+static void *pb_worker (void *arg) { pbctx *x = arg; for (;;) { int j = atomic_fetch_add(&x->next, 1); if (j >= x->nj) break; if (pb_claim(x, j)) pb_do(x, j); } return NULL; }
+static rsx_prebuilt *pb_get (pbctx *x, int j) {                                   // (the job j: built here if nobody has taken it, or waited for)
+    if (pb_claim(x, j)) pb_do(x, j);
+    pthread_mutex_lock(&x->mu); while (x->jobs[j].state != 2) pthread_cond_wait(&x->cv, &x->mu); pthread_mutex_unlock(&x->mu);
+    return x->jobs[j].pb;
+}
+static int builder_threads (void) { static int c = -1; if (c < 0) { const char *e = getenv("MW_META_BUILDERS"); c = e ? atoi(e) : 3; if (c < 0) c = 0; if (c > 8) c = 8; } return c; }
 static int write_range (mw_meta *m, sqlite3 *c, fitem *v, int i0, int n, bool last_range, uint64_t V, uint64_t hwm, uint32_t nsites, uint32_t sflushed, const struct mw_purge *purge, int npurge) {
     int rc = SQLITE_OK, need_slots_retries = 0;
-    for (int a = i0; a <= n && rc == SQLITE_OK; ) {
-        int b = a + RUN_ROWS < n ? a + RUN_ROWS : n;
-        bool last = last_range && b >= n;
+    int nj = (n - i0 + RUN_ROWS - 1) / RUN_ROWS; if (nj < 1) nj = 1;
+    pbctx x = { calloc((size_t)nj, sizeof(pbjob)), nj, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0 };
+    if (!x.jobs) return SQLITE_NOMEM;
+    for (int j = 0; j < nj; j++) { x.jobs[j].v = v; x.jobs[j].a = i0 + j * RUN_ROWS; x.jobs[j].b = x.jobs[j].a + RUN_ROWS < n ? x.jobs[j].a + RUN_ROWS : n; if (x.jobs[j].b <= x.jobs[j].a) x.jobs[j].state = 2; }
+    pthread_t th[8]; int nth = 0, want = nj - 1 < builder_threads() ? nj - 1 : builder_threads();
+    for (int t = 0; t < want; t++) if (pthread_create(&th[nth], NULL, pb_worker, &x) == 0) nth++;
+    for (int j = 0; j < nj && rc == SQLITE_OK; j++) {
+        int a = x.jobs[j].a, b = x.jobs[j].b;
+        rsx_prebuilt *pb = pb_get(&x, j);
+        if (b > a && !pb) { rc = SQLITE_NOMEM; break; }
+        bool last = last_range && j == nj - 1;
         rc = SQLITE_BUSY;
         for (int attempt = 0; attempt < 200 && busyish(rc); attempt++) {
-            rc = write_batch(m, c, v, a, b, last, V, hwm, nsites, sflushed, purge, npurge);
-            if (rc == RSX_NEED_SLOTS) { (void)rsx_reserve_items(m->rsx, c, v, a, b); rc = SQLITE_BUSY; attempt--; if (++need_slots_retries > 20) { rc = SQLITE_FULL; break; } continue; }      // (more incompressible than we thought: more slots, and again)
+            rc = write_batch(m, c, v, a, b, pb, last, V, hwm, nsites, sflushed, purge, npurge);
+            if (rc == RSX_NEED_SLOTS) { if (pb) (void)rsx_reserve_prebuilt(m->rsx, c, pb); rc = SQLITE_BUSY; attempt--; if (++need_slots_retries > 20) { rc = SQLITE_FULL; break; } continue; }      // (more slots, and again)
             if (busyish(rc)) { atomic_fetch_add(&m->flush_retries, 1); usleep(500 * (unsigned)(attempt < 20 ? attempt + 1 : 20)); }
         }
-        if (b >= n) break;
-        a = b;
+        rsx_prebuilt_free(pb); x.jobs[j].pb = NULL;
     }
+    atomic_store(&x.next, nj);                                                      // (the helpers: no more jobs; they finish what they are building)
+    for (int t = 0; t < nth; t++) pthread_join(th[t], NULL);
+    for (int j = 0; j < nj; j++) rsx_prebuilt_free(x.jobs[j].pb);
+    free(x.jobs);
     return rc;
 }
 void mw_meta_run_stats (mw_meta *m, uint64_t out[13]) { rsx_stats st; rsx_stats_get(m->rsx, &st); out[11] = st.merge_retries; out[12] = st.swept_slots; { int l0, all; rsx_backlog(m->rsx, &l0, &all); out[9] = (uint64_t)l0; out[10] = (uint64_t)all; } out[0] = st.gets; out[1] = st.run_probes; out[2] = st.bloom_skips; out[3] = st.blk_reads; out[4] = st.cache_hits; out[5] = st.merges; out[6] = st.merged_rows; out[7] = st.runs_written; out[8] = (uint64_t)st.nruns; }

@@ -124,7 +124,7 @@ static void child_run (const char *path, bool shared, int ackfd, int ms_after_fa
         for (int i = 1; i <= max_txn; i++) {
             char sql[300]; rng = rng * 1103515245u + 12345u; int a = 1 + (int)(rng >> 16) % NROWS; rng = rng * 1103515245u + 12345u; int b = 1 + (int)(rng >> 16) % NROWS; if (a == b) continue;
             snprintf(sql, sizeof sql, "BEGIN; UPDATE t SET n=n+1 WHERE id=%d; UPDATE t SET n=n+1 WHERE id=%d; INSERT INTO big(v) VALUES(zeroblob(2000)); COMMIT", a, b);
-            if (exec_retry(db, sql) == SQLITE_OK) { if (write(ackfd, &i, sizeof i) != sizeof i) _exit(2); if (failed_once) after++; }
+            if (exec_retry(db, sql) == SQLITE_OK) { if (write(ackfd, &i, sizeof i) != sizeof i) _exit(2); if (failed_once) after++; if (after >= 2000) break; }
             else {
                 failures++; mw_exec(db, "ROLLBACK");
                 struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
@@ -134,12 +134,14 @@ static void child_run (const char *path, bool shared, int ackfd, int ms_after_fa
             }
             if (i % 50 == 0) { mw_compact_result r; sqlite3_file_control(db, "main", MW_FCNTL_COMPACT, &r); }
         }
+        if (getenv("MW_VERBOSE")) { int64_t sm; int rw; ballast_drop(); int b = check_rows(db, &sm, &rw); fprintf(stderr, "child, before close (space freed): %d rows, %d disagree\n", rw, b); }
         sqlite3_close(db);
     } else failures = -1;
     int tag = -1; if (write(ackfd, &tag, sizeof tag) != sizeof tag || write(ackfd, &failures, sizeof failures) != sizeof failures || write(ackfd, &after, sizeof after) != sizeof after) _exit(2);
     _exit(0);
 }
 static void verify (const char *path, bool shared, int acked, const char *what) {
+    if (getenv("MW_DF_KEEP")) { char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf /tmp/dfdump; mkdir -p /tmp/dfdump && cp %s* /tmp/dfdump/ 2>/dev/null; ls -la /tmp/dfdump >&2", path); (void)system(cmd); }
     sqlite3 *r; int rc = open_cdc(path, &r, shared);
     if (rc != SQLITE_OK) { printf("FAIL %s: cannot open the database again (%d)\n", what, rc); mw_failures++; return; }
     int64_t sum; int rows; int bad = check_rows(r, &sum, &rows); int64_t nbig = mw_scalar(r, "SELECT count(*) FROM big");
@@ -147,12 +149,15 @@ static void verify (const char *path, bool shared, int acked, const char *what) 
         printf("FAIL %s: %d rows (want %d), %d disagree with the metadata, sum(n)=%lld, big rows %lld, acknowledged %d\n", what, rows, NROWS, bad, (long long)sum, (long long)nbig, acked); mw_failures++;
     }
     if (!integrity_ok(r)) { printf("FAIL %s: integrity_check\n", what); mw_failures++; }
-    int ok = 0; for (int i = 0; i < 30; i++) if (exec_retry(r, "BEGIN; UPDATE t SET n=n+1 WHERE id=1; UPDATE t SET n=n+1 WHERE id=2; INSERT INTO big(v) VALUES(zeroblob(2000)); COMMIT") == SQLITE_OK) ok++;
+    int ok = 0, lastrc = 0; for (int i = 0; i < 30; i++) { lastrc = exec_retry(r, "BEGIN; UPDATE t SET n=n+1 WHERE id=1; UPDATE t SET n=n+1 WHERE id=2; INSERT INTO big(v) VALUES(zeroblob(2000)); COMMIT"); if (lastrc == SQLITE_OK) ok++; else mw_exec(r, "ROLLBACK"); }
+    if (ok != 30) printf("    last result %d (%s)\n", lastrc, sqlite3_errmsg(r));
     if (ok != 30) { printf("FAIL %s: after the space came back %d of 30 transactions committed\n", what, ok); mw_failures++; }
     sqlite3_close(r);
 }
 
+static int g_only = -1, g_seq = 0;                       // (MW_DF_ONLY=n runs only the nth scenario, to look at one)
 static void scenario_run (bool shared, long leave, int relief_ms, const char *name, bool fill_after_open) {
+    if (g_only >= 0 && g_seq++ != g_only) return;
     char path[400]; snprintf(path, sizeof path, "%s/db", mnt);
     ballast_drop(); mw_rmfiles(path);
     make_db(path);
@@ -175,13 +180,17 @@ static void scenario_run (bool shared, long leave, int relief_ms, const char *na
     close(pfd[0]);
     ballast_drop(); unlink(gate);
     if (sig || code) { printf("FAIL %s, %s: the child %s %d\n", shared ? "shared" : "thread", name, sig ? "was killed by signal" : "exited with code", sig ? sig : code); mw_failures++; }
-    else verify(path, shared, acked, name);
+    else {
+        verify(path, shared, acked, name);
+        if (relief_ms && after < 1000) { printf("FAIL %s, %s: the space came back and only %d transactions committed on the open connection (%d failed): not recovered in place\n", shared ? "shared" : "thread", name, after, failures); mw_failures++; }
+    }
     printf("%-6s mode, %-44s: %5d transactions acknowledged, %4d failed, %4d committed after the first failure%s\n", shared ? "shared" : "thread", name, acked, failures, after, relief_ms ? " (space freed while running)" : "");
     mw_rmfiles(path);
 }
 
 int main (void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    if (getenv("MW_DF_ONLY")) g_only = atoi(getenv("MW_DF_ONLY"));
     if (!vol_make(160)) { printf("test/mw_diskfull.c: skipped (no disk image can be made here)\n"); return 0; }
     for (int mode = 0; mode < 2; mode++) {
         bool shared = mode == 1;

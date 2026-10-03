@@ -61,31 +61,34 @@ static int check_rows (sqlite3 *db, int64_t *sum, int *rows) {
     sqlite3_finalize(st); return bad;
 }
 
-typedef struct { int kinds; int err; int sticky; int shortw; const char *name; } scenario;
+typedef struct { int kinds; int err; int sticky; int shortw; const char *name; int recover; } scenario;       // recover: the fault is lifted after a few failed commits, and the database must take transactions again without being opened
 #define NTXN 120
 
 // the child: arm the fault, open, run the workload. Reports on `ackfd` every acknowledged transaction, and at the end the number of calls the fault saw.
 static void child_run (const char *path, bool shared, const scenario *sc, long nth, int ackfd) {
+    int failures = 0, after_ok = 0, recovered_at = 0;
     alarm(120);                                                       // (a hang is a failure: SIGALRM ends the child)
     setenv("MW_META_FLUSH_ROWS", "7", 1); setenv("MW_META_FLUSH_MS", "5", 1);
     mw_io_fault_arm(sc->kinds, nth, sc->err, sc->sticky, sc->shortw);
     sqlite3 *db = NULL;
     if (open_cdc(path, &db, shared) == SQLITE_OK) {
-        unsigned rng = 99u; int failures = 0;
-        for (int i = 1; i <= NTXN && failures < 25; i++) {
+        unsigned rng = 99u;
+        for (int i = 1; i <= NTXN && (failures < 25 || sc->recover); i++) {
             char sql[200]; rng = rng * 1103515245u + 12345u; int a = 1 + (int)(rng >> 16) % NROWS; rng = rng * 1103515245u + 12345u; int b = 1 + (int)(rng >> 16) % NROWS; if (a == b) continue;
             snprintf(sql, sizeof sql, "BEGIN; UPDATE t SET n=n+1 WHERE id=%d; UPDATE t SET n=n+1 WHERE id=%d; COMMIT", a, b);
-            if (exec_retry(db, sql) == SQLITE_OK) { if (write(ackfd, &i, sizeof i) != sizeof i) _exit(2); }
-            else { failures++; mw_exec(db, "ROLLBACK"); }
+            if (exec_retry(db, sql) == SQLITE_OK) { if (write(ackfd, &i, sizeof i) != sizeof i) _exit(2); if (recovered_at) after_ok++; }
+            else { failures++; mw_exec(db, "ROLLBACK"); if (sc->recover && failures == 3) { mw_io_fault_disarm(); recovered_at = i; usleep(20000); } }
             if (i % 30 == 0) { mw_compact_result r; sqlite3_file_control(db, "main", MW_FCNTL_COMPACT, &r); }
         }
         sqlite3_close(db);
     }
-    long calls = mw_io_fault_calls(); int tag = -1; if (write(ackfd, &tag, sizeof tag) != sizeof tag || write(ackfd, &calls, sizeof calls) != sizeof calls) _exit(2);
+    long calls = mw_io_fault_calls(); int tag = -1;
+    if (write(ackfd, &tag, sizeof tag) != sizeof tag || write(ackfd, &calls, sizeof calls) != sizeof calls || write(ackfd, &failures, sizeof failures) != sizeof failures || write(ackfd, &after_ok, sizeof after_ok) != sizeof after_ok) _exit(2);
     _exit(0);
 }
 
 // returns the number of calls the fault saw (from the child's last words), or -1; *acked: acknowledged transactions; *sig: the signal that ended the child (0: none)
+static int g_failures, g_after_ok;
 static long run_once (const char *path, bool shared, const scenario *sc, long nth, int *acked, int *sig, int *code) {
     int pfd[2]; CHECK(pipe(pfd) == 0);
     pid_t c = fork();
@@ -94,7 +97,7 @@ static long run_once (const char *path, bool shared, const scenario *sc, long nt
     int st; waitpid(c, &st, 0);
     *sig = WIFSIGNALED(st) ? WTERMSIG(st) : 0; *code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
     *acked = 0; long calls = -1; int v;
-    while (read(pfd[0], &v, sizeof v) == sizeof v) { if (v == -1) { if (read(pfd[0], &calls, sizeof calls) != sizeof calls) calls = -1; break; } (*acked)++; }
+    while (read(pfd[0], &v, sizeof v) == sizeof v) { if (v == -1) { if (read(pfd[0], &calls, sizeof calls) != sizeof calls || read(pfd[0], &g_failures, sizeof g_failures) != sizeof g_failures || read(pfd[0], &g_after_ok, sizeof g_after_ok) != sizeof g_after_ok) calls = -1; break; } (*acked)++; }
     close(pfd[0]);
     return calls;
 }
@@ -117,11 +120,14 @@ int main (int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     int maxiter = argc > 1 ? atoi(argv[1]) : 60;
     long only_n = argc > 3 ? atol(argv[3]) : 0; int only_sc = argc > 2 ? atoi(argv[2]) : -1;      // (to look at one case: mw_ioerr 0 <scenario> <n>; thread mode, or shared with MW_IOERR_SHARED=1)                      // faults tried per scenario and mode
+    // (the last field: the fault is lifted after three failed commits and the database must take transactions again, without being opened: a full disk is not the end of a connection)
     const scenario sc[] = {
-        { MW_IO_ALL,                                 EIO,    0, 0, "a single EIO in any call" },
-        { MW_IO_WRITE | MW_IO_TRUNC | MW_IO_MAP,     ENOSPC, 1, 0, "disk full for writes and extensions from the nth call" },
-        { MW_IO_WRITE,                               ENOSPC, 0, 1, "torn write, then disk full" },
-        { MW_IO_SYNC | MW_IO_RENAME,                 EIO,    1, 0, "fsync and rename fail from the nth call" },
+        { MW_IO_ALL,                                 EIO,    0, 0, "a single EIO in any call", 0 },
+        { MW_IO_WRITE | MW_IO_TRUNC | MW_IO_MAP,     ENOSPC, 1, 0, "disk full for writes and extensions from the nth call", 0 },
+        { MW_IO_WRITE,                               ENOSPC, 0, 1, "torn write, then disk full", 0 },
+        { MW_IO_SYNC | MW_IO_RENAME,                 EIO,    1, 0, "fsync and rename fail from the nth call", 0 },
+        { MW_IO_TRUNC,                               ENOSPC, 1, 0, "no room to reserve the log, then room again", 1 },
+        { MW_IO_WRITE | MW_IO_TRUNC | MW_IO_MAP,     ENOSPC, 1, 0, "no room for segments and maps, then room again", 2 },
     };
     char path[256];
     if (only_n > 0 && only_sc >= 0) {
@@ -135,6 +141,8 @@ int main (int argc, char **argv) {
     for (int mode = 0; mode < 2; mode++) {
         bool shared = mode == 1;
         for (size_t s = 0; s < sizeof sc / sizeof sc[0]; s++) {
+            if (sc[s].recover == 1 && shared) continue;           // (the thread mode's reservation of the log)
+            if (sc[s].recover == 2 && !shared) continue;          // (the shared mode's segments)
             mw_tmpdb(path, sizeof path, "ioerr"); make_db(path);
             int acked, sig, code; long total = run_once(path, shared, &sc[s], 1L << 40, &acked, &sig, &code);      // (counting run: the fault never fires)
             CHECK(sig == 0 && code == 0 && total > 0);
@@ -147,7 +155,10 @@ int main (int argc, char **argv) {
                 int before = mw_failures;
                 long calls = run_once(path, shared, &sc[s], n, &acked, &sig, &code);
                 if (sig != 0 || code != 0 || calls < 0) { printf("FAIL %s, %s, n=%ld: the child %s %d (acknowledged %d)\n", shared ? "shared" : "thread", sc[s].name, n, sig ? "was killed by signal" : "exited with code", sig ? sig : code, acked); mw_failures++; children_failed++; }
-                else verify(path, shared, acked, sc[s].name, n);
+                else {
+                    verify(path, shared, acked, sc[s].name, n);
+                    if (sc[s].recover && g_failures >= 3 && g_after_ok < 10) { printf("FAIL %s, %s, n=%ld: %d commits failed, then the fault was lifted and only %d committed (not recovered in place)\n", shared ? "shared" : "thread", sc[s].name, n, g_failures, g_after_ok); mw_failures++; }
+                }
                 if (mw_failures != before) failed_cases++;
                 mw_rmdb(path); tried++;
             }

@@ -11,6 +11,10 @@
 #include <sys/uio.h>
 #include <sys/mman.h>
 #include <stdio.h>
+#include <fcntl.h>
+#if defined(__linux__)
+#include <linux/falloc.h>
+#endif
 
 #include "multiwriter.h"
 
@@ -43,6 +47,24 @@ static inline int mw_io_fsync (int fd) { int e = mw_io_hit(MW_IO_SYNC, NULL); if
 static inline int mw_io_msync (void *a, size_t n, int fl) { int e = mw_io_hit(MW_IO_SYNC, NULL); if (e) { errno = e; return -1; } return msync(a, n, fl); }
 static inline int mw_io_ftruncate (int fd, off_t n) { int e = mw_io_hit(MW_IO_TRUNC, NULL); if (e) { errno = e; return -1; } return ftruncate(fd, n); }
 static inline int mw_io_rename (const char *a, const char *b) { int e = mw_io_hit(MW_IO_RENAME, NULL); if (e) { errno = e; return -1; } return rename(a, b); }
+// The SQLite result for a failed file call: a full disk is SQLITE_FULL (the application can wait for room and go on), anything else the given I/O error.
+static inline int mw_io_rc (int err, int dflt) { return (err == ENOSPC || err == EDQUOT) ? SQLITE_FULL : dflt; }
+
+// Reserves the disk blocks for [from, to) of a file whose data ends at `from` (the size of the file does not change; a later write into the range cannot fail for want of space).
+// 0, or the errno. The reservation is of whole blocks and all or nothing. Where the system has no such call nothing is reserved (and nothing can be promised).
+static inline int mw_io_reserve (int fd, uint64_t from, uint64_t to) {
+    int e = mw_io_hit(MW_IO_TRUNC, NULL); if (e) return e;
+    if (to <= from) return 0;
+#if defined(__APPLE__)
+    fstore_t fs = { F_ALLOCATEALL, F_PEOFPOSMODE, 0, (off_t)(to - from), 0 };
+    return fcntl(fd, F_PREALLOCATE, &fs) == 0 ? 0 : (errno ? errno : EIO);
+#elif defined(__linux__)
+    if (fallocate(fd, FALLOC_FL_KEEP_SIZE, (off_t)from, (off_t)(to - from)) == 0) return 0;
+    return (errno == EOPNOTSUPP || errno == ENOSYS) ? 0 : errno;
+#else
+    (void)fd; return 0;
+#endif
+}
 static inline void *mw_io_mmap (void *a, size_t n, int prot, int fl, int fd, off_t off) { int e = mw_io_hit(MW_IO_MAP, NULL); if (e) { errno = e; return MAP_FAILED; } return mmap(a, n, prot, fl, fd, off); }
 
 #endif

@@ -392,7 +392,14 @@ void mw_cdc_lane_free (mw_lane *lane) {
 mw_meta *mw_cdc_meta (mw_db *db) { mw_cdc *c = db->cdc; return c ? c->meta : NULL; }
 
 // the last user connection is closing: the metadata goes to the file now (the log is about to be dropped), and the store's own connections close
-void mw_cdc_quiesce (mw_db *db) { mw_cdc *c = db->cdc; if (c) { if (!c->ready) { mw_meta_ready(c->meta); c->ready = true; } mw_meta_quiesce(c->meta); } }
+void mw_cdc_quiesce (mw_db *db) {
+    mw_cdc *c = db->cdc; if (!c) return;
+    if (!c->ready && mw_meta_ready(c->meta) == SQLITE_OK) c->ready = true;
+    mw_meta_quiesce(c->meta);
+    // The final flush could not write everything (no room on the disk, an I/O error): the log is all that holds the rest of the metadata. The close keeps the log of a failed database for the
+    // recovery at the next open; it would drop it as compacted otherwise.
+    if (c->ready && mw_meta_safe_epoch(c->meta) != UINT64_MAX) atomic_store(&db->failed, 1);
+}
 // the point up to which the log may be compacted without losing metadata
 void mw_cdc_kick_flush (mw_db *db) { mw_cdc *c = db->cdc; if (c) mw_meta_kick(c->meta); }
 uint64_t mw_cdc_safe_epoch (mw_db *db) { mw_cdc *c = db->cdc; if (c && !c->ready) { mw_meta_ready(c->meta); c->ready = true; } if (!c || !c->ready) return c ? 0 : UINT64_MAX; uint64_t e = mw_meta_safe_epoch(c->meta); if (e != UINT64_MAX) mw_meta_kick(c->meta); return e; }

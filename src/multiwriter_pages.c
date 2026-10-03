@@ -314,6 +314,7 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
         if (!adopt) memcpy(copies[ncopied], images[ncopied], (size_t)st->pgsz);
     }
     if (rc == SQLITE_OK && mw_fault_hit(MW_FAULT_ALLOC_ERR)) rc = SQLITE_NOMEM;
+    if (rc == SQLITE_OK && db->has_log) { mw_log_decide_mode(db, sync); rc = mw_log_ensure_room(db, mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0)); }       // (no room on the disk: this commit fails, before it takes an epoch)
     if (rc != SQLITE_OK) goto fail_free;
 
     // ---- lock the stripes of every page written or read (ascending) --------------------------------

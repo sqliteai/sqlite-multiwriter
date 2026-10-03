@@ -127,7 +127,7 @@ static int pwrite_all (int fd, const void *buf, size_t n, off_t off) {
     const char *p = buf;
     while (n > 0) {
         ssize_t w = mw_io_pwrite(fd, p, n, off);
-        if (w < 0) { if (errno == EINTR) continue; return SQLITE_IOERR_WRITE; }
+        if (w < 0) { if (errno == EINTR) continue; return mw_io_rc(errno, SQLITE_IOERR_WRITE); }
         p += w; off += w; n -= (size_t)w;
     }
     return SQLITE_OK;
@@ -437,6 +437,28 @@ void mw_log_prefill_bg (mw_db *db) {
 void mw_log_fill_hold (mw_db *db) { prefill_claim(db, true); }
 void mw_log_fill_release (mw_db *db) { atomic_store(&db->shm->log_fill_pid, 0); }
 
+
+// Staged log: the disk for the records is reserved ahead (in steps of LOG_RES_STEP), before the commit takes its offset. A full disk then fails the commit that asked for the
+// room, cleanly (nothing was assigned, installed or written), and the next one finds the room when the space is back; the group write of records inside the reservation cannot
+// fail for want of space, so the database is not left failed. (Measured on APFS: the reservation makes the log faster, 23 against 33-40 us per write and fsync.)
+#define LOG_RES_STEP (4ull << 20)
+#define LOG_RES_SLACK (2ull << 20)
+int mw_log_ensure_room (mw_db *db, uint64_t record_size) {
+    if (db->mp || db->logfd < 0 || atomic_load_explicit(&db->log_mode, memory_order_acquire) != 2) return SQLITE_OK;
+    uint64_t need = db->log_off + record_size + LOG_RES_SLACK;                       // (log_off read without its lock: a little behind at worst, the slack covers it)
+    if (need <= atomic_load_explicit(&db->log_res_end, memory_order_acquire)) return SQLITE_OK;
+    pthread_mutex_lock(&db->log_mu);
+    uint64_t have = atomic_load(&db->log_res_end), want = need + LOG_RES_STEP;
+    if (have < db->written_end) have = db->written_end;                               // (the data already in the file is its own reservation)
+    int rc = SQLITE_OK;
+    if (need > atomic_load(&db->log_res_end)) {
+        int e = mw_io_reserve(db->logfd, have, want);
+        if (e) rc = mw_io_rc(e, SQLITE_IOERR_WRITE); else atomic_store(&db->log_res_end, want);
+    }
+    pthread_mutex_unlock(&db->log_mu);
+    return rc;
+}
+
 void mw_log_reserve_space (mw_db *db) {
     // Only the mapped log grows ahead of time. A staged log grows by append: extending a file with ftruncate and then writing into the hole makes the file system
     // allocate blocks inside every write (measured: group sync 70-290 us against 40-50 us when the file simply grows, 2 writers 5-11k against 17k tx/s).
@@ -532,7 +554,7 @@ static int ring_write_file (mw_db *db, uint64_t from, uint64_t len) {
         size_t first = len < R - pos ? (size_t)len : (size_t)(R - pos);
         struct iovec iov[2] = { { db->stage_buf + pos, first }, { db->stage_buf, (size_t)len - first } };
         ssize_t w = mw_io_pwritev(db->logfd, iov, len > first ? 2 : 1, (off_t)from);
-        if (w < 0) { if (errno == EINTR) continue; return SQLITE_IOERR_WRITE; }
+        if (w < 0) { if (errno == EINTR) continue; return mw_io_rc(errno, SQLITE_IOERR_WRITE); }
         from += (uint64_t)w; len -= (uint64_t)w;
     }
     return SQLITE_OK;
@@ -573,6 +595,7 @@ static int stage_flush (mw_db *db, bool publish) {
 void mw_log_stage_reset (mw_db *db, uint64_t off) {
     pthread_mutex_lock(&db->log_mu);
     db->written_end = db->flushed_off = db->synced_off = off;
+    atomic_store(&db->log_res_end, off);                                       // (the file was cut or replaced: whatever was reserved is gone)
     db->flushed_epoch = db->synced_upto = db->written_upto;
     pthread_mutex_unlock(&db->log_mu);
 }

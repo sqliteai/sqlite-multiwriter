@@ -322,6 +322,7 @@ struct mw_db {
     uint8_t          *logmap;              // the log file mapped MAP_SHARED (records are memcpy'd, no syscall); NULL = pwrite fallback
     uint64_t          logsync_off;         // everything below this offset has been msync'ed (log_mu)
     uint64_t          logsync_low1;        // 1 + lowest offset of a record completed since the last sync began although below logsync_off (0 = none; log_mu)
+    _Atomic uint64_t  log_res_end;         // staged log: the file's blocks are reserved up to here (a write below it cannot fail for want of space)
     uint64_t          logfile_size;        // current file size (grown ahead of log_off under seq_mu)
     uint64_t          base_epoch;          // compacted epoch (log header), protected by log_mu
     pthread_mutex_t   log_mu;              // fsync leader election + written-prefix bookkeeping
@@ -500,6 +501,7 @@ typedef struct mw_rext { uint64_t epoch; uint8_t *data; uint32_t len; } mw_rext;
 int       mw_recovered_ext_add (mw_db *db, uint64_t epoch, const uint8_t *ext, uint32_t len);          // recovery: an extension seen in the log, kept for the change capture to replay
 int       mw_log_sync (mw_db *db, uint64_t epoch, uint64_t my_end);   // my_end: file offset where this commit's record ends (staged mode)
 int       mw_log_set_base (mw_db *db, uint64_t base_epoch);
+int       mw_log_ensure_room (mw_db *db, uint64_t record_size);      // staged log: reserve the disk for the next records before an offset is assigned (SQLITE_FULL when there is no room: nothing was assigned yet)
 void      mw_log_reserve_space (mw_db *db);                          // caller holds store->seq_mu: grow the file ahead of log_off
 void      mw_log_remap (mw_db *db);                                  // after the file was replaced/truncated (seq_mu held)
 int       mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch);      // caller holds store->seq_mu

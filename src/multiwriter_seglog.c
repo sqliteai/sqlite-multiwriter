@@ -71,7 +71,7 @@ static uint64_t rec_cksum (uint64_t salt, const rec_hdr *h, const void *body, si
 
 static int pwrite_all (int fd, const void *buf, size_t n, off_t off) {
     const char *p = buf;
-    while (n > 0) { ssize_t w = mw_io_pwrite(fd, p, n, off); if (w < 0) { if (errno == EINTR) continue; return SQLITE_IOERR_WRITE; } p += w; off += w; n -= (size_t)w; }
+    while (n > 0) { ssize_t w = mw_io_pwrite(fd, p, n, off); if (w < 0) { if (errno == EINTR) continue; return mw_io_rc(errno, SQLITE_IOERR_WRITE); } p += w; off += w; n -= (size_t)w; }
     return SQLITE_OK;
 }
 static int pread_all (int fd, void *buf, size_t n, off_t off) {
@@ -154,8 +154,9 @@ static int seg_create (mw_seglog *sl, uint32_t seg, uint64_t size, uint64_t base
             rc = pwrite_all(fd, z, (size_t)k, (off_t)off); off += k;
         }
         free(z);
-    } else if (rc == SQLITE_OK && mw_io_ftruncate(fd, (off_t)size) != 0) rc = SQLITE_IOERR;
+    } else if (rc == SQLITE_OK && mw_io_ftruncate(fd, (off_t)size) != 0) rc = mw_io_rc(errno, SQLITE_IOERR);
     close(fd);
+    if (rc != SQLITE_OK) unlink(path);                         // (a segment that could not be made whole is not left behind)
     return rc;
 }
 
@@ -374,7 +375,7 @@ static int seg_roll (mw_db *db, mw_seglog *sl, uint32_t cur, uint64_t need, uint
         if (!(atomic_load(&sh->seg_next_ready) == next && size == sl->seg_bytes)) {
             unlink(final_);
             int rc = seg_create(sl, next, size, base, false, true);
-            if (rc != SQLITE_OK) return rc;
+            if (rc != SQLITE_OK) { atomic_store(&sh->seg_next_ready, 0); atomic_store(&sh->log_ready, 0); return rc; }       // (no room: the commit fails and the next one tries again)
         }
     }
     // the header of the new segment carries the current base (recovery takes the largest over the segments)

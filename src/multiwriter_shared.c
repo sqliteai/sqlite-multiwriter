@@ -293,7 +293,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     rc = mw_seglog_append(db, epoch, new_dbsize, n, pgnos, images, lane ? lane->cdc_ext : NULL, lane ? lane->cdc_ext_len : 0, locs, &ext_loc, &seg, &end);
     mw_fault_hit(MW_CRASH_SHARED_APPENDED);                                           // (the record is complete, nothing is installed)
     MW_T1(MW_ST_APPEND, ta0);
-    if (rc != SQLITE_OK) { if (n > 16) free(locs); ADOPT_FREE(); atomic_store(&db->failed, 1); return rc; }
+    if (rc != SQLITE_OK) { if (n > 16) free(locs); ADOPT_FREE(); return rc; }          // (the append failed before it touched anything the others can see: this commit fails, the database does not)
     if (shidx_install(ix, epoch, new_dbsize, n, pgnos, locs) != 0) { if (n > 16) free(locs); ADOPT_FREE(); atomic_store(&db->failed, 1); return SQLITE_FULL; }
     if (n > 16) free(locs);
     if (db->cdc && lane) {                                                       // the metadata of the commit: its buckets in the shared index, the owner maps follow the commit's pages

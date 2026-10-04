@@ -251,6 +251,7 @@ static int get_one (mw_rstore *s, const mw_rman *m, sqlite3_stmt *st, uint32_t t
         int b = rs_run_block_of(r, &k); if (b < 0) continue;
         cblk *cb = fetch_block(s, st, r, (uint32_t)b); if (!cb) return -1;
         rs_blk blk; int64_t dv; const uint8_t *c; uint32_t nc; int f = rs_blk_open(&blk, cb->d, cb->len) ? rs_blk_find(&blk, &k, &dv, &c, &nc) : -1;
+        rs_blk_close(&blk);
         if (f < 0) { cblk_unref(cb); return -1; }
         if (f == 0) { cblk_unref(cb); continue; }
         int rc = 0;
@@ -281,7 +282,7 @@ int rsx_scan_keys (mw_rstore *s, sqlite3 *c, void (*cb)(void *, uint32_t, const 
             uint8_t *raw; size_t rl; if (!read_block(s, st, r, bi, &raw, &rl)) { rc = -1; break; }
             rs_blk b; uint8_t *own; if (!rs_blk_unpack(&b, raw, rl, &own)) { free(raw); rc = -1; break; }
             for (uint32_t i = 0; i < b.nrows; i++) { rs_key k; int64_t dv; const uint8_t *cells; uint32_t nc; if (!rs_blk_row(&b, i, &k, &dv, &cells, &nc)) { rc = -1; break; } if (nc) cb(ctx, k.tbl, k.pk, k.pklen); }
-            free(own); free(raw);
+            rs_blk_close(&b); free(own); free(raw);
         }
     }
     sqlite3_finalize(st); rsx_man_release(m); if (own) sqlite3_exec(c, "COMMIT", NULL, NULL, NULL);
@@ -297,7 +298,7 @@ int rsx_scan_since (mw_rstore *s, sqlite3 *c, mw_rman *m, int64_t since, void (*
             cblk *cb_ = fetch_block(s, st, r, bi); if (!cb_) { rc = -1; break; }
             rs_blk b; if (!rs_blk_open(&b, cb_->d, cb_->len)) rc = -1;
             for (uint32_t i = 0; !rc && i < b.nrows; i++) { rs_key k; int64_t dv; const uint8_t *cells; uint32_t nc; if (!rs_blk_row(&b, i, &k, &dv, &cells, &nc)) { rc = -1; break; } if (nc && dv > since) cb(ctx, k.tbl, k.pk, k.pklen); }
-            cblk_unref(cb_);
+            rs_blk_close(&b); cblk_unref(cb_);
         }
     }
     sqlite3_finalize(st);
@@ -340,7 +341,7 @@ static int scan_emit (void *ctx, uint32_t blkno, const uint8_t *data, size_t len
         int64_t dd = drop_of(sc->m, k.tbl); if (dd) { int q = 0; for (int x = 0; x < n; x++) if (c[x].dv >= dd) c[q++] = c[x]; n = q; }
         rcx = n ? sc->cb(sc->ctx, k.tbl, k.pk, k.pklen, c, n) : 0; free(c);
     }
-    free(own);
+    rs_blk_close(&b); free(own);
     return rcx;
 }
 static int scan_begin (void *sctx, uint64_t hint, rs_emit_fn *emit, void **ec) { (void)hint; *emit = scan_emit; *ec = sctx; return 0; }

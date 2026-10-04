@@ -39,7 +39,7 @@ static int lookup (const rs_key *k, int64_t *dv, uint8_t *out, uint32_t *nc) {
         int b = rs_run_block_of(runs[i], k); if (b < 0) continue;
         uint8_t *d; size_t l; if (store_read(NULL, runs[i], (uint32_t)b, &d, &l)) return -2;
         rs_blk blk; uint8_t *own; if (!rs_blk_unpack(&blk, d, l, &own)) { free(d); return -3; }
-        const uint8_t *c; uint32_t n; int64_t v; int f = rs_blk_find(&blk, k, &v, &c, &n);
+        const uint8_t *c; uint32_t n; int64_t v; int f = rs_blk_find(&blk, k, &v, &c, &n); rs_blk_close(&blk);
         if (f == 1) { *dv = v; *nc = n; if (n) memcpy(out, c, n); free(own); free(d); return n ? 1 : 0; }
         free(own); free(d); if (f < 0) return -4;
     }
@@ -94,6 +94,19 @@ static void merge_some (void) {
 }
 
 int main (void) {
+    // a block of the first form (offsets of every row, whole keys) is still read
+    { uint8_t blk[200]; size_t w = 0; blk[w++] = 1; uint32_t n = 2; memcpy(blk + w, &n, 4); w += 4;
+      size_t offs_at = w; w += 8;
+      uint32_t o0 = (uint32_t)w; blk[w++] = 1; blk[w++] = 2; blk[w++] = 'a'; blk[w++] = 'b'; blk[w++] = 7; blk[w++] = 3; blk[w++] = 9; blk[w++] = 9; blk[w++] = 9;
+      uint32_t o1 = (uint32_t)w; blk[w++] = 1; blk[w++] = 2; blk[w++] = 'a'; blk[w++] = 'c'; blk[w++] = 8; blk[w++] = 0;
+      memcpy(blk + offs_at, &o0, 4); memcpy(blk + offs_at + 4, &o1, 4);
+      rs_blk b; uint8_t *own; CHECK(rs_blk_unpack(&b, blk, w, &own)); CHECK(b.nrows == 2);
+      rs_key k; int64_t dv; const uint8_t *c; uint32_t nc;
+      CHECK(rs_blk_row(&b, 1, &k, &dv, &c, &nc) && k.pklen == 2 && k.pk[1] == 'c' && dv == 8 && nc == 0);
+      CHECK(rs_blk_row(&b, 0, &k, &dv, &c, &nc) && dv == 7 && nc == 3);
+      rs_key q = { 1, (const uint8_t *)"ac", 2 }; CHECK(rs_blk_find(&b, &q, &dv, &c, &nc) == 1 && dv == 8);
+      rs_blk_close(&b); }
+
     // the universe of keys: three tables; integer-like keys of 8 bytes and text keys of varying length (including empty ones and ones that are prefixes of each other)
     for (int i = 0; i < NKEYS; i++) {
         mkey *m = &keys[i]; m->tbl = 1 + (uint32_t)(i % 3);
@@ -139,7 +152,7 @@ int main (void) {
             rs_blk b; uint8_t *own; tried++;
             if (!rs_blk_unpack(&b, d, len, &own)) { refused++; free(d); continue; }
             for (uint32_t i = 0; i < b.nrows; i++) { rs_key k; int64_t v; const uint8_t *c; uint32_t nc; (void)rs_blk_row(&b, i, &k, &v, &c, &nc); }       // (never reads outside the block: ASan checks)
-            rs_key probe = { 1, (const uint8_t *)"zz", 2 }; int64_t v; const uint8_t *c; uint32_t nc; (void)rs_blk_find(&b, &probe, &v, &c, &nc);
+            rs_key probe = { 1, (const uint8_t *)"zz", 2 }; int64_t v; const uint8_t *c; uint32_t nc; (void)rs_blk_find(&b, &probe, &v, &c, &nc); rs_blk_close(&b);
             free(own); free(d);
         }
         printf("%d damaged blocks: %d refused at once, the others read without leaving their bytes\n", tried, refused);

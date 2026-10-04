@@ -50,7 +50,7 @@ static bool bloom_test (const uint64_t *bits, uint64_t nbits, uint64_t h) {
 bool rs_blk_unpack (rs_blk *b, const uint8_t *data, size_t len, uint8_t **owned) {
     *owned = NULL;
     if (len < 1) return false;
-    if (data[0] == 1) return rs_blk_open(b, data, len);
+    if (data[0] == 1 || data[0] == 3) return rs_blk_open(b, data, len);
     if (data[0] != 2 || len < 6) return false;
     uint32_t raw = rd32(data + 1);
     if (raw < 5 || raw > (64u << 20)) return false;
@@ -61,26 +61,87 @@ bool rs_blk_unpack (rs_blk *b, const uint8_t *data, size_t len, uint8_t **owned)
     return true;
 }
 bool rs_blk_open (rs_blk *b, const uint8_t *data, size_t len) {
-    if (len < 5 || data[0] != 1) return false;
+    b->kbuf = b->kinl; b->kcap = sizeof b->kinl; b->klen = 0; b->ktbl = 0; b->kdv = 0; b->cur = -1; b->next_off = 0; b->ver = 0; b->nrest = 0; b->rows_at = 0;
+    if (len < 5 || (data[0] != 1 && data[0] != 3)) return false;
     uint32_t n = rd32(data + 1);
-    if ((uint64_t)n * 4 + 5 > len) return false;
-    b->data = data; b->len = len; b->nrows = n;
+    if (data[0] == 1) {
+        if ((uint64_t)n * 4 + 5 > len) return false;
+        b->data = data; b->len = len; b->nrows = n; b->ver = 1;
+        return true;
+    }
+    uint64_t nr = ((uint64_t)n + RS_RESTART - 1) / RS_RESTART;
+    if (n == 0 || 5 + nr * 4 > len) return false;
+    b->data = data; b->len = len; b->nrows = n; b->ver = 3; b->nrest = (uint32_t)nr; b->rows_at = 5 + (size_t)nr * 4;
     return true;
 }
-bool rs_blk_row (const rs_blk *b, uint32_t i, rs_key *k, int64_t *dv, const uint8_t **cells, uint32_t *ncells) {
+void rs_blk_close (rs_blk *b) { if (b->kbuf && b->kbuf != b->kinl) free(b->kbuf); b->kbuf = b->kinl; b->kcap = sizeof b->kinl; }
+// decodes the row at *off (form 3) into the state of the block; `restart`: it is a restart row (whole key, dv as it is)
+static bool blk_next (rs_blk *b, size_t *off, bool restart) {
+    const uint8_t *p = b->data + *off, *end = b->data + b->len;
+    uint64_t h, un, d, cl, t;
+    if (*off < b->rows_at || *off >= b->len || !get_var(&p, end, &h)) return false;
+    uint64_t shared = h >> 1; bool newtbl = h & 1;
+    if (restart && (shared || !newtbl)) return false;
+    if (newtbl) { if (!get_var(&p, end, &t)) return false; b->ktbl = (uint32_t)t; } else if (b->cur < 0 && !restart) return false;
+    if (!get_var(&p, end, &un) || shared > b->klen || un > (uint64_t)(end - p) || shared + un > (1u << 30)) return false;
+    uint64_t nl = shared + un;
+    if (nl > b->kcap) { uint32_t nc = (uint32_t)(nl * 2 + 64); uint8_t *nb = malloc(nc); if (!nb) return false; memcpy(nb, b->kbuf, b->klen); if (b->kbuf != b->kinl) free(b->kbuf); b->kbuf = nb; b->kcap = nc; }
+    memcpy(b->kbuf + shared, p, (size_t)un); p += un; b->klen = (uint32_t)nl;
+    if (!get_var(&p, end, &d)) return false;
+    if (restart) b->kdv = (int64_t)d; else b->kdv += (int64_t)(d >> 1) ^ -(int64_t)(d & 1);
+    if (!get_var(&p, end, &cl) || cl > (uint64_t)(end - p)) return false;
+    b->kcells = p; b->knc = (uint32_t)cl; p += cl;
+    *off = (size_t)(p - b->data);
+    return true;
+}
+bool rs_blk_row (rs_blk *b, uint32_t i, rs_key *k, int64_t *dv, const uint8_t **cells, uint32_t *ncells) {
     if (i >= b->nrows) return false;
-    uint32_t off = rd32(b->data + 5 + (size_t)i * 4);
-    if (off < 5 + (size_t)b->nrows * 4 || off >= b->len) return false;
-    const uint8_t *p = b->data + off, *end = b->data + b->len;
-    uint64_t tbl, pkl, d, cl;
-    if (!get_var(&p, end, &tbl) || !get_var(&p, end, &pkl) || pkl > (uint64_t)(end - p)) return false;
-    const uint8_t *pk = p; p += pkl;
-    if (!get_var(&p, end, &d) || !get_var(&p, end, &cl) || cl > (uint64_t)(end - p)) return false;
-    k->tbl = (uint32_t)tbl; k->pk = pk; k->pklen = (uint32_t)pkl; *dv = (int64_t)d; *cells = p; *ncells = (uint32_t)cl;
+    if (b->ver == 1) {
+        uint32_t off = rd32(b->data + 5 + (size_t)i * 4);
+        if (off < 5 + (size_t)b->nrows * 4 || off >= b->len) return false;
+        const uint8_t *p = b->data + off, *end = b->data + b->len;
+        uint64_t tbl, pkl, d, cl;
+        if (!get_var(&p, end, &tbl) || !get_var(&p, end, &pkl) || pkl > (uint64_t)(end - p)) return false;
+        const uint8_t *pk = p; p += pkl;
+        if (!get_var(&p, end, &d) || !get_var(&p, end, &cl) || cl > (uint64_t)(end - p)) return false;
+        k->tbl = (uint32_t)tbl; k->pk = pk; k->pklen = (uint32_t)pkl; *dv = (int64_t)d; *cells = p; *ncells = (uint32_t)cl;
+        return true;
+    }
+    if (b->cur != (int64_t)i) {
+        if (b->cur >= 0 && (int64_t)i == b->cur + 1) {                                  // the next row: where the last one ended
+            if (!blk_next(b, &b->next_off, i % RS_RESTART == 0)) { b->cur = -1; return false; }
+            b->cur = (int64_t)i;
+        } else {                                                                         // from the restart row before it
+            uint32_t r = i / RS_RESTART; uint32_t off32 = rd32(b->data + 5 + (size_t)r * 4); size_t off = off32;
+            b->cur = -1; b->klen = 0;
+            if (!blk_next(b, &off, true)) return false;
+            b->cur = (int64_t)r * RS_RESTART; b->next_off = off;
+            while (b->cur < (int64_t)i) { if (!blk_next(b, &b->next_off, false)) { b->cur = -1; return false; } b->cur++; }
+        }
+    }
+    k->tbl = b->ktbl; k->pk = b->kbuf; k->pklen = b->klen; *dv = b->kdv; *cells = b->kcells; *ncells = b->knc;
     return true;
 }
-int rs_blk_find (const rs_blk *b, const rs_key *k, int64_t *dv, const uint8_t **cells, uint32_t *ncells) {
+int rs_blk_find (rs_blk *b, const rs_key *k, int64_t *dv, const uint8_t **cells, uint32_t *ncells) {
     uint32_t lo = 0, hi = b->nrows;
+    if (b->ver == 3) {                                                                   // the last restart row that is not after the key, then the rows up to the next one
+        uint32_t a = 0, z = b->nrest;                                                  // restarts [a, z): number of restart keys <= k
+        while (a < z) {
+            uint32_t mid = a + (z - a) / 2; rs_key x; int64_t d; const uint8_t *c; uint32_t nc;
+            if (!rs_blk_row(b, mid * RS_RESTART, &x, &d, &c, &nc)) return -1;
+            if (rs_key_cmp(&x, k) <= 0) a = mid + 1; else z = mid;
+        }
+        if (a == 0) return 0;
+        lo = (a - 1) * RS_RESTART; hi = lo + RS_RESTART < b->nrows ? lo + RS_RESTART : b->nrows;
+        for (uint32_t i = lo; i < hi; i++) {
+            rs_key x; int64_t d; const uint8_t *c; uint32_t nc;
+            if (!rs_blk_row(b, i, &x, &d, &c, &nc)) return -1;
+            int r = rs_key_cmp(&x, k);
+            if (r == 0) { *dv = d; *cells = c; *ncells = nc; return 1; }
+            if (r > 0) return 0;
+        }
+        return 0;
+    }
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2; rs_key x; int64_t d; const uint8_t *c; uint32_t nc;
         if (!rs_blk_row(b, mid, &x, &d, &c, &nc)) return -1;
@@ -151,7 +212,7 @@ struct rs_builder {
     uint32_t blkno; uint64_t total; int64_t dvmax;
     uint32_t nf, capf; uint32_t *ftbl, *foff, *flen; int64_t *fdv; uint8_t *farena; size_t farn, farcap;
     uint32_t *slen, *loff, *llen; uint8_t *larena; size_t larn, larcap;
-    uint8_t *last; size_t lastcap; uint32_t lasttbl, lastl;
+    uint8_t *last; size_t lastcap; uint32_t lasttbl, lastl; int64_t prevdv;
     uint64_t *bloom; uint64_t nbits;
     bool defer; uint8_t **dblk; uint32_t *dlen, ndblk, capdblk;      // deferred: the finished blocks are kept (their places are given when the run is finished)
 };
@@ -175,10 +236,11 @@ void rs_builder_free (rs_builder *b) {
 uint64_t rs_builder_rows (const rs_builder *b) { return b->total; }
 static int flush_block (rs_builder *b) {
     if (!b->noffs) return 0;
-    size_t base = 5 + (size_t)b->noffs * 4, len = base + b->nbytes;
+    uint32_t n = b->noffs, nr = (n + RS_RESTART - 1) / RS_RESTART;
+    size_t base = 5 + (size_t)nr * 4, len = base + b->nbytes;
     uint8_t *buf = malloc(len); if (!buf) return -1;
-    buf[0] = 1; uint32_t n = b->noffs; memcpy(buf + 1, &n, 4);
-    for (uint32_t i = 0; i < n; i++) { uint32_t o = b->offs[i] + (uint32_t)base; memcpy(buf + 5 + (size_t)i * 4, &o, 4); }
+    buf[0] = 3; memcpy(buf + 1, &n, 4);
+    for (uint32_t i = 0; i < nr; i++) { uint32_t o = b->offs[i] + (uint32_t)base; memcpy(buf + 5 + (size_t)i * 4, &o, 4); }
     memcpy(buf + base, b->rows, b->nbytes);
     static int nocomp = -1; if (nocomp < 0) nocomp = getenv("MW_META_NOCOMPRESS") != NULL;
     const uint8_t *stored = buf; size_t slen = len; uint8_t *cmp = NULL;
@@ -222,14 +284,22 @@ static int flush_block (rs_builder *b) {
 int rs_builder_add (rs_builder *b, const rs_key *k, int64_t dv, const uint8_t *cells, uint32_t ncells) {
     size_t need = b->nbytes + 40 + k->pklen + ncells;
     if (need > b->cap) { size_t nc = need * 2 + 4096; uint8_t *nr = realloc(b->rows, nc); if (!nr) return -1; b->rows = nr; b->cap = nc; }
-    if (b->noffs == b->capoffs) { uint32_t nc = b->capoffs ? b->capoffs * 2 : 512; uint32_t *no = realloc(b->offs, nc * 4); if (!no) return -1; b->offs = no; b->capoffs = nc; }
+    bool restart = b->noffs % RS_RESTART == 0;
+    if (restart && b->noffs / RS_RESTART == b->capoffs) { uint32_t nc = b->capoffs ? b->capoffs * 2 : 64; uint32_t *no = realloc(b->offs, nc * 4); if (!no) return -1; b->offs = no; b->capoffs = nc; }
     if (!b->noffs) {                                                                   // the first row of a block: its key is the fence
         if (k->pklen > b->firstcap) { size_t nc = k->pklen * 2 + 64; uint8_t *nf = realloc(b->first, nc); if (!nf) return -1; b->first = nf; b->firstcap = nc; }
         memcpy(b->first, k->pk, k->pklen); b->firsttbl = k->tbl; b->firstl = k->pklen; b->bdv = 0;
     }
     uint8_t *w = b->rows + b->nbytes;
-    b->offs[b->noffs++] = (uint32_t)b->nbytes;
-    w += put_var(w, k->tbl); w += put_var(w, k->pklen); memcpy(w, k->pk, k->pklen); w += k->pklen; w += put_var(w, (uint64_t)dv); w += put_var(w, ncells); if (ncells) memcpy(w, cells, ncells); w += ncells;
+    if (restart) b->offs[b->noffs / RS_RESTART] = (uint32_t)b->nbytes;
+    b->noffs++;
+    bool newtbl = restart || k->tbl != b->lasttbl;
+    uint32_t shared = 0; if (!newtbl) { uint32_t m = b->lastl < k->pklen ? b->lastl : k->pklen; while (shared < m && b->last[shared] == k->pk[shared]) shared++; }
+    w += put_var(w, ((uint64_t)shared << 1) | (newtbl ? 1u : 0u)); if (newtbl) w += put_var(w, k->tbl);
+    w += put_var(w, k->pklen - shared); memcpy(w, k->pk + shared, k->pklen - shared); w += k->pklen - shared;
+    if (restart) w += put_var(w, (uint64_t)dv); else { int64_t df = dv - b->prevdv; w += put_var(w, ((uint64_t)df << 1) ^ (uint64_t)(df >> 63)); }
+    b->prevdv = dv;
+    w += put_var(w, ncells); if (ncells) memcpy(w, cells, ncells); w += ncells;
     b->nbytes = (size_t)(w - b->rows);
     if (dv > b->bdv) b->bdv = dv;
     if (dv > b->dvmax) b->dvmax = dv;
@@ -237,7 +307,7 @@ int rs_builder_add (rs_builder *b, const rs_key *k, int64_t dv, const uint8_t *c
     memcpy(b->last, k->pk, k->pklen); b->lasttbl = k->tbl; b->lastl = k->pklen;
     bloom_add(b->bloom, b->nbits, rs_key_hash(k));
     b->total++;
-    if (b->nbytes + (size_t)b->noffs * 4 >= RS_BLOCK_TARGET) return flush_block(b);
+    if (b->nbytes + (size_t)((b->noffs + RS_RESTART - 1) / RS_RESTART) * 4 >= RS_BLOCK_TARGET) return flush_block(b);
     return 0;
 }
 static int builder_finish (rs_builder *b, bool keep, const uint8_t *const *locs, const uint32_t *llens, uint8_t **meta, size_t *metalen, uint64_t *nrows, uint32_t *nblk, int64_t *dvmax) {
@@ -275,7 +345,7 @@ static int mit_advance (mit *it, const rs_merge_opts *o) {
             { uint64_t p = 0; uint32_t n = it->k.pklen < 8 ? it->k.pklen : 8; for (uint32_t q = 0; q < 8; q++) p = (p << 8) | (q < n ? it->k.pk[q] : 0); it->pfx = p; }
             it->i++; return 0;
         }
-        if (it->buf) { free(it->buf); free(it->raw); it->buf = NULL; it->raw = NULL; it->blk++; }
+        if (it->buf) { rs_blk_close(&it->b); free(it->buf); free(it->raw); it->buf = NULL; it->raw = NULL; it->blk++; }
         if (it->blk >= it->run->nblk) { it->done = true; return 0; }
         int rc = o->read(o->rctx, it->run, it->blk, &it->buf, &it->buflen); if (rc) return rc;
         if (!rs_blk_unpack(&it->b, it->buf, it->buflen, &it->raw)) return -2;
@@ -340,7 +410,7 @@ int rs_merge (rs_run *const *runs, int nruns, const rs_merge_opts *o, uint64_t *
     }
     (void)inside;
     if (b) rs_builder_free(b);
-    for (int i = 0; i < nruns; i++) { free(its[i].buf); free(its[i].raw); }
+    for (int i = 0; i < nruns; i++) { if (its[i].buf) rs_blk_close(&its[i].b); free(its[i].buf); free(its[i].raw); }
     free(its); free(heap);
     if (rows_out) *rows_out = out;
     return rc;

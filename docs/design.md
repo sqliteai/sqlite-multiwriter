@@ -206,6 +206,11 @@ the metadata tests with the store under pressure.
   blocks of the runs as page images): a sixth more bytes through the one group-commit pipeline, and the transactions of the merge and the flush take turns on the b-trees of `mw_slots` / `mw_free`
   (`rsx_wlock`). The process uses ~9.8 of the 18 cores, so it is not the CPU. What would cut it is writing fewer bytes: the blocks hold 14.5 bytes a row (9 of them the key, ascending: a key stored as a
   difference from the previous one with restart points would save ~40%), or fewer passes (every row is written once by the flush and once at each level: 4 times in a run of 60 s).
+- **Fewer bytes a row in the blocks (measured, kept).** The blocks of the runs (form 3) store a key as the difference from the previous one (the shared prefix and the rest), the db_version as the difference
+  from the previous row, and keep an offset only for every 32nd row (a row is found from the restart before it; form 1 is still read): the table of offsets was 4 bytes a row and the keys of an ascending
+  range differ in their last byte. `bench/bench_merge.c`: 14.3 -> 8.8 bytes a row stored (restart every 16 rows: 9.1; 64: 8.6); in a real run of the benchmark 14.6 -> 10.0 bytes a row in the slots (the
+  Bloom filter of the meta is 1.25 more, and the padding of the last slot of a block). Less in the log (the commits of the metadata) and less to compress and decompress; the merge CPU is the same (47 ns
+  a row). 16 threads tracked 29.6k -> 32.2k tx/s (three alternating pairs of 30 s), 4 processes 14.9k -> 15.5k.
 
 ## Capture and DDL
 

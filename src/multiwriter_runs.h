@@ -20,13 +20,22 @@ int rs_key_cmp (const rs_key *a, const rs_key *b);                       // tabl
 uint64_t rs_key_hash (const rs_key *k);
 
 // ---- a block ----
-// raw form: [format 1][nrows u32][offsets u32 x nrows][rows]; a row: varint table, varint key length, key, varint dv, varint length of the cells, the cells (length 0: the row was deleted)
-typedef struct { const uint8_t *data; size_t len; uint32_t nrows; } rs_blk;
+// raw form 3: [3][nrows u32][offsets u32 of every RS_RESTART-th row][rows]; a row: varint (shared << 1 | new table), the table if new, varint length of the rest of the key, those bytes (the first `shared` bytes
+// are those of the row before: a key is stored as the difference from the previous one), varint dv (the difference from the previous row, zigzag), varint length of the cells, the cells (length 0: the row was
+// deleted). A restart row has its whole key and its dv as they are: a row is found from the restart before it. (Form 1, read still: [1][nrows u32][offsets u32 x nrows], rows with the table, the whole key, dv.)
+#define RS_RESTART 32
+typedef struct {
+    const uint8_t *data; size_t len; uint32_t nrows;
+    int ver; uint32_t nrest; size_t rows_at;                                          // (form 3)
+    uint8_t *kbuf; uint32_t kcap, klen, ktbl; int64_t kdv; const uint8_t *kcells; uint32_t knc;      // the row last decoded: its key is rebuilt in kbuf
+    int64_t cur; size_t next_off; uint8_t kinl[96];
+} rs_blk;
+void rs_blk_close (rs_blk *b);                                                         // frees what the reading of rows took (call it when done with the block)
 // A stored block is raw (format 1, as built) or compressed with LZ4 (format 2: [2][raw length u32][LZ4 data]); the builder compresses a block when it gains a tenth or more.
 bool rs_blk_unpack (rs_blk *b, const uint8_t *data, size_t len, uint8_t **owned);                                      // a stored block opened; *owned: a buffer to free when done (NULL: b points into data)
 bool rs_blk_open (rs_blk *b, const uint8_t *data, size_t len);                                                            // false: not a block (nothing is read past its end)
-bool rs_blk_row (const rs_blk *b, uint32_t i, rs_key *k, int64_t *dv, const uint8_t **cells, uint32_t *ncells);           // the i-th row
-int  rs_blk_find (const rs_blk *b, const rs_key *k, int64_t *dv, const uint8_t **cells, uint32_t *ncells);                // 1 found, 0 not, -1 corrupt
+bool rs_blk_row (rs_blk *b, uint32_t i, rs_key *k, int64_t *dv, const uint8_t **cells, uint32_t *ncells);           // the i-th row
+int  rs_blk_find (rs_blk *b, const rs_key *k, int64_t *dv, const uint8_t **cells, uint32_t *ncells);                // 1 found, 0 not, -1 corrupt
 
 // ---- a run (what is kept in memory) ----
 typedef struct rs_run {

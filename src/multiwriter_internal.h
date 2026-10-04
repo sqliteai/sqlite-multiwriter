@@ -90,6 +90,7 @@ typedef struct mw_shm {
     _Atomic uint64_t  sy_done;            // everything up to this log position (segment << 40 | offset) is durable: the group commit across processes
     _Atomic uint32_t  sy_wake;            // changed + woken when a sync finishes: the commits waiting for durability sleep on it
     _Atomic int32_t   sy_leader;          // process running the fsync everybody waits for (0 = none)
+    _Atomic uint32_t  sy_failed;          // an fsync of the log failed: the data it should have covered may never reach the disk, and a later fsync that succeeds (the kernel forgets the error) must not acknowledge it: every commit that is not durable yet fails, in every process, until the log is closed by all
     _Atomic uint32_t  base_dbsize;        // database size in pages at the compaction base (what the real file holds)
     _Atomic uint64_t  compact_req_ns;     // shared mode: a process has claimed the next compaction at this time (0 = none; a claim older than 2 s is void)
     _Atomic uint64_t  compact_end_ns;     // when the last compaction ended (periodic compactions of all processes share one interval)
@@ -277,6 +278,8 @@ struct mw_lane {
     uint32_t   *own_pg;              // pages committed by this connection inside the current snapshot (sorted)
     int         own_n, own_cap;
     uint64_t    own_epoch;           // epoch of its latest commit
+    uint64_t   *own_ep;              // (parallel to own_pg) the epoch of the latest commit of this snapshot that wrote each page: a page is validated against the commit that wrote it, not against the latest commit of the lane
+    bool        poisoned;            // a commit of this snapshot was relocated (its pages went to other numbers): the lane's private WAL still has the old ones, so the snapshot takes no more commits
     int        *ws_frame;       // frame index of the last image of each page (parallel to ws_pgnos)
     // passthrough-mode commit detection (wal-index header watch)
     volatile uint8_t *shm0;

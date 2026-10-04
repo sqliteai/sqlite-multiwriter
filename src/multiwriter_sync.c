@@ -307,7 +307,9 @@ int mw_sync_apply (sqlite3 *db, const uint8_t *payload, size_t len, mw_sync_stat
     mw_meta_ready(m);
     uint8_t *tuples = NULL; size_t tlen = 0; uint32_t nrows = 0;
     int rc = container_decode(payload, len, &tuples, &tlen, &nrows); if (rc != SQLITE_OK) return rc;
+    if ((uint64_t)nrows > tlen) { free(tuples); return SQLITE_CORRUPT; }                      // (a tuple takes at least a byte: a count that is larger than the payload is a damaged header, not an allocation to make)
     chg *ch = calloc((size_t)nrows + 1, sizeof *ch); int n = 0;
+    if (!ch) { free(tuples); return SQLITE_NOMEM; }
     size_t off = 0;
     while (off < tlen && n < (int)nrows) {
         crdt_value v[NCOLS]; size_t used = 0;

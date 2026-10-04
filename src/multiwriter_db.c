@@ -156,8 +156,10 @@ void mw_db_release_ex (mw_db *db, bool sys) {
         mw_log_close(db, sole && clean);
     shared_cleanup:
         if (db->mp_lockfd >= 0) {
-            if (sole && db->mp_path) unlink(db->mp_path);
+            // (the file of the byte locks goes first, then the one that is the lock of the header, which is held until the close: an opener that finds the header file gone starts over on both; the other order let one create a
+            // new header file, win it, and register its locks on the old byte-lock file that the closer was just going to unlink - two processes on one database that locked different files)
             if (sole && db->mp_pubpath) unlink(db->mp_pubpath);
+            if (sole && db->mp_path) unlink(db->mp_path);
             if (db->mp_pubfd >= 0) close(db->mp_pubfd);
             sqlite3_free(db->mp_pubpath);
             if (db->shm) munmap(db->shm, (sizeof(mw_shm) + 4095) & ~(size_t)4095);

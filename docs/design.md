@@ -280,6 +280,19 @@ the metadata tests with the store under pressure.
   metadata away (`MW_EXP_NOEXT`, `MW_EXP_NOAPPLY`, `MW_EXP_SKIPWRITE`, `MW_META_NOMERGE`, `MW_META_NOCOMPRESS`) and `MW_MP_PRIVATE_OK` are no longer read by a normal build (`make EXPERIMENTS=1`).
   Reported and **not** fixed yet: the order of the compaction and of the fsync of the log in the shared mode (the file can get ahead of what is durable at a power failure), the epoch of own pages of a lane after several
   commits in one snapshot, the unlink order of the lock files, the ticket lock after `kill -9`, and the recovery of the log on read errors (see the review).
+- **Second group of corrections (durability, recovery, locks).** (1) Opening a log: a header that does not check out, with records behind it, is `SQLITE_CORRUPT` (it emptied the log: the commits were thrown away in
+  silence); a read that fails during the replay is an error (it was taken for the end of the log, which was then cut there: all the commits after it were lost; `mw_logopen` fails on both without the fix, with 4 failures);
+  the cut of a torn tail, the cut of the recovery in place and the rename of a rewritten log are made durable (`fsync` of the file and of the directory); the same for the segments of the shared log, whose replay stops
+  at the end of the data but fails on a read that fails, and whose tail is cleared with the errors checked. (2) Shared mode: a failed fsync of the log fails every commit that is not durable yet, in every process, until
+  the log is closed by all (a later fsync that succeeds would have acknowledged data that may not be on the disk: `mw_syfail`, the commit of the second process went through before); the compaction makes the log durable up
+  to the commits whose pages it writes before it writes them, in the shared mode and in the single-process mode with `synchronous` below FULL (`mw_compactsync`: no sync before, one after; a power failure could leave the file ahead of
+  the log). (3) The roll to a new segment sets the segment before the offset in it, and the repair of a dead publisher puts the offset right if it died between the two. (4) The lock files of the shared mode are unlinked
+  in the order that cannot leave two processes locking different files; the ticket lock skips a ticket whose owner never wrote its pid (500 ms without progress) and a process whose ticket was skipped takes a new one.
+  (5) A lane validates each page that it wrote against the commit that wrote it (`own_ep`), keeps the size of its own last commit, and a snapshot that had a relocated commit takes no more commits (`MW_CONFLICT_READ`): the
+  reviewers' scenario of a lost update turned out to be caught earlier (the pages that a snapshot read are validated too), so `mw_ownepoch` is a guard and not a proof. (6) The extension and the sync payload check
+  the sizes they are given. Not done: the epochs in the table of 256 first-epochs of the segments with more than 256 live segments, the pid reuse of the processes, the publisher that dies in the garbage collection,
+  the orphan record after a failed install in the shared mode, `mm_head` that takes every error for an empty bucket, and the permissions of the sidecars in /dev/shm. The ticket lock and the unlink order were not tested
+  (no way to stop a process in those windows from a test).
 
 ## Capture and DDL
 

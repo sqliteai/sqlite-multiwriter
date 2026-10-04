@@ -36,6 +36,8 @@ static const sqlite3_io_methods *pass_io;
 
 static uint32_t be32 (const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 
+typedef struct { uint32_t pg; uint64_t ep; } pe_t;
+static int cmp_pe (const void *a, const void *b) { const pe_t *x = a, *y = b; if (x->pg != y->pg) return x->pg < y->pg ? -1 : 1; return x->ep > y->ep ? -1 : x->ep < y->ep; }
 static int cmp_u32 (const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
 
 // MARK: - write set -
@@ -138,6 +140,7 @@ static int lane_publish_inner (mw_lane *lane) {
         if (lane->ws_pgnos[i] == 1) pg1 = imgs[i];
     }
     if (!lane->dsz_valid || lane->dsz_epoch != lane->tx.snapshot_epoch) { lane->dsz_val = mw_store_dbsize(db->store, lane->tx.snapshot_epoch); lane->dsz_epoch = lane->tx.snapshot_epoch; lane->dsz_valid = true; }
+    if (lane->poisoned && lane->own_n > 0) { free(imgs); return MW_CONFLICT_READ; }          // (a commit of this snapshot was relocated: the next one would use the page numbers it had before; the snapshot ends and the transaction runs again)
     uint32_t snap_size = lane->dsz_val;
     uint32_t cookie = lane_schema_cookie(lane);
     // pages read but not written: mark the write set in the (sorted) bitmap, walk the read list
@@ -155,7 +158,7 @@ static int lane_publish_inner (mw_lane *lane) {
     if (db->cdc && !lane->norebase) { if (lane->sys) mw_cdc_skip(lane); else mw_cdc_prepare(lane, imgs); }       // (the metadata store's own commits write only mw_* tables: never tracked, never in the owner maps: nothing to capture)
     if (lane->cdc_err) { int e = lane->cdc_err; lane->cdc_err = 0; free(imgs); free(ro); return e; }          // (the commit's metadata could not be built: the commit does not go out without it)
     mw_validate v = { .snapshot_epoch = lane->tx.snapshot_epoch, .check_cookie = true, .cookie = cookie, .read_pgnos = ro, .n_read = nro,
-                      .own_pgnos = lane->own_pg, .own_n = lane->own_n, .own_epoch = lane->own_epoch };
+                      .own_pgnos = lane->own_pg, .own_n = lane->own_n, .own_epoch = lane->own_epoch, .own_epochs = lane->own_ep };
     uint64_t epoch = 0;
     uint64_t tp0 = MW_T0();
     // How long did this transaction stay open? A per-database turn (hot-spot escalation) is held from the snapshot to the commit: it pays for transactions that last
@@ -199,7 +202,7 @@ static int lane_publish_inner (mw_lane *lane) {
         if (rr == SQLITE_OK) rc = SQLITE_OK; else MP_RELEASE_NOFINISH();
         if (rr == SQLITE_OK) {
             MP_RELEASE();                                        // (multi-process: unlock, then wait for the group fsync; rc may turn into an I/O error)
-            if (rc == SQLITE_OK) { lane->tx.commit_epoch = epoch; lane->tx.state = MW_TX_COMMITTED; lane->consec_aborts = 0; if (lane->retry_credit > 0) lane->retry_credit--; }
+            if (rc == SQLITE_OK) { lane->tx.commit_epoch = epoch; lane->tx.state = MW_TX_COMMITTED; lane->consec_aborts = 0; if (lane->retry_credit > 0) lane->retry_credit--; lane->poisoned = true; }
         }
         else if (rr != MW_RELOC_NA) rc = rr;
         else if (lane_can_rebase(lane, pg1, cookie)) {
@@ -258,18 +261,26 @@ static int lane_commit_frame (mw_lane *lane, int k, uint32_t dbsize) {
         // The read snapshot may outlive this commit (a statement still stepping): the next commit starts after these frames and must not
         // count this commit's pages as somebody else's change.
         lane->commit_base = k + 1;
+        lane->dsz_val = dbsize;                                  // (the size this snapshot has after its own commit: the next commit of it that does not change the size must not record the size at the snapshot, which another commit may have grown meanwhile)
         if (lane->own_n + lane->ws_n > lane->own_cap) {
             int cap = lane->own_n + lane->ws_n + 16;
             uint32_t *p = sqlite3_realloc64(lane->own_pg, (sqlite3_uint64)cap * sizeof(uint32_t));
             if (!p) { lane->commit_base = 0; return rc; }
             lane->own_pg = p;
+            uint64_t *pe = sqlite3_realloc64(lane->own_ep, (sqlite3_uint64)cap * sizeof(uint64_t));
+            if (!pe) { lane->commit_base = 0; return rc; }
+            lane->own_ep = pe;
             lane->own_cap = cap;
         }
-        for (int i = 0; i < lane->ws_n; i++) lane->own_pg[lane->own_n++] = lane->ws_pgnos[i];
-        qsort(lane->own_pg, (size_t)lane->own_n, sizeof(uint32_t), cmp_u32);
-        int u = 0;
-        for (int i = 0; i < lane->own_n; i++) if (i == 0 || lane->own_pg[i] != lane->own_pg[u - 1]) lane->own_pg[u++] = lane->own_pg[i];
-        lane->own_n = u;
+        const uint64_t ce = lane->tx.commit_epoch;
+        for (int i = 0; i < lane->ws_n; i++) { lane->own_ep[lane->own_n] = ce; lane->own_pg[lane->own_n++] = lane->ws_pgnos[i]; }
+        // sorted by page, and for equal pages the latest commit first; one entry for each page, with the epoch of the commit that wrote it last
+        { int n = lane->own_n; pe_t *t = malloc((size_t)n * sizeof *t);
+          if (!t) { lane->commit_base = 0; return rc; }
+          for (int i = 0; i < n; i++) { t[i].pg = lane->own_pg[i]; t[i].ep = lane->own_ep[i]; }
+          qsort(t, (size_t)n, sizeof *t, cmp_pe);
+          int u = 0; for (int i = 0; i < n; i++) if (i == 0 || t[i].pg != lane->own_pg[u - 1]) { lane->own_pg[u] = t[i].pg; lane->own_ep[u] = t[i].ep; u++; }
+          lane->own_n = u; free(t); }
         lane->own_epoch = lane->tx.commit_epoch;
     }
     return rc;
@@ -353,7 +364,7 @@ int mw_lane_open_wal (mw_file *f, const char *name) {
 // walIndexRecover over the (now empty) WAL and reports changed=1 => page cache reset.
 void mw_lane_reset (mw_lane *lane) {
     lane->commit_base = 0;
-    lane->own_n = 0;
+    lane->own_n = 0; lane->poisoned = false;
     lane->wal.size = 0;
     lane->wal.commit_seen = false;
     lane->wal.pgsz = 0;
@@ -368,7 +379,7 @@ void mw_lane_free (mw_lane *lane) {
     sqlite3_free(lane->wal.buf);
     sqlite3_free(lane->ws_pgnos);
     sqlite3_free(lane->ws_frame);
-    sqlite3_free(lane->own_pg);
+    sqlite3_free(lane->own_pg); sqlite3_free(lane->own_ep);
     sqlite3_free(lane->ws_hash);
     sqlite3_free(lane->resv);
     sqlite3_free(lane->rs_bits);

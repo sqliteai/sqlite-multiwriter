@@ -206,6 +206,7 @@ void mw_mp_lock (mw_db *db) {
     if (mp_ticket_lock()) {
         uint64_t t = atomic_fetch_add(&sh->pub_ticket, 1);
         atomic_store(&sh->pub_tk_pid[t % 1024], me);
+        uint64_t stall_s = UINT64_MAX, stall_ns = 0;                                                    // (the ticket being served and since when: one whose owner never wrote its pid)
         for (unsigned polls = 0; ; polls++) {
             uint32_t wk = atomic_load_explicit(&sh->pub_wake[t % 1024], memory_order_acquire);          // (sampled before the queue is looked at: a wake in between is not lost)
             uint64_t s = atomic_load_explicit(&sh->pub_serving, memory_order_acquire);
@@ -213,8 +214,21 @@ void mw_mp_lock (mw_db *db) {
                 int32_t exp = 0;
                 if (atomic_compare_exchange_strong_explicit(&sh->pub_owner, &exp, me, memory_order_acquire, memory_order_relaxed)) { return; }
                 if (exp != me && (polls & 31) == 31 && !pid_alive(db, exp) && atomic_compare_exchange_strong(&sh->pub_owner, &exp, me)) { db->mp_recheck = true; if (db->shared) mw_shared_repair(db); return; }   // the holder died
+            } else if (s > t) {                                                                             // our ticket was skipped (we looked dead for too long): a new one
+                t = atomic_fetch_add(&sh->pub_ticket, 1);
+                atomic_store(&sh->pub_tk_pid[t % 1024], me);
+                stall_s = UINT64_MAX;
+                continue;
             } else if (s < t && (polls & 31) == 31) {
                 int32_t pid = atomic_load(&sh->pub_tk_pid[s % 1024]);
+                if (pid == 0) {                                                                         // the owner of this ticket has not written its pid: it is a moment from it, or it died between taking the ticket and that, and nobody would ever skip it
+                    uint64_t nowns = mw_stage_now();
+                    if (stall_s != s) { stall_s = s; stall_ns = nowns; }
+                    else if (nowns - stall_ns > 500000000ull && atomic_load(&sh->pub_owner) == 0) {
+                        uint64_t ss = s; if (atomic_compare_exchange_strong(&sh->pub_serving, &ss, s + 1)) atomic_store_explicit(&sh->pub_tk_pid[s % 1024], 0, memory_order_relaxed);
+                        stall_s = UINT64_MAX;
+                    }
+                } else stall_s = UINT64_MAX;
                 if (pid > 0 && (pid != me && !pid_alive(db, pid))) { if (getenv("MW_DEBUG")) fprintf(stderr, "pid %d: skipping ticket %llu of pid %d (owner %d)\n", (int)me, (unsigned long long)s, (int)pid, (int)atomic_load(&sh->pub_owner)); if (atomic_compare_exchange_strong(&sh->pub_serving, &s, s + 1)) atomic_store_explicit(&sh->pub_tk_pid[s % 1024], 0, memory_order_relaxed); }   // (slot cleared once its ticket is past: a dead pid left by the ticket 1024 earlier must not get a fresh ticket skipped) a queued process that gave up (-1) or died: skip its ticket
             }
             uint64_t ahead = s < t ? t - s : 0;

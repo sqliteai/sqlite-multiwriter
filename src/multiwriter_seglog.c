@@ -276,18 +276,20 @@ int mw_seglog_open (mw_db *db, mw_seglog_replay_fn fn, void *ctx, uint64_t *base
         for (int i = 0; i < nids && !stop && rc == SQLITE_OK; i++) {
             char path[620]; seg_path(sl, ids[i].id, path, sizeof path);
             int fd = open(path, O_RDWR);
-            if (fd < 0) { stop = true; break; }
-            struct stat sb; fstat(fd, &sb);
+            if (fd < 0) { if (errno != ENOENT) rc = SQLITE_CANTOPEN; stop = true; break; }           // (a segment that is not there ends the log; one that cannot be opened does not)
+            struct stat sb; if (fstat(fd, &sb) != 0) { close(fd); rc = SQLITE_IOERR; break; }
             uint64_t off = MW_SEG_HDR; uint8_t *buf = NULL; size_t bcap = 0;
             uint64_t first_in_seg = 0;
             for (;;) {                                                                    // records until the first one that is not valid: the end of this segment (zero padding after the last one that fitted)
                 rec_hdr r;
-                if (off + REC_HDR_SIZE > (uint64_t)sb.st_size || pread_all(fd, &r, sizeof r, (off_t)off) != SQLITE_OK) break;
+                if (off + REC_HDR_SIZE > (uint64_t)sb.st_size) break;
+                { int prc = pread_all(fd, &r, sizeof r, (off_t)off); if (prc == SQLITE_IOERR_SHORT_READ) break; if (prc != SQLITE_OK) { rc = prc; break; } }       // (a read that fails is not the end of the log: what is behind it is not a torn tail)
                 if (r.magic != REC_MAGIC || r.pgsz != sl->pgsz || r.npages == 0 || r.npages > (1u << 24)) break;
                 size_t body = (size_t)r.npages * (4 + (size_t)sl->pgsz) + r.ext_len;
                 if (off + REC_HDR_SIZE + body > (uint64_t)sb.st_size) break;
                 if (body > bcap) { uint8_t *nb = realloc(buf, body); if (!nb) { rc = SQLITE_NOMEM; break; } buf = nb; bcap = body; }
-                if (pread_all(fd, buf, body, (off_t)(off + REC_HDR_SIZE)) != SQLITE_OK || r.cksum != rec_cksum(sl->salt, &r, buf, body)) break;
+                { int prc = pread_all(fd, buf, body, (off_t)(off + REC_HDR_SIZE)); if (prc == SQLITE_IOERR_SHORT_READ) break; if (prc != SQLITE_OK) { rc = prc; break; } }
+                if (r.cksum != rec_cksum(sl->salt, &r, buf, body)) break;
                 if (prev_epoch && r.epoch != prev_epoch + 1) break;                       // a gap (or stale bytes): the prefix ends here
                 if (r.epoch > base && r.epoch != last + 1) break;                          // must continue right after the base
                 prev_epoch = r.epoch;
@@ -319,12 +321,13 @@ int mw_seglog_open (mw_db *db, mw_seglog_replay_fn fn, void *ctx, uint64_t *base
     }
     if (nids > 0) {                                                   // the tail of the last segment may hold a torn record and what a crash left behind: clear it, so that stale records can never join the log again
         char path[620]; seg_path(sl, cur_seg, path, sizeof path);
-        int fd = open(path, O_RDWR); struct stat sb;
+        int fd = open(path, O_RDWR); struct stat sb; int clr = SQLITE_OK;
         if (fd >= 0 && fstat(fd, &sb) == 0) {
-            for (uint64_t off = cur_end; off < (uint64_t)sb.st_size; ) { uint64_t k = (uint64_t)sb.st_size - off < SEG_PREFILL_CHUNK ? (uint64_t)sb.st_size - off : SEG_PREFILL_CHUNK; if (pwrite_all(fd, sl->zeros, (size_t)k, (off_t)off) != SQLITE_OK) break; off += k; }
-            mw_io_fsync(fd);
+            for (uint64_t off = cur_end; off < (uint64_t)sb.st_size; ) { uint64_t k = (uint64_t)sb.st_size - off < SEG_PREFILL_CHUNK ? (uint64_t)sb.st_size - off : SEG_PREFILL_CHUNK; if (pwrite_all(fd, sl->zeros, (size_t)k, (off_t)off) != SQLITE_OK) { clr = SQLITE_IOERR_WRITE; break; } off += k; }
+            if (clr == SQLITE_OK && mw_io_fsync(fd) != 0) clr = SQLITE_IOERR_FSYNC;
         }
         if (fd >= 0) close(fd);
+        if (clr != SQLITE_OK) { free(ids); return clr; }                                // (stale records that could not be cleared would rejoin the log behind the commits that reuse their epochs)
     }
     atomic_store(&sh->sl_seg, cur_seg);
     atomic_store(&sh->sl_end, cur_end);
@@ -383,8 +386,10 @@ static int seg_roll (mw_db *db, mw_seglog *sl, uint32_t cur, uint64_t need, uint
     atomic_store(&sh->seg_first_epoch[next % 256], first_epoch);
     atomic_store(&sh->seg_next_ready, 0);
     atomic_store(&sh->log_ready, 0);
-    atomic_store_explicit(&sh->sl_end, MW_SEG_HDR, memory_order_release);
+    // (the segment first, then the offset in it: a holder that dies between the two leaves the new segment with the old offset, which the repair of the next holder sees - there is no record at the head of the
+    // new segment - and puts right; the other order would have left the old segment with an offset at its head, where the next record would overwrite the first ones)
     atomic_store_explicit(&sh->sl_seg, next, memory_order_release);
+    atomic_store_explicit(&sh->sl_end, MW_SEG_HDR, memory_order_release);
     return SQLITE_OK;
 }
 
@@ -442,6 +447,7 @@ int mw_seglog_sync (mw_db *db, uint32_t seg, uint64_t end) {
     const int32_t me = (int32_t)getpid();
     for (;;) {
         if (atomic_load_explicit(&sh->sy_done, memory_order_acquire) >= target) return SQLITE_OK;
+        if (atomic_load_explicit(&sh->sy_failed, memory_order_acquire)) return SQLITE_IOERR_FSYNC;
         int32_t exp = 0;
         if (atomic_compare_exchange_strong(&sh->sy_leader, &exp, me)) {
             // The leader: one fsync for every commit written so far, by any process (the processes share one active segment).
@@ -473,7 +479,7 @@ int mw_seglog_sync (mw_db *db, uint32_t seg, uint64_t end) {
             atomic_store_explicit(&sh->sy_leader, 0, memory_order_release);
             atomic_fetch_add_explicit(&sh->sy_wake, 1, memory_order_release);
             mw_wake_u32(&sh->sy_wake, true);
-            if (frc != 0) return SQLITE_IOERR_FSYNC;
+            if (frc != 0) { atomic_store_explicit(&sh->sy_failed, 1, memory_order_release); return SQLITE_IOERR_FSYNC; }
             continue;                                                                    // (re-check: normally done now)
         }
         // A follower: the leader's fsync (started after our record was written) covers us, or the next one will: sleep until a sync finishes.

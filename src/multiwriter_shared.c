@@ -151,6 +151,15 @@ void mw_shared_close (mw_db *db, bool sole) {
 // metadata, publish) or torn (undo: the cursor goes back, the header is cleared). Either way nobody else saw the commit, and the log has exactly one record for every epoch.
 void mw_shared_repair (mw_db *db) {
     mw_shm *sh = db->shm;
+    {   // a holder that died in the roll to a new segment: the cursor is in the new segment but still at the offset of the old one; there is no record at the head of a segment that was just rolled to
+        uint32_t cs = atomic_load(&sh->sl_seg); uint64_t ce = atomic_load(&sh->sl_end);
+        if (ce > MW_SEG_HDR && !atomic_load(&sh->pend_epoch)) {
+            uint64_t e2 = 0, s2 = 0, l2 = 0; uint32_t d2 = 0, x2 = 0; int n2 = 0; uint32_t *pg2 = NULL; uint64_t *lc2 = NULL;
+            int prc = mw_seglog_peek(db, cs, MW_SEG_HDR, &e2, &d2, &n2, &pg2, &lc2, &x2, &l2, &s2);
+            free(pg2); free(lc2);
+            if (prc != SQLITE_OK) { atomic_store_explicit(&sh->sl_end, MW_SEG_HDR, memory_order_release); }
+        }
+    }
     uint64_t pe = atomic_load_explicit(&sh->pend_epoch, memory_order_acquire);
     if (!pe) return;
     uint64_t committed = atomic_load(&sh->committed_epoch);
@@ -405,11 +414,14 @@ int mw_shared_compact (mw_db *db, mw_compact_result *out) {
     if (db->cdc) { uint64_t lim = mw_cdc_safe_epoch(db); if (T > lim) T = lim; }       // (the metadata of the commits above the last flush lives in the log records only)
     base = atomic_load(&sh->base_epoch);
     if (T > base) atomic_store(&sh->compact_busy_T, T);
+    const uint64_t lp = atomic_load_explicit(&sh->log_pos, memory_order_acquire);        // (where the log ends with the commits up to T in it: they are visible before their fsync, so what goes into the file must first be durable in the log)
     if (getenv("MW_COMPACT_TRACE")) fprintf(stderr, "compact: t=%.0fms pid=%d waited=%.0fms base=%llu T=%llu visible=%llu safe=%llu log=%.1f MB\n", (double)(now_ns() / 1000000ull % 100000), (int)getpid(), (double)(now_ns() - t0) / 1e6, (unsigned long long)base, (unsigned long long)T, (unsigned long long)visible, (unsigned long long)(db->cdc ? mw_cdc_safe_epoch(db) : 0), (double)mw_seglog_bytes(db) / 1048576.0);
     mw_mp_unlock(db);
     if (T <= base) goto done;
     int fd = real_fd(db);
     if (fd < 0) { rc = SQLITE_CANTOPEN; goto done_busy; }
+    rc = mw_seglog_sync(db, (uint32_t)MW_LOG_GEN(lp), MW_LOG_END(lp));                    // (the pages of the commits up to T go into the file only when the log has them on the disk: otherwise a power failure leaves the file ahead of the log, and a b-tree of pages of different commits)
+    if (rc != SQLITE_OK) goto done_busy;
     c.db = db; c.fd = fd; c.pgsz = (size_t)db->store->pgsz;
     c.page = malloc(c.pgsz);
     if (!c.page) { rc = SQLITE_NOMEM; goto done_busy; }

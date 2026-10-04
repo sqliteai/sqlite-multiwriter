@@ -125,6 +125,15 @@ static uint64_t fnv64 (uint64_t h, const void *p, size_t n) {
     return h;
 }
 
+// A file that was created or renamed is in its directory only once the directory is flushed.
+static void sync_dir_of (const char *path) {
+    char *dir = sqlite3_mprintf("%s", path); if (!dir) return;
+    char *sl = strrchr(dir, '/'); if (sl) { if (sl == dir) sl[1] = 0; else *sl = 0; } else { sqlite3_free(dir); dir = sqlite3_mprintf("."); if (!dir) return; }
+    int fd = open(dir, O_RDONLY);
+    if (fd >= 0) { (void)mw_sys_fsync(fd); close(fd); }
+    sqlite3_free(dir);
+}
+
 static int pwrite_all (int fd, const void *buf, size_t n, off_t off) {
     const char *p = buf;
     while (n > 0) {
@@ -204,7 +213,7 @@ static int log_replay (mw_db *db, mw_store *st, int pgsz, uint64_t base, uint64_
     for (;;) {
         rec_hdr r;
         if ((uint64_t)off >= limit) break;
-        if (pread_all(db->logfd, &r, sizeof r, off) != SQLITE_OK) break;
+        { int prc = pread_all(db->logfd, &r, sizeof r, off); if (prc == SQLITE_IOERR_SHORT_READ) break; if (prc != SQLITE_OK) { rc = prc; break; } }       // (the end of the file ends the prefix; a read that failed does not: the records after it are not garbage)
         if (r.magic != REC_MAGIC || r.pgsz != (uint32_t)pgsz || r.npages == 0 || r.npages > (1u << 24)) break;
         size_t body = (size_t)r.npages * (4 + (size_t)pgsz) + r.ext_len;
         if ((uint64_t)off + REC_HDR_SIZE + body > fsz) break;                          // a torn / garbage header must not size an allocation
@@ -213,7 +222,7 @@ static int log_replay (mw_db *db, mw_store *st, int pgsz, uint64_t base, uint64_
             if (!nb) { rc = SQLITE_NOMEM; break; }
             buf = nb; rec_cap = body;
         }
-        if (pread_all(db->logfd, buf, body, off + REC_HDR_SIZE) != SQLITE_OK) break;
+        { int prc = pread_all(db->logfd, buf, body, off + REC_HDR_SIZE); if (prc == SQLITE_IOERR_SHORT_READ) break; if (prc != SQLITE_OK) { rc = prc; break; } }
         if (r.cksum != rec_cksum(db->log_salt, &r, buf, body)) break;                       // torn / stale
         if (prev_epoch && r.epoch != prev_epoch + 1) break;                             // gap: stop at the prefix
         prev_epoch = r.epoch;
@@ -259,11 +268,15 @@ int mw_log_open (mw_db *db, int pgsz) {
     bool valid = sb.st_size >= LOG_HDR_SIZE && pread_all(db->logfd, &h, sizeof h, 0) == SQLITE_OK &&
                  memcmp(h.magic, LOG_MAGIC, 8) == 0 && h.cksum == hdr_cksum(&h) && h.pgsz == (uint32_t)pgsz;
     uint64_t base = 1;
-    if (!valid) {                                            // new (or unusable) log: start empty from the real file
+    if (!valid && sb.st_size > (off_t)LOG_HDR_SIZE) {         // a log with records after a header that does not check out (another page size, another format, a damaged header) is not a new log: the commits in it are not thrown away in silence
+        return SQLITE_CORRUPT;
+    }
+    if (!valid) {                                            // new log (empty, or a header that was being written): start empty from the real file
         sqlite3_randomness(sizeof db->log_salt, &db->log_salt);
         if (mw_io_ftruncate(db->logfd, 0) != 0) return SQLITE_IOERR;
         int rc = hdr_write(db, (uint32_t)pgsz, base, db->log_salt);
         if (rc != SQLITE_OK) return rc;
+        sync_dir_of(db->logpath);                                                       // (the new file itself must be there after a power failure)
         db->log_off = LOG_HDR_SIZE;
         mw_log_stage_reset(db, db->log_off);
     } else {
@@ -282,7 +295,10 @@ int mw_log_open (mw_db *db, int pgsz) {
     uint64_t last = base; off_t off = LOG_HDR_SIZE;
     int rc = log_replay(db, st, pgsz, base, limit, &last, &off);
     if (rc != SQLITE_OK) return rc;
-    if (limit == UINT64_MAX && sb.st_size > off && mw_io_ftruncate(db->logfd, off) != 0) return SQLITE_IOERR;       // drop the torn tail (only the first process)
+    if (limit == UINT64_MAX && sb.st_size > off) {                                      // drop the torn tail (only the first process); durably: a record of it that survived a power failure could otherwise rejoin the log behind new commits that reuse its epochs
+        if (mw_io_ftruncate(db->logfd, off) != 0) return SQLITE_IOERR;
+        if (mw_io_fsync(db->logfd) != 0) return SQLITE_IOERR_FSYNC;
+    }
     db->log_off = (uint64_t)off;
     mw_log_stage_reset(db, db->log_off);
     pthread_mutex_lock(&st->seq_mu); mw_log_remap(db); pthread_mutex_unlock(&st->seq_mu);
@@ -342,6 +358,7 @@ int mw_db_recover (mw_db *db) {
     pthread_mutex_lock(&db->log_mu); E = db->synced_off; D = db->synced_upto; pthread_mutex_unlock(&db->log_mu);
     if (V != D || E < LOG_HDR_SIZE) goto out;
     if (mw_io_ftruncate(db->logfd, (off_t)E) != 0) goto out;
+    if (mw_io_fsync(db->logfd) != 0) goto out;                                          // (the records of the commits that were refused must not come back after a power failure, behind the commits that reuse their epochs)
     nst = mw_store_create(old->pgsz, old->base_dbsize);
     if (nst) nst->base_limit = old->base_limit;
     if (!nst) { rc = SQLITE_NOMEM; goto out; }
@@ -1132,6 +1149,7 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch, mw_log_prep *prep) {
     if (rc == SQLITE_OK) { rc = copy_range(db->logfd, nfd, pos, end, out); out += end - pos; }
     if (rc == SQLITE_OK && mw_io_fsync(nfd) != 0) rc = SQLITE_IOERR_FSYNC;
     if (rc == SQLITE_OK && mw_io_rename(tmp, db->logpath) != 0) rc = SQLITE_IOERR;
+    if (rc == SQLITE_OK) sync_dir_of(db->logpath);                                       // (the rename is durable before commits are acknowledged on the new file)
     if (rc == SQLITE_OK) mw_fault_hit(MW_CRASH_LOG_RENAME);
     if (rc != SQLITE_OK) { close(nfd); unlink(tmp); sqlite3_free(tmp); return rc; }
     sqlite3_free(tmp);

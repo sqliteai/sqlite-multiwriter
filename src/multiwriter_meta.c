@@ -623,7 +623,7 @@ int mw_ext_walk (const uint8_t *ext, uint32_t len, uint64_t epoch, mw_ext_row_fn
         if (!row_cb) { p += glen; continue; }
         if (r_var(&p, end, &bucket) || r_var(&p, end, &nrows)) { free(cells); return -1; }
         for (uint64_t i = 0; i < nrows; i++) {
-            uint64_t tbl, pklen, nc; if (r_var(&p, end, &tbl) || r_var(&p, end, &pklen) || p + pklen > end) { free(cells); return -1; }
+            uint64_t tbl, pklen, nc; if (r_var(&p, end, &tbl) || r_var(&p, end, &pklen) || pklen > (uint64_t)(end - p)) { free(cells); return -1; }
             const uint8_t *pk = p; p += pklen;
             if (r_var(&p, end, &nc) || nc > (1u << 20)) { free(cells); return -1; }
             if ((int)nc > ccap) { ccap = (int)nc * 2 + 4; mw_mcell *nm = realloc(cells, (size_t)ccap * sizeof *nm); if (!nm) { free(cells); return -1; } cells = nm; }

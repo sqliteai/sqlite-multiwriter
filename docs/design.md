@@ -256,6 +256,22 @@ the metadata tests with the store under pressure.
   time in the queue for the publication lock (`mw_mp_lock`), which one process holds at a time for ~49 us (47 of them the relocation of the new pages, the append of the record and the install in the shared index); 16 processes
   fill 72% of that, so the ceiling is ~20k tx/s and the measure 14-16k. Shorter holds would need the record to be copied outside the lock or a log for each process: a redesign, not a change. The limit of the backlog
   of the merges is now 6 times the limit of level 0 (`MW_META_ALL_MULT`, was 3): 16 threads, 60 s, two runs each, 32.05k -> 32.7k tx/s, p99 1.88 -> 1.77 ms, RSS 1.38 -> 1.2 GB.
+- **The other workloads (measured; `bench/results/new_workloads_2026-10-04.md`).** 16 threads / 8 processes against stock SQLite (WAL, FULL), everything tracked. Independent updates 80.7k / 44.9k tx/s against 14.6k / 14.5k;
+  mixed read-write 380k / 202k against 74k / 94k; hot rows, the same page, other columns of a row 37-39k against 11-12k; inserts (uuid, int, autoincrement, crdt) 28-33k against 11-17k; wide rows 32k / 15k against 8k;
+  read only the same with threads (861k, 883k) and twice SQLite with processes (559k, 283k). Retries: 0 for the independent and read ones, ~10-13% of the transactions with threads and 78-86% with processes on
+  the contended ones (hot, samepage, cols, inserts: processes retry on a conflict of the shared index), 0 given up in all but one run (below). Where it does not win: **random keys** (UUID-like bulk, 100 rows spread over the
+  whole key space) every engine is bound by the cache misses: 449 / 362 tx/s against 454 / 460 (with processes 21% under SQLite, 54% retries, and one transaction in the thread run that gave up after 1000 retries);
+  **transactions that are held open 5 ms on hot rows or on the same page** 194 against 139 (the engine serialises what conflicts, as it should, but a fifth of what the independent rows give: 16 writers
+  that hold their page for 5 ms each can only commit one at a time); **a long reader** (a connection that keeps its snapshot for the whole run) 4.6k / 4.2k tx/s against 12.2k / 11.4k and 806 MB of memory, see next.
+- **A reader that never ends (known limit, not fixed).** The compactor writes the pages of the log into the file only up to the oldest snapshot still in use (a reader that is older than the file would read a page that
+  is newer than its snapshot, and the garbage collector cannot drop the versions that it needs): with a reader pinned at epoch 2 nothing is compacted, the log fills to 16 times its limit and every commit is delayed in proportion
+  (0.5 ms at the limit, up to 50 ms; at 768 MB a commit waits for room, at most 20 s), the retained versions fill the memory (755 MB in 22 s, `reclaimed=0`), and the writers are down to 2.5k tx/s. SQLite has the
+  same pin (its WAL cannot be checkpointed) but lets the log grow and does not slow down. What would remove it is keeping what the old reader needs apart from the file (the pre-images of the pages that the compactor overwrites,
+  as a rollback journal does), or ending a reader that stays too long; neither is done: it is a design decision.
+- **Ten minutes at 16 threads (soak, bulk, tracked, a database that grows to 115 GB).** 22.6k tx/s on average (33k in the first minute: the numbers fall with the size of the database and with the heat of the machine), RSS 0.8 GB
+  at 30 s, 2.6 GB at 211 s and 3.4-3.55 GB from 300 s on (it stops growing), the log 13.6 MB at the end, the files of the engine 5-372 MB, the backlog of the merges bounded (58 age groups at level 0, 187 in all, 24 thousand
+  runs), 4393 merges of 2.2 billion rows, 2.05 million commits delayed by the back-pressure (1778 s of the 9600 thread-seconds). The database of 115 GB opens at once (18 MB of RSS to read it); the integrity check takes 30 s.
+  One transaction ended with an error in this run, as in 3 of ~60 other runs of 10-60 s (never in 20 runs with `MW_BENCH_DEBUG=1`, which prints the error code and message; not found yet).
 
 ## Capture and DDL
 

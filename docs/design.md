@@ -211,6 +211,15 @@ the metadata tests with the store under pressure.
   range differ in their last byte. `bench/bench_merge.c`: 14.3 -> 8.8 bytes a row stored (restart every 16 rows: 9.1; 64: 8.6); in a real run of the benchmark 14.6 -> 10.0 bytes a row in the slots (the
   Bloom filter of the meta is 1.25 more, and the padding of the last slot of a block). Less in the log (the commits of the metadata) and less to compress and decompress; the merge CPU is the same (47 ns
   a row). 16 threads tracked 29.6k -> 32.2k tx/s (three alternating pairs of 30 s), 4 processes 14.9k -> 15.5k.
+- **The Bloom filter of a run (measured; the default stays).** It is 10 bits a row (1.25 of the ~11.3 bytes a row that a run costs in the file, 115 MB of memory for the 2800 runs of a 20 s benchmark) with 7
+  probes. Its CPU is nothing (`bench_merge` with 2 bits a row: the same 47 ns a row; the reading back of the metas in `man_load`: 31 samples in 40 thousand) and a filter of 2 bits a row changed
+  the throughput by +1%: what it costs is bytes and memory. The size is now chosen when a run is built (`mw_meta_bloom_bits=<n>` in the URI or `MW_META_BLOOM_BITS`, 2..32; the number of probes follows,
+  and is kept in the low bits of the size in the meta of the run - a size is a multiple of 64 - so every run says how it was built, and the first metas, with 0 there, mean 7). What a bit
+  buys, measured on 20 thousand absent keys (`mw_runs`): 6 bits 5.6% of false positives, 8 bits 2.2%, 10 bits 0.83%, 12 bits 0.33%. In the benchmark (16 threads, 30 s, two runs each): 10 bits 32.0k tx/s
+  1462 MB, 8 bits 32.4k 1360 MB, 6 bits 32.9k 1120 MB. A false positive costs a read of a block in every run whose key range holds the key, and the runs are many (a hundred or more groups behind a busy
+  merger), so a lookup of a row that is not in the memory table pays 0.8, 2.2 or 5.6 reads for 10, 8 or 6 bits per 100 runs: the default is kept for the databases that update rows from the file;
+  a database that mostly inserts can take 6 and save a fifth of its memory. (The memory that goes with the bits is several times the size of the filters, 340 MB for 4 bits a row against 46 MB of
+  filters: the allocations of the builders are most of it, not looked into further.)
 
 ## Capture and DDL
 

@@ -94,6 +94,23 @@ static void merge_some (void) {
 }
 
 int main (void) {
+    // the size of the filter: false positives for 8, 10 and 12 bits a row, and the run still decodes (the number of probes is in its meta)
+    for (int bpr = 6; bpr <= 12; bpr += 2) {
+        rs_set_bloom_bits(bpr);
+        const uint32_t N = 20000; rs_builder *bld = rs_builder_new(N, emit_blk, NULL); cur_run = next_id++; int64_t dvm; uint8_t *meta; size_t ml; uint64_t nr; uint32_t nb;
+        for (uint32_t i = 0; i < N; i++) { uint8_t pk[8]; for (int q = 0; q < 8; q++) pk[q] = (uint8_t)((uint64_t)i * 2 >> (56 - 8 * q)); rs_key k = { 1, pk, 8 }; CHECK(rs_builder_add(bld, &k, 1, (const uint8_t *)"x", 1) == 0); }
+        CHECK(rs_builder_finish(bld, &meta, &ml, &nr, &nb, &dvm) == 0);
+        rs_run *r = rs_run_decode(cur_run, 1, 0, nr, nb, dvm, meta, ml); CHECK(r != NULL); free(meta);
+        int fp = 0, miss = 0;
+        for (uint32_t i = 0; i < N; i++) { uint8_t pk[8]; for (int q = 0; q < 8; q++) pk[q] = (uint8_t)((uint64_t)i * 2 >> (56 - 8 * q)); rs_key k = { 1, pk, 8 }; if (!rs_run_maybe(r, &k)) miss++; }
+        for (uint32_t i = 0; i < N; i++) { uint8_t pk[8]; for (int q = 0; q < 8; q++) pk[q] = (uint8_t)((uint64_t)(i * 2 + 1) >> (56 - 8 * q)); rs_key k = { 1, pk, 8 }; if (rs_run_maybe(r, &k)) fp++; }
+        printf("filter %d bits a row, %d probes: %d of %u absent keys passed (%.2f%%)\n", bpr, r->bk, fp, N, 100.0 * fp / N);
+        CHECK(miss == 0);
+        CHECK(fp < (int)(N * (bpr >= 10 ? 0.02 : bpr >= 8 ? 0.04 : 0.09)));
+        rs_run_unref(r);
+    }
+    rs_set_bloom_bits(10);
+
     // a block of the first form (offsets of every row, whole keys) is still read
     { uint8_t blk[200]; size_t w = 0; blk[w++] = 1; uint32_t n = 2; memcpy(blk + w, &n, 4); w += 4;
       size_t offs_at = w; w += 8;

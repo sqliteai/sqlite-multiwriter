@@ -9,6 +9,7 @@
 #include <stdatomic.h>
 #include <string.h>
 #include "multiwriter_internal.h"
+#include "multiwriter_runs.h"
 
 static sqlite3_vfs  mw_vfs;
 static sqlite3_vfs *mw_root = NULL;
@@ -270,6 +271,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
                 return crc;
             }
         }
+        if (db->cdc && sqlite3_uri_parameter(name, "mw_meta_bloom_bits")) rs_set_bloom_bits((int)sqlite3_uri_int64(name, "mw_meta_bloom_bits", 10));
         if (db->cdc && sqlite3_uri_parameter(name, "mw_meta_cache_mb")) mw_cdc_set_cache_mb(db, (int)sqlite3_uri_int64(name, "mw_meta_cache_mb", 64));
         lane->norebase = sqlite3_uri_boolean(name, "mw_norebase", 0) != 0;
         if (want_sys) lane->sys = true;

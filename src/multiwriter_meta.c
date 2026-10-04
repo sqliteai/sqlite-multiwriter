@@ -44,6 +44,7 @@ mw_meta *mw_meta_new (struct mw_db *db) {
     mw_meta *m = calloc(1, sizeof *m);
     if (!m) return NULL;
     m->db = db; m->shared = db->shared; m->cap_bytes = 64u << 20;
+    { const char *eb = getenv("MW_META_BLOOM_BITS"); if (eb && atoi(eb) > 0) rs_set_bloom_bits(atoi(eb)); }
     const char *e = getenv("MW_META_CACHE_MB"); if (e && atol(e) > 0) m->cap_bytes = (size_t)atol(e) << 20;
     m->fanout = 8; m->part_rows = 1u << 15;
     { const char *e = getenv("MW_META_FANOUT"); if (e && atoi(e) >= 2) m->fanout = atoi(e); e = getenv("MW_META_PART_ROWS"); if (e && atoll(e) >= 1) m->part_rows = (uint64_t)atoll(e); }       // (tests: merge at every chance, in small parts)

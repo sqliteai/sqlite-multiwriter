@@ -43,10 +43,11 @@ typedef struct rs_run {
     uint32_t nfence; uint32_t *ftbl, *foff, *flen; int64_t *fdv; uint8_t *farena;
     uint32_t *slen, *loff, *llen; uint8_t *larena;                                     // per block: its stored length and the locator the store gave it (opaque here), in larena     // first key of every block (table, offset and length in farena) and the largest dv in it
     uint8_t *kmaxk; uint32_t kmaxtbl, kmaxl;                                           // the last key of the run
-    uint64_t *bloom; uint64_t nbits;
+    uint64_t *bloom; uint64_t nbits; int bk;                                            // bk: probes of the filter
     uint8_t *mloc; uint32_t mlocl;                                                      // where the store keeps the meta of the run itself (opaque; set by the store)
     _Atomic int refs;
 } rs_run;
+void rs_set_bloom_bits (int bits_per_row);                                  // the filters of the runs built from now on (default 10; 2..32)
 rs_run *rs_run_decode (int64_t id, int64_t age, int lvl, uint64_t nrows, uint32_t nblk, int64_t dvmax, const uint8_t *meta, size_t len);   // NULL: not a meta
 void rs_run_ref (rs_run *r);
 void rs_run_unref (rs_run *r);

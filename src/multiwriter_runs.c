@@ -33,16 +33,21 @@ uint64_t rs_key_hash (const rs_key *k) {
 }
 
 // ---- Bloom ----
-#define BLOOM_K 7
+// The size of the filter of a run is chosen when it is built: `bpr` bits a row (10: a false positive in 0.8% of the probes; 8: 2.2%; 6: 5.6%) and the number of probes that suits it, kept in the low bits of the
+// size in the meta of the run (they are free: a size is a multiple of 64; 0: 7 probes, as the first metas had).
 #define BLOOM_BITS_PER_ROW 10
+#define BLOOM_K_LEGACY 7
+static _Atomic int g_bloom_bpr = BLOOM_BITS_PER_ROW;
+void rs_set_bloom_bits (int bpr) { atomic_store(&g_bloom_bpr, bpr < 2 ? 2 : bpr > 32 ? 32 : bpr); }
+static int bloom_k_for (int bpr) { int k = (int)(0.693 * bpr + 0.5); return k < 1 ? 1 : k > 16 ? 16 : k; }
 static uint64_t bloom_pos (uint64_t nbits, uint64_t h1, uint64_t h2, int i) { uint64_t h = h1 + (uint64_t)i * h2; return (uint64_t)(((__uint128_t)h * nbits) >> 64); }
-static void bloom_add (uint64_t *bits, uint64_t nbits, uint64_t h) {
+static void bloom_add (uint64_t *bits, uint64_t nbits, int k, uint64_t h) {
     uint64_t h1 = h, h2 = (h >> 17) | (h << 47) | 1;
-    for (int i = 0; i < BLOOM_K; i++) { uint64_t p = bloom_pos(nbits, h1, h2, i); bits[p >> 6] |= 1ull << (p & 63); }
+    for (int i = 0; i < k; i++) { uint64_t p = bloom_pos(nbits, h1, h2, i); bits[p >> 6] |= 1ull << (p & 63); }
 }
-static bool bloom_test (const uint64_t *bits, uint64_t nbits, uint64_t h) {
+static bool bloom_test (const uint64_t *bits, uint64_t nbits, int k, uint64_t h) {
     uint64_t h1 = h, h2 = (h >> 17) | (h << 47) | 1;
-    for (int i = 0; i < BLOOM_K; i++) { uint64_t p = bloom_pos(nbits, h1, h2, i); if (!(bits[p >> 6] & (1ull << (p & 63)))) return false; }
+    for (int i = 0; i < k; i++) { uint64_t p = bloom_pos(nbits, h1, h2, i); if (!(bits[p >> 6] & (1ull << (p & 63)))) return false; }
     return true;
 }
 
@@ -174,7 +179,8 @@ rs_run *rs_run_decode (int64_t id, int64_t age, int lvl, uint64_t nrows, uint32_
     if (!get_var(&p, end, &kt) || !get_var(&p, end, &kl) || kl > (uint64_t)(end - p)) goto bad;
     r->kmaxk = malloc(kl ? kl : 1); if (!r->kmaxk) goto bad;
     memcpy(r->kmaxk, p, kl); p += kl; r->kmaxtbl = (uint32_t)kt; r->kmaxl = (uint32_t)kl;
-    if (!get_var(&p, end, &v) || v == 0 || (v & 63) || v / 8 > (uint64_t)(end - p) || v > (1ull << 40)) goto bad;
+    if (!get_var(&p, end, &v) || (v & ~63ull) == 0 || (v & 63) > 16 || (v & ~63ull) / 8 > (uint64_t)(end - p) || v > (1ull << 40)) goto bad;
+    r->bk = (v & 63) ? (int)(v & 63) : BLOOM_K_LEGACY; v &= ~63ull;
     r->nbits = v; r->bloom = malloc((size_t)(v / 8));
     if (!r->bloom) goto bad;
     memcpy(r->bloom, p, (size_t)(v / 8));
@@ -200,7 +206,7 @@ int rs_run_block_of (const rs_run *r, const rs_key *k) {
 bool rs_run_maybe (const rs_run *r, const rs_key *k) {
     rs_key lo, hi; rs_run_range(r, &lo, &hi);
     if (rs_key_cmp(k, &lo) < 0 || rs_key_cmp(k, &hi) > 0) return false;
-    return bloom_test(r->bloom, r->nbits, rs_key_hash(k));
+    return bloom_test(r->bloom, r->nbits, r->bk, rs_key_hash(k));
 }
 
 // ---- building ----
@@ -213,7 +219,7 @@ struct rs_builder {
     uint32_t nf, capf; uint32_t *ftbl, *foff, *flen; int64_t *fdv; uint8_t *farena; size_t farn, farcap;
     uint32_t *slen, *loff, *llen; uint8_t *larena; size_t larn, larcap;
     uint8_t *last; size_t lastcap; uint32_t lasttbl, lastl; int64_t prevdv;
-    uint64_t *bloom; uint64_t nbits;
+    uint64_t *bloom; uint64_t nbits; int bk;
     bool defer; uint8_t **dblk; uint32_t *dlen, ndblk, capdblk;      // deferred: the finished blocks are kept (their places are given when the run is finished)
 };
 rs_builder *rs_builder_new_deferred (uint64_t nrows_hint) {
@@ -222,7 +228,8 @@ rs_builder *rs_builder_new_deferred (uint64_t nrows_hint) {
 rs_builder *rs_builder_new (uint64_t nrows_hint, rs_emit_fn emit, void *ctx) {
     rs_builder *b = calloc(1, sizeof *b); if (!b) return NULL;
     b->emit = emit; b->ctx = ctx;
-    uint64_t bits = nrows_hint * BLOOM_BITS_PER_ROW; if (bits < 1024) bits = 1024; bits = (bits + 63) & ~63ull;
+    int bpr = atomic_load(&g_bloom_bpr); b->bk = bloom_k_for(bpr);
+    uint64_t bits = nrows_hint * (uint64_t)bpr; if (bits < 1024) bits = 1024; bits = (bits + 63) & ~63ull;
     b->nbits = bits; b->bloom = calloc((size_t)(bits / 64), 8);
     if (!b->bloom) { free(b); return NULL; }
     return b;
@@ -305,7 +312,7 @@ int rs_builder_add (rs_builder *b, const rs_key *k, int64_t dv, const uint8_t *c
     if (dv > b->dvmax) b->dvmax = dv;
     if (k->pklen > b->lastcap) { size_t nc = k->pklen * 2 + 64; uint8_t *nl = realloc(b->last, nc); if (!nl) return -1; b->last = nl; b->lastcap = nc; }
     memcpy(b->last, k->pk, k->pklen); b->lasttbl = k->tbl; b->lastl = k->pklen;
-    bloom_add(b->bloom, b->nbits, rs_key_hash(k));
+    bloom_add(b->bloom, b->nbits, b->bk, rs_key_hash(k));
     b->total++;
     if (b->nbytes + (size_t)((b->noffs + RS_RESTART - 1) / RS_RESTART) * 4 >= RS_BLOCK_TARGET) return flush_block(b);
     return 0;
@@ -323,7 +330,7 @@ static int builder_finish (rs_builder *b, bool keep, const uint8_t *const *locs,
         w += put_var(m + w, b->slen[i]); w += put_var(m + w, ll); memcpy(m + w, lp, ll); w += ll;
     }
     w += put_var(m + w, b->lasttbl); w += put_var(m + w, b->lastl); memcpy(m + w, b->last, b->lastl); w += b->lastl;
-    w += put_var(m + w, b->nbits); memcpy(m + w, b->bloom, (size_t)(b->nbits / 8)); w += (size_t)(b->nbits / 8);
+    w += put_var(m + w, b->nbits | (uint64_t)b->bk); memcpy(m + w, b->bloom, (size_t)(b->nbits / 8)); w += (size_t)(b->nbits / 8);
     *meta = m; *metalen = w; *nrows = b->total; *nblk = b->nf; *dvmax = b->dvmax;
     if (!keep) rs_builder_free(b);
     return 0;

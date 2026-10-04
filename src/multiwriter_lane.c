@@ -634,6 +634,7 @@ int mw_lane_open_main (mw_file *f, mw_lane *lane) {
     sqlite3_mutex_enter(db->mu);
     if (!db->store) {
         db->store = db->shared ? mw_store_create_light(pgsz, (uint32_t)(size / pgsz)) : mw_store_create(pgsz, (uint32_t)(size / pgsz));
+        if (db->store && db->base_cache_bytes) db->store->base_limit = db->base_cache_bytes;
         if (!db->store) rc = SQLITE_NOMEM;
         else {
             db->store->reserved = h[20];

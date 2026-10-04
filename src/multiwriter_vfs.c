@@ -10,6 +10,7 @@
 #include <string.h>
 #include "multiwriter_internal.h"
 #include "multiwriter_runs.h"
+#include "multiwriter_io.h"
 
 static sqlite3_vfs  mw_vfs;
 static sqlite3_vfs *mw_root = NULL;
@@ -271,8 +272,15 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
                 return crc;
             }
         }
-        if (db->cdc && sqlite3_uri_parameter(name, "mw_meta_bloom_bits")) rs_set_bloom_bits((int)sqlite3_uri_int64(name, "mw_meta_bloom_bits", 10));
-        if (db->cdc && sqlite3_uri_parameter(name, "mw_meta_cache_mb")) mw_cdc_set_cache_mb(db, (int)sqlite3_uri_int64(name, "mw_meta_cache_mb", 64));
+        if (sqlite3_uri_parameter(name, "mw_fullfsync") ? sqlite3_uri_boolean(name, "mw_fullfsync", 0) : (getenv("MW_FULLFSYNC") != NULL)) mw_set_fullfsync(1);
+        // mw_profile=small (or MW_PROFILE=small): for a phone or a small server, where 300 MB for a process is too much: the caches (memory table of the metadata, pages of the real file kept in memory) at 8 MB
+        // instead of 64, filters of 8 bits a row, a log of 16 MB before it is compacted. Every one of them can still be set by its own parameter.
+        const char *prof = sqlite3_uri_parameter(name, "mw_profile"); if (!prof) prof = getenv("MW_PROFILE");
+        const bool small = prof && !strcmp(prof, "small");
+        if (db->cdc && (small || sqlite3_uri_parameter(name, "mw_meta_bloom_bits"))) rs_set_bloom_bits((int)sqlite3_uri_int64(name, "mw_meta_bloom_bits", 8));
+        if (db->cdc && (small || sqlite3_uri_parameter(name, "mw_meta_cache_mb"))) mw_cdc_set_cache_mb(db, (int)sqlite3_uri_int64(name, "mw_meta_cache_mb", small ? 8 : 64));
+        if (small || sqlite3_uri_parameter(name, "mw_base_cache_mb")) { db->base_cache_bytes = (uint64_t)sqlite3_uri_int64(name, "mw_base_cache_mb", small ? 8 : 64) << 20; if (db->store) db->store->base_limit = db->base_cache_bytes; }
+        if (small && !sqlite3_uri_parameter(name, "mw_log_max_mb")) db->log_max_bytes = 16ull << 20;
         lane->norebase = sqlite3_uri_boolean(name, "mw_norebase", 0) != 0;
         if (want_sys) lane->sys = true;
         lane->noreloc = sqlite3_uri_boolean(name, "mw_noreloc", 0) != 0;

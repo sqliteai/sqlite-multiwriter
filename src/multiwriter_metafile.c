@@ -767,7 +767,7 @@ int mw_metafile_export (mw_meta *m, sqlite3 *c, int64_t since, int64_t upto, mw_
 uint32_t mw_meta_run_pressure (mw_meta *m) {
     static int max_l0 = -1; if (max_l0 < 0) { const char *e = getenv("MW_META_MAX_RUNS"); max_l0 = e && atoi(e) > 0 ? atoi(e) : 48; }
     int l0, all; rsx_backlog(m->rsx, &l0, &all);
-    static int mult = -1; if (mult < 0) { const char *e = getenv("MW_META_ALL_MULT"); mult = e && atoi(e) > 0 ? atoi(e) : 3; }
+    static int mult = -1; if (mult < 0) { const char *e = getenv("MW_META_ALL_MULT"); mult = e && atoi(e) > 0 ? atoi(e) : 6; }
     int over = l0 - max_l0, over_all = all - max_l0 * mult; if (over_all > over) over = over_all;
     if (over <= 0) return 0;
     uint32_t w = (uint32_t)over * 150u; return w > 20000u ? 20000u : w;

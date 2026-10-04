@@ -335,6 +335,7 @@ struct mw_db {
     uint64_t          stage_r;             // ring size (power of two)
     uint64_t          written_end;         // end offset of the contiguous prefix of records that were copied (log_mu)
     uint64_t          flushed_off;         // everything below is in the file (log_mu)
+    uint64_t          base_cache_bytes;    // cap of the pages of the real file kept in memory as epoch-0 versions (0: the default, 64 MB); mw_base_cache_mb / mw_profile=small
     uint64_t          synced_off;          // everything below is durable (log_mu)
     int               sync_waiters;        // threads waiting on sync_cv (log_mu)
     uint64_t          written_upto;        // all records with epoch <= this have been pwritten

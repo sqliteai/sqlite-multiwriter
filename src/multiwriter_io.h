@@ -43,7 +43,17 @@ static inline ssize_t mw_io_pwritev (int fd, const struct iovec *iov, int cnt, o
     return pwritev(fd, iov, cnt, off);
 }
 static inline ssize_t mw_io_pread (int fd, void *p, size_t n, off_t off) { int e = mw_io_hit(MW_IO_READ, NULL); if (e) { errno = e; return -1; } return pread(fd, p, n, off); }
-static inline int mw_io_fsync (int fd) { int e = mw_io_hit(MW_IO_SYNC, NULL); if (e) { errno = e; return -1; } return fsync(fd); }
+// Where `fsync` leaves the data in the disk's own cache (macOS: the drive may still lose it at a power failure) the data goes to the platform with F_FULLFSYNC when `mw_fullfsync` is set (URI mw_fullfsync=1,
+// MW_FULLFSYNC=1; the same promise as PRAGMA fullfsync of SQLite, which is off by default there too). Linux's fsync already asks the device to flush.
+extern _Atomic int mw_fullfsync;
+static inline int mw_sys_fsync (int fd) {
+#if defined(__APPLE__) && defined(F_FULLFSYNC)
+    if (atomic_load_explicit(&mw_fullfsync, memory_order_relaxed) && fcntl(fd, F_FULLFSYNC) == 0) return 0;      // (when the file system does not know it: the plain fsync, as SQLite does)
+#endif
+    return fsync(fd);
+}
+void mw_set_fullfsync (int on);
+static inline int mw_io_fsync (int fd) { int e = mw_io_hit(MW_IO_SYNC, NULL); if (e) { errno = e; return -1; } return mw_sys_fsync(fd); }
 static inline int mw_io_msync (void *a, size_t n, int fl) { int e = mw_io_hit(MW_IO_SYNC, NULL); if (e) { errno = e; return -1; } return msync(a, n, fl); }
 static inline int mw_io_ftruncate (int fd, off_t n) { int e = mw_io_hit(MW_IO_TRUNC, NULL); if (e) { errno = e; return -1; } return ftruncate(fd, n); }
 static inline int mw_io_rename (const char *a, const char *b) { int e = mw_io_hit(MW_IO_RENAME, NULL); if (e) { errno = e; return -1; } return rename(a, b); }

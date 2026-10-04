@@ -243,6 +243,19 @@ the metadata tests with the store under pressure.
   visiting the entries again (a cache miss each: it was a quarter of its time before the rows were packed into the stripes' buffers) or the entries copying their cells when a flush ends (the same visit);
   that is at most 11% of what is left, paid in the CPU of the thread that is already the busiest. The filters (180 MB) are the one big item, and shrinking them trades false positives for lookups
   (`mw_meta_bloom_bits`). The base cache (54 MB) and the memory table (64 MB) are caps, set by `MW_META_CACHE_MB`.
+- **Durability against a power failure (F_FULLFSYNC).** On macOS `fsync` leaves the data in the drive's cache; SQLite has the same gap and closes it with `PRAGMA fullfsync` (off by default). The log, the
+  compaction and the other files of the engine now go through `mw_sys_fsync`, which uses `fcntl(F_FULLFSYNC)` when `mw_fullfsync=1` is in the URI (or `MW_FULLFSYNC=1`; process-wide; if the file system
+  does not know it, the plain `fsync`, as SQLite does). Linux's `fsync` already flushes the device. Off by default, like SQLite. The price is the drive's: stock SQLite (WAL, FULL, one writer) 10.1k -> 264 tx/s; here
+  one thread 9.9k -> 272 tx/s, but 16 threads 33.5k -> 1532 tx/s: the group commit shares each flush (5.8 times SQLite's best case). A real power cut was not tried (the machine is the only one); what is tested is that the path
+  works, that an injected failure of the flush fails the commit, and that the data is there after a reopen and a SIGKILL (`mw_fullfsync`; the staged-log and durability tests also pass with it on).
+- **A profile for small devices (`mw_profile=small`, `MW_PROFILE=small`).** The memory table of the metadata and the base cache of pages at 8 MB instead of 64 (`mw_meta_cache_mb`, `mw_base_cache_mb`), filters
+  of 8 bits a row, a log of 16 MB before it is compacted. One thread, bulk inserts for 15 s: RSS 304 -> 165 MB (a 2 s run: 192 -> 95 MB), tx/s the same (9.7k -> 10.1k); 16 threads 856 -> 652 MB with
+  the same tx/s. What is left at one thread is the run metas (44 MB: the filters), the chain directory (19 MB) and the buffers of SQLite. Test `mw_profile`.
+- **The single thread and the many processes (analysed, nothing changed).** One thread tracked is 9.3-9.9k tx/s against SQLite's 12.3k: 26% of the 100 us of a commit is the wait for the fsync, 11% is the capture, 11% the
+  apply of the cells and 5% the append of the log record; with one committer the apply cannot overlap anything but the fsync, and the hand-over to another thread costs as much as it hides. Many processes: each spends 58% of its
+  time in the queue for the publication lock (`mw_mp_lock`), which one process holds at a time for ~49 us (47 of them the relocation of the new pages, the append of the record and the install in the shared index); 16 processes
+  fill 72% of that, so the ceiling is ~20k tx/s and the measure 14-16k. Shorter holds would need the record to be copied outside the lock or a log for each process: a redesign, not a change. The limit of the backlog
+  of the merges is now 6 times the limit of level 0 (`MW_META_ALL_MULT`, was 3): 16 threads, 60 s, two runs each, 32.05k -> 32.7k tx/s, p99 1.88 -> 1.77 ms, RSS 1.38 -> 1.2 GB.
 
 ## Capture and DDL
 

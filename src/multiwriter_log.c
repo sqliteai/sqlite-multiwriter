@@ -85,6 +85,8 @@ bool mw_fault_hit (mw_fault_t f) {
 
 // ---- I/O fault injection (multiwriter_io.h) ----
 _Atomic int mw_io_armed;
+_Atomic int mw_fullfsync;
+void mw_set_fullfsync (int on) { atomic_store(&mw_fullfsync, on != 0); }
 static _Atomic long io_left, io_calls; static _Atomic int io_kinds, io_err, io_sticky, io_short, io_fired;
 void mw_io_fault_arm (int kinds, long nth, int err, int sticky, int shortw) {
     atomic_store(&io_calls, 0); atomic_store(&io_fired, 0); atomic_store(&io_kinds, kinds); atomic_store(&io_err, err ? err : EIO);
@@ -341,6 +343,7 @@ int mw_db_recover (mw_db *db) {
     if (V != D || E < LOG_HDR_SIZE) goto out;
     if (mw_io_ftruncate(db->logfd, (off_t)E) != 0) goto out;
     nst = mw_store_create(old->pgsz, old->base_dbsize);
+    if (nst) nst->base_limit = old->base_limit;
     if (!nst) { rc = SQLITE_NOMEM; goto out; }
     nst->reserved = old->reserved;
     for (int i = 0; i < db->nrext; i++) free(db->rext[i].data);

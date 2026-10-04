@@ -171,6 +171,16 @@ the metadata tests with the store under pressure.
   without limit: 960 age groups after 20 s). More merger threads (levels split between 2, 3, 4 threads), a fanout of 16 or 32 and bigger parts all measured the same or worse: the merges do not
   scale because they share the page store and the write turn of the file tables. The way ahead is a cheaper merge (fewer small transactions, reading the inputs without going through the page
   store), not more CPU saved in the commit.
+- **A cheaper merge (measured).** The merger thread is 100% busy at 16 threads: of its ~55 ms a merge, ~22% reads the input blocks (a snapshot and four slot reads through the page store each), ~35% writes the
+  output parts (small transactions: the commit is 60% of them) and the rest is CPU (decode, heap merge, LZ4). Changes: the run numbers of a merge are taken once (a range of 16) instead of one transaction a
+  part; the merge reads without checking that the run is still listed when this process alone removes runs (thread mode); and a finished part is written by a thread of its own with a connection of its own
+  while the next one is merged (thread mode only: with processes it cost more than it gave). 16 threads 28.7k -> 29.5k tx/s (30 s, three pairs), 4 and 8 processes unchanged.
+  Tried and dropped: the levels split among 2-4 merger threads; one merge cut into key ranges merged by 2 threads (pivots at fences of the largest input); merge connections with `synchronous=OFF` (the
+  order of the log makes it safe, but the commit time barely moved). None of them gave more, because the small transactions of the merge, the flush and the writers' own commits take turns on
+  the same b-trees (`rsx_wlock`) and meet in the page store.
+- **What the page store costs everybody.** 10% of the reads of a page wait for the stripe lock, and 85% of those are for page 1: the header is rewritten by every commit that grows the file (the database
+  size), and every transaction reads it. The workers spend 8.5% (untracked) to 13.6% (tracked) of their time in `mw_store_read` waiting; more spinning (`MW_SPIN_US` 500, 5000) made it worse. This is
+  the next lever for both variants: a lock-free path for the newest version of page 1 (the size and the cookie are already kept in atomics).
 
 ## Capture and DDL
 

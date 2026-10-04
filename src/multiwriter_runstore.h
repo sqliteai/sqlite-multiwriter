@@ -22,6 +22,7 @@ typedef struct mw_rstore mw_rstore;
 typedef struct mw_rman mw_rman;                        // a version of the list of runs (immutable, counted)
 
 mw_rstore *rsx_new (size_t cache_bytes);
+void rsx_set_exclusive (mw_rstore *s, bool on);   // this process is the only one that removes runs, and one thread merges: the merge reads its inputs without checking that they are still listed
 void rsx_free (mw_rstore *s);
 
 // ---- reading (the caller has a transaction open on `c`: the runs and the blocks must be of one snapshot) ----
@@ -56,7 +57,7 @@ int rsx_tx_drop_table (rsx_tx *t, sqlite3 *c, uint32_t tbl, int64_t dv);
 int rsx_tx_finish (rsx_tx *t, sqlite3 *c);                                  // the version and counters into mw_state; call before COMMIT
 void rsx_tx_end (rsx_tx *t, bool committed);                                // after COMMIT (or ROLLBACK): publishes the new list of runs, or forgets it; frees t
 // one round of merging: the runs of the lowest level that has `fanout` or more age groups into the next level. Returns 1 if it merged, 0 if there was nothing to do, <0 an error.
-int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, int fanout, uint64_t part_rows);
+int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, sqlite3 *wr2, int fanout, uint64_t part_rows);   // wr2: a connection of its own for the thread that writes the finished parts (NULL: the merge writes them itself)
 
 // how far the merges are behind: the age groups at level 0 and in all
 void rsx_backlog (mw_rstore *s, int *l0, int *total);

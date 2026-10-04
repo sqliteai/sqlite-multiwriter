@@ -26,6 +26,7 @@ struct mw_rstore {
     pthread_mutex_t mu, wmu; mw_rman *cur;
     cslot *cs; size_t ncs; pthread_mutex_t cmu[CSTRIPES];
     uint32_t *hslot; uintptr_t *howner; size_t nh, caph;                      // slots taken out of the pool by a transaction or a part that has not finished (so that the register of reservations covers them)
+    bool exclusive;                                                          // only this process merges and removes runs (one thread): the runs a merge works from cannot go while it reads them
     pthread_mutex_t pmu; uint32_t *pool; size_t npool, cappool;               // slots taken from the free table (or fresh) and not used yet
     _Atomic uint32_t slot_bytes;                                             // the size of a slot: the file's, found or decided at the first use
     _Atomic int bl0, ball;                                                   // age groups at level 0 and in all, of the current list
@@ -177,6 +178,7 @@ static void backlog_update (mw_rstore *s, const mw_rman *m) {                 //
     }
     atomic_store_explicit(&s->bl0, a, memory_order_relaxed); atomic_store_explicit(&s->ball, t, memory_order_relaxed);
 }
+void rsx_set_exclusive (mw_rstore *s, bool on) { s->exclusive = on; }
 void rsx_wlock (mw_rstore *s) { pthread_mutex_lock(&s->wmu); }
 void rsx_wunlock (mw_rstore *s) { pthread_mutex_unlock(&s->wmu); }
 void rsx_stats_get (mw_rstore *s, rsx_stats *o) {
@@ -309,6 +311,12 @@ typedef struct { mw_rstore *s; sqlite3_stmt *st; sqlite3 *c; sqlite3_stmt *exist
 static int plain_read (void *ctx, const rs_run *r, uint32_t blk, uint8_t **data, size_t *len) {
     plainctx *p = ctx; int rc = -1;
     if (!p->own_txn) return read_block(p->s, p->st, r, blk, data, len) ? 0 : -1;                    // (inside a transaction of the caller: one snapshot already)
+    if (p->s->exclusive) {                                                                          // (nobody else removes runs: no need to find the run in the list, only one snapshot for the slots of the block)
+        if (sqlite3_exec(p->c, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) return -1;
+        rc = read_block(p->s, p->st, r, blk, data, len) ? 0 : -1;
+        sqlite3_exec(p->c, "COMMIT", NULL, NULL, NULL);
+        return rc;
+    }
     if (sqlite3_exec(p->c, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) return -1;
     if (!p->exists) sqlite3_prepare_v2(p->c, "SELECT 1 FROM mw_runs WHERE run = ?1", -1, &p->exists, NULL);
     if (p->exists) {
@@ -724,6 +732,8 @@ static int id_fn (void *ctx, sqlite3 *c);
 typedef struct {
     mw_rstore *s; sqlite3 *wr; int out_lvl; int64_t out_age; const mw_rman *man;
     oblk *blks; int nblks, capblks; uint8_t *loc; size_t loccap; int64_t part_id;      // part_id: the number of the run being written (taken before its first block)
+    int64_t id_next, id_end;                                                           // run numbers taken for the parts of this merge (recorded in the file when they were taken)
+    struct pwriter *pw;                                                                // the thread that writes the finished parts while the next one is being merged (NULL: the merge writes them itself)
 } mctx;
 static void mctx_clear (mctx *m) { for (int i = 0; i < m->nblks; i++) { free(m->blks[i].d); free(m->blks[i].sl); } m->nblks = 0; held_drop(m->s, m); }
 // a block of the output: its slots are chosen now (the locator goes into the meta), the data is written later, a few blocks to a transaction
@@ -740,11 +750,13 @@ static int m_emit (void *ctx, uint32_t blk, const uint8_t *d, size_t len, const 
     *loc = m->loc; *loclen = ll;
     return 0;
 }
-typedef struct { mw_rstore *s; int64_t id; } idctx;
+typedef struct { mw_rstore *s; int64_t id; int64_t count; } idctx;
 static int m_begin (void *sctx, uint64_t hint, rs_emit_fn *emit, void **ec) {
     (void)hint; mctx *m = sctx; mctx_clear(m);
-    idctx ic = { m->s, 0 }; int rc = small_txn(m->s, m->wr, id_fn, &ic); if (rc) return rc;
-    m->part_id = ic.id; *emit = m_emit; *ec = sctx; return 0;
+    mw_rstore *s = m->s; int rc;
+    if (m->id_next < m->id_end) m->part_id = m->id_next++;
+    else { idctx ic = { s, 0, 16 }; rc = small_txn(s, m->wr, id_fn, &ic); if (rc) return rc; m->part_id = ic.id; m->id_next = ic.id + 1; m->id_end = ic.id + ic.count; }
+    *emit = m_emit; *ec = sctx; return 0;
 }
 // the number of a new run is taken (and recorded) before anything is written under it: whoever flushes meanwhile gets another one
 static int id_fn (void *ctx, sqlite3 *c) {
@@ -754,7 +766,7 @@ static int id_fn (void *ctx, sqlite3 *c) {
     int64_t next; if (state_get(c, "next_run", 1, &next)) return -1;
     if (next <= maxid) next = maxid + 1;
     x->id = next;
-    return state_put(c, "next_run", next + 1);
+    return state_put(c, "next_run", next + (x->count ? x->count : 1));
 }
 // the slots of blocks [i0, i1) of the part
 typedef struct { const oblk *b; int i0, i1; uint32_t sb; int64_t run; } bctx;
@@ -767,9 +779,9 @@ static int blocks_fn (void *ctx, sqlite3 *c) {
 }
 static void part_slots_back (mctx *m) { for (int i = 0; i < m->nblks; i++) pool_put(m->s, m->blks[i].sl, m->blks[i].nsl); }
 
-static int m_end (void *sctx, const uint8_t *meta, size_t ml, uint64_t nr, uint32_t nb, int64_t dvm) {
-    mctx *m = sctx; sqlite3 *c = m->wr; int rc;
-    idctx ic = { m->s, m->part_id }; rc = 0;
+static int part_write (mctx *m, sqlite3 *c, const uint8_t *meta, size_t ml, uint64_t nr, uint32_t nb, int64_t dvm) {
+    int rc;
+    idctx ic = { m->s, m->part_id, 0 }; rc = 0;
     uint32_t sb = atomic_load(&m->s->slot_bytes);
     for (int i = 0; i < m->nblks && !rc; i += 24) {                                              // the slots, a few blocks to a transaction: nobody can see them until the run has a row
         bctx b = { m->blks, i, i + 24 < m->nblks ? i + 24 : m->nblks, sb, ic.id };
@@ -795,6 +807,55 @@ static int m_end (void *sctx, const uint8_t *meta, size_t ml, uint64_t nr, uint3
     if (rc) part_slots_back(m);                                                                   // (no run came of it: its slots stay ours)
     mctx_clear(m);
     return rc;
+}
+
+// ---- the thread that writes the parts ----
+// A merge alternates between merging a part (reading blocks, merging rows, compressing: CPU) and writing it (small transactions of the engine: waiting for its commits). The finished part is
+// handed to a thread of its own, with a connection of its own, and the merge goes on with the next part; one part is written while the next is merged (the parts go in order, and the
+// inputs are removed only when all of them are in).
+typedef struct { mctx *job; uint8_t *meta; size_t ml; uint64_t nr; uint32_t nb; int64_t dvm; } pjob;
+struct pwriter { sqlite3 *c; pthread_t th; pthread_mutex_t mu; pthread_cond_t cv; pjob j; bool has, busy, stop; int rc; };
+static void held_rekey (mw_rstore *s, const void *from, const void *to) { pthread_mutex_lock(&s->pmu); for (size_t i = 0; i < s->nh; i++) if (s->howner[i] == (uintptr_t)from) s->howner[i] = (uintptr_t)to; pthread_mutex_unlock(&s->pmu); }
+static void *pw_main (void *arg) {
+    struct pwriter *pw = arg;
+    pthread_mutex_lock(&pw->mu);
+    for (;;) {
+        while (!pw->has && !pw->stop) pthread_cond_wait(&pw->cv, &pw->mu);
+        if (!pw->has) break;
+        pjob j = pw->j; pw->has = false; pw->busy = true; pthread_mutex_unlock(&pw->mu);
+        int rc = pw->rc ? pw->rc : part_write(j.job, pw->c, j.meta, j.ml, j.nr, j.nb, j.dvm);
+        if (pw->rc) { part_slots_back(j.job); mctx_clear(j.job); }                          // (an earlier part failed: this one is not written, its slots stay ours)
+        free(j.job->blks); free(j.job->loc); free(j.job); free(j.meta);
+        pthread_mutex_lock(&pw->mu); if (rc && !pw->rc) pw->rc = rc; pw->busy = false; pthread_cond_broadcast(&pw->cv);
+    }
+    pthread_mutex_unlock(&pw->mu);
+    return NULL;
+}
+static struct pwriter *pw_start (sqlite3 *c) {
+    struct pwriter *pw = calloc(1, sizeof *pw); if (!pw) return NULL;
+    pw->c = c; pthread_mutex_init(&pw->mu, NULL); pthread_cond_init(&pw->cv, NULL);
+    if (pthread_create(&pw->th, NULL, pw_main, pw)) { pthread_mutex_destroy(&pw->mu); pthread_cond_destroy(&pw->cv); free(pw); return NULL; }
+    return pw;
+}
+static int pw_wait (struct pwriter *pw) { pthread_mutex_lock(&pw->mu); while (pw->has || pw->busy) pthread_cond_wait(&pw->cv, &pw->mu); int rc = pw->rc; pthread_mutex_unlock(&pw->mu); return rc; }
+static int pw_finish (struct pwriter *pw) {
+    int rc = pw_wait(pw);
+    pthread_mutex_lock(&pw->mu); pw->stop = true; pthread_cond_broadcast(&pw->cv); pthread_mutex_unlock(&pw->mu);
+    pthread_join(pw->th, NULL); pthread_mutex_destroy(&pw->mu); pthread_cond_destroy(&pw->cv); free(pw);
+    return rc;
+}
+static int m_end (void *sctx, const uint8_t *meta, size_t ml, uint64_t nr, uint32_t nb, int64_t dvm) {
+    mctx *m = sctx; int rc;
+    if (!m->pw) return part_write(m, m->wr, meta, ml, nr, nb, dvm);
+    struct pwriter *pw = m->pw;
+    if ((rc = pw_wait(pw)) != 0) { part_slots_back(m); mctx_clear(m); return rc; }              // (the part before this one could not be written)
+    mctx *job = malloc(sizeof *job); uint8_t *mc = malloc(ml ? ml : 1);
+    if (!job || !mc) { free(job); free(mc); part_slots_back(m); mctx_clear(m); return -1; }
+    memcpy(mc, meta, ml); *job = *m; job->loc = NULL; job->loccap = 0;
+    held_rekey(m->s, m, job);
+    m->blks = NULL; m->nblks = 0; m->capblks = 0;
+    pthread_mutex_lock(&pw->mu); pw->j = (pjob){ job, mc, ml, nr, nb, dvm }; pw->has = true; pthread_cond_broadcast(&pw->cv); pthread_mutex_unlock(&pw->mu);
+    return 0;
 }
 // At the close: the slots this process holds go back to the free ones and its entry in the register of reservations is removed
 static int release_fn (void *ctx, sqlite3 *c) {
@@ -864,7 +925,7 @@ int rsx_sweep (mw_rstore *s, sqlite3 *rd, sqlite3 *wr) {
     if (!rc) atomic_fetch_add(&s->swept_slots, (uint64_t)leaked);
     return rc ? -1 : leaked;
 }
-int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, int fanout, uint64_t part_rows) {
+int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, sqlite3 *wr2, int fanout, uint64_t part_rows) {
     mw_rman *man = NULL;
     sqlite3_exec(rd, "BEGIN", NULL, NULL, NULL);
     int rc = rsx_man(s, rd, &man);
@@ -891,10 +952,12 @@ int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, int fanout, uint64_t part
     for (int i = 0; i < man->n; i++) { bool is_in = false; for (int j = 0; j < nin; j++) if (in[j] == man->runs[i]) is_in = true; if (!is_in && man->runs[i]->age <= in[0]->age) bottom = false; }
     (void)minage;
     plainctx pc = { s, NULL, rd, NULL, true }; if (sqlite3_prepare_v2(rd, rsx_blk_sql(), -1, &pc.st, NULL) != SQLITE_OK) { free(in); rsx_man_release(man); return -1; }
-    mctx mc = { s, wr, lvl + 1, in[0]->age, man, NULL, 0, 0, NULL, 0, 0 };
+    struct pwriter *pw = wr2 ? pw_start(wr2) : NULL;                                               // (the finished parts are written by a thread of its own while the next one is merged)
+    mctx mc = { .s = s, .wr = wr, .out_lvl = lvl + 1, .out_age = in[0]->age, .man = man, .pw = pw };
     rs_merge_opts o = { plain_read, &pc, bottom, keep_alive, man, part_rows, m_begin, m_end, &mc };
     uint64_t rows = 0;
     rc = rs_merge(in, nin, &o, &rows);
+    if (pw) { int prc = pw_finish(pw); if (!rc) rc = prc; }
     mctx_clear(&mc); free(mc.blks); free(mc.loc); sqlite3_finalize(pc.st); sqlite3_finalize(pc.exists);
     // The inputs go last, one run to a transaction (its row goes and its slots are free), the OLDEST first: if the merge is interrupted what is left of the inputs is always the newest of them. The output
     // has the age of the newest input, so it still hides what is left (which it holds); a later merge of what is left with newer runs makes an output that is not older than anything it is missing.

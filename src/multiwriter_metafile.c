@@ -121,7 +121,7 @@ static sqlite3 *open_conn (mw_meta *m) {
 void mw_metafile_free (mw_meta *m) {
     for (int i = 0; i < MW_RDN; i++) { sqlite3_finalize(m->rds[i]); sqlite3_close(m->rd[i]); m->rds[i] = NULL; m->rd[i] = NULL; }
     sqlite3_close(m->wr); m->wr = NULL;
-    sqlite3_close(m->mrd); m->mrd = NULL; sqlite3_close(m->mwr); m->mwr = NULL;
+    sqlite3_close(m->mrd); m->mrd = NULL; sqlite3_close(m->mwr); m->mwr = NULL; sqlite3_close(m->mwr_w); m->mwr_w = NULL;
     free(m->uri); m->uri = NULL;
 }
 
@@ -474,13 +474,14 @@ static void *merger_main (void *arg) {
         if (m->shared && !mw_mp_meta_lock(m->db, 2, false)) continue;                          // (several processes: one of them merges at a time; the others' flushes go on)
         if (!m->mrd) m->mrd = open_conn(m);
         if (!m->mwr) m->mwr = open_conn(m);
+        if (!m->mwr_w && !m->shared) m->mwr_w = open_conn(m);                               // (shared mode: the parts are written by the merge itself, the pipeline cost more than it gave)
         if (m->mrd && m->mwr) {                                                                  // (slots of processes that are gone come back: at the start and then every few seconds)
             static uint64_t every = 0; if (!every) { const char *e = getenv("MW_META_SWEEP_MS"); every = (e ? (uint64_t)atoll(e) : 10000) * 1000000ull; }
             if (!m->swept || now_ns() - m->sweep_ns > every) { (void)rsx_sweep(m->rsx, m->mrd, m->mwr); m->swept = true; m->sweep_ns = now_ns(); }
         }
         if (m->mrd && m->mwr) for (;;) {
             pthread_mutex_lock(&m->mth_mu); bool st = m->mth_stop; pthread_mutex_unlock(&m->mth_mu);
-            if (st || rsx_merge(m->rsx, m->mrd, m->mwr, m->fanout, m->part_rows) <= 0) break;
+            if (st || rsx_merge(m->rsx, m->mrd, m->mwr, m->mwr_w, m->fanout, m->part_rows) <= 0) break;
         }
         if (m->shared) mw_mp_meta_unlock(m->db, 2);
     }
@@ -638,13 +639,14 @@ void mw_meta_quiesce (mw_meta *m) {
     if (m->wr && (m->shared ? atomic_load(&m->db->shm->meta_state) == 2 : atomic_load(&m->ready))) (void)rsx_release_pool(m->rsx, m->wr);      // (the slots we hold go back to the free ones, and our entry in the register of reservations goes)
     pthread_mutex_lock(&m->th_mu); m->th_stop = false; pthread_mutex_unlock(&m->th_mu);       // (a later open starts the thread again)
     pthread_mutex_lock(&m->mth_mu); m->mth_stop = false; pthread_mutex_unlock(&m->mth_mu);
-    sqlite3 *conns[MW_RDN + 3]; sqlite3_stmt *stmts[MW_RDN]; int nc = 0;
+    sqlite3 *conns[MW_RDN + 4]; sqlite3_stmt *stmts[MW_RDN]; int nc = 0;
     pthread_mutex_lock(&m->file_mu);
     for (int i = 0; i < MW_RDN; i++) { pthread_mutex_lock(&m->rdmu[i]); stmts[i] = m->rds[i]; m->rds[i] = NULL; if (m->rd[i]) conns[nc++] = m->rd[i]; m->rd[i] = NULL; pthread_mutex_unlock(&m->rdmu[i]); }
     if (m->wr) conns[nc++] = m->wr;
     m->wr = NULL;
     if (m->mrd) { conns[nc++] = m->mrd; m->mrd = NULL; }
     if (m->mwr) { conns[nc++] = m->mwr; m->mwr = NULL; }
+    if (m->mwr_w) { conns[nc++] = m->mwr_w; m->mwr_w = NULL; }
     pthread_mutex_unlock(&m->file_mu);
     atomic_store(&m->quiescing, 0);
     // the last connection to close releases the database for good, and that frees this store: nothing of it may be touched after the closes

@@ -48,6 +48,7 @@ mw_meta *mw_meta_new (struct mw_db *db) {
     m->fanout = 8; m->part_rows = 1u << 15;
     { const char *e = getenv("MW_META_FANOUT"); if (e && atoi(e) >= 2) m->fanout = atoi(e); e = getenv("MW_META_PART_ROWS"); if (e && atoll(e) >= 1) m->part_rows = (uint64_t)atoll(e); }       // (tests: merge at every chance, in small parts)
     m->rsx = rsx_new(m->cap_bytes / 2); if (!m->rsx) { free(m); return NULL; }
+    rsx_set_exclusive(m->rsx, !db->shared);
     for (int i = 0; i < STRIPES; i++) {
         pthread_mutex_init(&m->st[i].mu, NULL);
         m->st[i].nb = 64; m->st[i].b = calloc(m->st[i].nb, sizeof(mentry *)); m->st[i].pend.blockmin = 64u << 10;

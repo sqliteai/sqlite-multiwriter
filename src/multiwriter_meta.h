@@ -79,8 +79,8 @@ void mw_meta_run_stats (mw_meta *m, uint64_t out[13]);       // lookups, runs pr
 typedef struct { uint32_t tid; uint32_t pko; uint32_t pkl; mw_mcell c; int64_t cl; } mw_xcell;      // a cell to export: its table, where its key is in the pool, the cell, the causal length of its row
 int mw_metafile_export (mw_meta *m, sqlite3 *c, int64_t since, int64_t upto, mw_xcell **out, size_t *n, uint8_t **pkpool);   // (a transaction is open on c; free out and the pool)
 int mw_meta_register_views (sqlite3 *c, mw_meta *m);                                      // the read-only virtual table mw_cells (the cells of the runs, unpacked)
-uint8_t *mw_meta_row_pack (const mw_mcell *c, int n, size_t *len);
-bool mw_meta_row_cells (const void *blob, size_t len, mw_mcell **c, int *n);   // the cells of a packed row of a block (caller frees)
+uint8_t *mw_meta_row_pack (const mw_mcell *c, int n, size_t *len, int64_t *rowdv);   // (tests) *rowdv: the db_version of the row, what the cells are relative to
+bool mw_meta_row_cells (const void *blob, size_t len, int64_t rowdv, mw_mcell **c, int *n);   // the cells of a packed row of a block (caller frees)
 uint64_t mw_meta_epoch (mw_meta *m);
 uint64_t mw_meta_dv (mw_meta *m, uint64_t epoch);                               // the db_version of an epoch of this incarnation                                              // the last commit made visible                                              // rows changed since the last flush
 

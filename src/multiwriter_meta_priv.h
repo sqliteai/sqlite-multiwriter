@@ -31,7 +31,7 @@ typedef struct mentry {
     struct mentry *next;
     uint64_t h, ver, dseq;                     // ver: epoch of the last change; dseq: the stripe's sequence number of its last change (it is dirty while that is above the stripe's flushed_seq)
     uint32_t tbl, pklen, n, bloblen, cap; bool inl; uint8_t cls;     // the cells are kept packed (as a row of a run: ~1 byte a cell, not 32); inl: they are in the same allocation as the entry (after the key); cap: room for them
-    uint8_t *blob;
+    uint8_t *blob; int64_t rdv;                                       // rdv: the db_version of the row (the largest of its cells: what the packed cells are relative to)
     uint8_t pk[];
 } mentry;
 

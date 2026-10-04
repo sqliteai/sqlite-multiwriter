@@ -19,15 +19,15 @@ int main (void) {
             c[i].site = (rnd() & 3) ? (uint32_t)(rnd() % 5) : (uint32_t)rnd();
             c[i].seq = (rnd() & 3) ? (uint32_t)(rnd() % 100) : (uint32_t)rnd();
         }
-        size_t len; uint8_t *b = mw_meta_row_pack(c, n, &len); CHECK(b != NULL);
-        mw_mcell *o; int on; CHECK(mw_meta_row_cells(b, len, &o, &on)); CHECK(on == n);
+        size_t len; int64_t rdv; uint8_t *b = mw_meta_row_pack(c, n, &len, &rdv); CHECK(b != NULL);
+        mw_mcell *o; int on; CHECK(mw_meta_row_cells(b, len, rdv, &o, &on)); CHECK(on == n);
         for (int i = 0; i < n && i < on; i++) CHECK(!memcmp(&o[i], &c[i], sizeof c[i]) || (o[i].col == c[i].col && o[i].cv == c[i].cv && o[i].dv == c[i].dv && o[i].site == c[i].site && o[i].seq == c[i].seq));
         free(o);
         // every truncation of it is refused (never read past the end, never accepted as a shorter row)
-        if (n) for (size_t cut = 0; cut < len; cut += 1 + len / 7) { mw_mcell *x; int xn; bool ok = mw_meta_row_cells(b, cut, &x, &xn); CHECK(!ok); free(x); }
+        if (n) for (size_t cut = 0; cut < len; cut += 1 + len / 7) { mw_mcell *x; int xn; bool ok = mw_meta_row_cells(b, cut, rdv, &x, &xn); CHECK(!ok); free(x); }
         free(b); rounds++;
     }
-    { mw_mcell *x; int xn; uint8_t junk[] = { 9, 1, 0, 0, 0, 0, 0 }; CHECK(!mw_meta_row_cells(junk, sizeof junk, &x, &xn)); uint8_t huge[] = { 1, 0xff, 0xff, 0xff, 0xff, 0x0f }; CHECK(!mw_meta_row_cells(huge, sizeof huge, &x, &xn)); }
+    { mw_mcell *x; int xn; uint8_t junk[] = { 9, 1, 0, 0, 0, 0, 0 }; CHECK(!mw_meta_row_cells(junk, sizeof junk, 0, &x, &xn)); uint8_t huge[] = { 1, 0xff, 0xff, 0xff, 0xff, 0x0f }; CHECK(!mw_meta_row_cells(huge, sizeof huge, 0, &x, &xn)); }
     printf("%d random rows packed and unpacked (extreme versions, columns and sites), truncations refused\n", rounds);
     MW_DONE();
 }

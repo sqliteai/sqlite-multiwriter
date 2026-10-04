@@ -32,7 +32,7 @@ int mw_meta_export_index (sqlite3 *c) { (void)c; return SQLITE_OK; }            
 // ---- the row as the file holds it ----
 // The cells of a row of a user table, packed (a row of a block of a run): its key, the largest db_version of its cells (what the export looks for) and all its cells, packed: a format byte, the number of cells, then
 // per cell the column (+1, so the sentinel is 0), version, db_version, sequence and site as varints. The cells are the complete state of the row: a flush replaces them all.
-#define ROW_FORMAT 2                                                     // (1: five varints a cell, still read)
+#define ROW_FORMAT 3                                                     // (3: the db_version of a cell is kept as the difference from the largest one of the row, which the block keeps anyway; 2: whole; 1: five varints a cell; both still read)
 static size_t put_var (uint8_t *p, uint64_t v) { size_t n = 0; while (v >= 0x80) { p[n++] = (uint8_t)(v | 0x80); v >>= 7; } p[n++] = (uint8_t)v; return n; }
 static bool get_var (const uint8_t **p, const uint8_t *end, uint64_t *v) {
     uint64_t r = 0; int sh = 0;
@@ -43,9 +43,10 @@ static bool get_var (const uint8_t **p, const uint8_t *end, uint64_t *v) {
 static size_t row_pack_ex (const mw_mcell *c, int n, bool resolve, uint64_t chg, uint8_t *out, int64_t *maxdv) {
     size_t w = 0; out[w++] = ROW_FORMAT; w += put_var(out + w, (uint64_t)n);
     uint64_t prev[5]; int64_t mx = 0;
+    for (int i = 0; i < n; i++) { int64_t dv = (resolve && c[i].dv == OV_CHG) ? (int64_t)chg : c[i].dv; if (dv > mx) mx = dv; }
     for (int i = 0; i < n; i++) {
-        int64_t dv = (resolve && c[i].dv == OV_CHG) ? (int64_t)chg : c[i].dv; if (dv > mx) mx = dv;
-        uint64_t v[5] = { (uint32_t)(c[i].col + 1u), (uint64_t)c[i].cv, (uint64_t)dv, c[i].site, c[i].seq };
+        int64_t dv = (resolve && c[i].dv == OV_CHG) ? (int64_t)chg : c[i].dv;
+        uint64_t v[5] = { (uint32_t)(c[i].col + 1u), (uint64_t)c[i].cv, (uint64_t)mx - (uint64_t)dv, c[i].site, c[i].seq };
         w += cz_put(out + w, v, i ? prev : NULL); memcpy(prev, v, sizeof prev);
     }
     if (maxdv) *maxdv = mx;
@@ -55,16 +56,16 @@ static size_t row_pack (const mw_mcell *c, int n, uint8_t *out) { return row_pac
 size_t mw_meta_pack_row (const mw_mcell *c, int n, bool resolve, uint64_t chg_epoch, uint8_t *out, int64_t *maxdv) { return row_pack_ex(c, n, resolve, chg_epoch, out, maxdv); }
 #define ROW_PACK_MAX(n) MW_PACK_MAX(n)
 // the cells of a packed row, appended to `*c` (grown as needed; `*n` the count so far); false when the blob is not one
-static bool row_unpack (const uint8_t *p, size_t len, mw_mcell **c, int *n, int *cap) {
+static bool row_unpack (const uint8_t *p, size_t len, int64_t rowdv, mw_mcell **c, int *n, int *cap) {
     const uint8_t *end = p + len; uint64_t cnt;
     if (len < 2) return false;
-    int fmt = *p++; if ((fmt != 1 && fmt != ROW_FORMAT) || !get_var(&p, end, &cnt) || cnt > (1u << 20)) return false;
+    int fmt = *p++; if ((fmt != 1 && fmt != 2 && fmt != ROW_FORMAT) || !get_var(&p, end, &cnt) || cnt > (1u << 20)) return false;
     if (*n + (int)cnt > *cap) { int nc = (*n + (int)cnt) * 2 + 4; mw_mcell *nm = realloc(*c, (size_t)nc * sizeof **c); if (!nm) return false; *c = nm; *cap = nc; }
     uint64_t pv[5];
-    for (uint64_t i = 0; i < cnt && fmt == ROW_FORMAT; i++) {
+    for (uint64_t i = 0; i < cnt && fmt >= 2; i++) {
         uint64_t v[5]; if (cz_get(&p, end, v, i ? pv : NULL)) return false;
         memcpy(pv, v, sizeof pv);
-        (*c)[(*n)++] = (mw_mcell){ (int64_t)v[1], (int64_t)v[2], (uint32_t)(v[0] - 1u), (uint32_t)v[3], (uint32_t)v[4] };
+        (*c)[(*n)++] = (mw_mcell){ (int64_t)v[1], fmt == 2 ? (int64_t)v[2] : (int64_t)((uint64_t)rowdv - v[2]), (uint32_t)(v[0] - 1u), (uint32_t)v[3], (uint32_t)v[4] };
     }
     for (uint64_t i = 0; i < cnt && fmt == 1; i++) {
         uint64_t col, cv, dv, seq, site;
@@ -74,9 +75,9 @@ static bool row_unpack (const uint8_t *p, size_t len, mw_mcell **c, int *n, int 
     return true;
 }
 // (tests) the packed form of cells: the blob, malloc'ed
-uint8_t *mw_meta_row_pack (const mw_mcell *c, int n, size_t *len) { uint8_t *b = malloc(ROW_PACK_MAX(n)); if (!b) return NULL; *len = row_pack(c, n, b); return b; }
+uint8_t *mw_meta_row_pack (const mw_mcell *c, int n, size_t *len, int64_t *rowdv) { uint8_t *b = malloc(ROW_PACK_MAX(n)); if (!b) return NULL; *len = row_pack_ex(c, n, false, 0, b, rowdv); return b; }
 // for the export and the virtual table of tests: the cells of the blob of a row
-bool mw_meta_row_cells (const void *blob, size_t len, mw_mcell **c, int *n) { int cap = 0; *c = NULL; *n = 0; if (row_unpack(blob, len, c, n, &cap)) return true; free(*c); *c = NULL; *n = 0; return false; }
+bool mw_meta_row_cells (const void *blob, size_t len, int64_t rowdv, mw_mcell **c, int *n) { int cap = 0; *c = NULL; *n = 0; if (row_unpack(blob, len, rowdv, c, n, &cap)) return true; free(*c); *c = NULL; *n = 0; return false; }
 
 int mw_meta_schema (sqlite3 *c) {
     sqlite3_stmt *st = NULL; int have = 0;
@@ -261,11 +262,10 @@ fitem *mw_fbatch_add_row (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t p
     if (b->n == b->cap) { int nc = b->cap ? b->cap * 2 : 1024; fitem *nv = realloc(b->v, (size_t)nc * sizeof *nv); if (!nv) return NULL; b->v = nv; b->cap = nc; }
     size_t need = ROW_PACK_MAX(n);
     if (n && need > b->tmpcap) { uint8_t *nt = realloc(b->tmp, need * 2); if (!nt) return NULL; b->tmp = nt; b->tmpcap = need * 2; }
-    size_t len = n ? row_pack(c, n, b->tmp) : 0;
+    int64_t dv = 0; size_t len = n ? row_pack_ex(c, n, false, 0, b->tmp, &dv) : 0;
     uint8_t *k = mw_fbatch_alloc(b, (size_t)pklen + len + 1);                 // (the key and, after it, the packed cells: one place)
     if (!k) return NULL;
     memcpy(k, pk, pklen); if (len) memcpy(k + pklen, b->tmp, len);
-    int64_t dv = 0; for (int i = 0; i < n; i++) if (c[i].dv > dv) dv = c[i].dv;
     fitem *it = &b->v[b->n++]; *it = (fitem){ tbl, k, pklen, (uint32_t)n, (uint32_t)len, k + pklen, dv };
     return it;
 }

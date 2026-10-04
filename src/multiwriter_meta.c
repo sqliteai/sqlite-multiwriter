@@ -118,13 +118,13 @@ void mw_meta_trim (mw_meta *m, int stripe_no) {
     }
 }
 
-static mentry *entry_new (stripe *s, uint64_t h, uint32_t tbl, const void *pk, size_t pklen, const uint8_t *blob, size_t bl, int n) {
+static mentry *entry_new (stripe *s, uint64_t h, uint32_t tbl, const void *pk, size_t pklen, const uint8_t *blob, size_t bl, int n, int64_t rdv) {
     size_t off = (sizeof(mentry) + pklen + 7) & ~(size_t)7;                          // (one allocation for the entry, its key and its cells: a row costs one take and one give back)
     uint8_t cls; mentry *e = stripe_alloc(s, off + bl, &cls);
     if (!e) return NULL;
     memset(e, 0, off);
     e->h = h; e->tbl = tbl; e->pklen = (uint32_t)pklen; memcpy(e->pk, pk, pklen);
-    e->cap = (uint32_t)bl; e->bloblen = (uint32_t)bl; e->n = (uint32_t)n; e->inl = true; e->cls = cls;
+    e->rdv = rdv; e->cap = (uint32_t)bl; e->bloblen = (uint32_t)bl; e->n = (uint32_t)n; e->inl = true; e->cls = cls;
     if (bl) { e->blob = (uint8_t *)e + off; memcpy(e->blob, blob, bl); }
     return e;
 }
@@ -168,7 +168,7 @@ static int mem_peek (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_
     if (!e) { pthread_mutex_unlock(&s->mu); return 0; }
     atomic_fetch_add(&m->hits, 1);
     *n = (int)e->n; *out = NULL;
-    if (e->n && !mw_meta_row_cells(e->blob, e->bloblen, out, n)) { pthread_mutex_unlock(&s->mu); return -1; }
+    if (e->n && !mw_meta_row_cells(e->blob, e->bloblen, e->rdv, out, n)) { pthread_mutex_unlock(&s->mu); return -1; }
     pthread_mutex_unlock(&s->mu); return 1;
 }
 // what the file said about a row goes into the table as a clean entry (if nobody put one there meanwhile)
@@ -176,7 +176,7 @@ static void mem_cache (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, c
     uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
     uint8_t *buf; int64_t dv; size_t bl = pack_tl(c, n, false, 0, &buf, &dv); if (bl == (size_t)-1) return;
     mw_spinlock(&s->mu);
-    if (!find(s, h, tbl, pk, pklen)) { mentry *ne = entry_new(s, h, tbl, pk, pklen, buf, bl, n); if (ne) { insert_entry(m, s, ne); evict(m, s); } }
+    if (!find(s, h, tbl, pk, pklen)) { mentry *ne = entry_new(s, h, tbl, pk, pklen, buf, bl, n, dv); if (ne) { insert_entry(m, s, ne); evict(m, s); } }
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -519,7 +519,7 @@ static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pkle
     mw_spinlock(&s->mu);
     mentry *e = find(s, h, tbl, pk, pklen);
     if (!e) {                                                          // a new row: one allocation for the entry (its cells are the state), linked once
-        ne = entry_new(s, h, tbl, pk, pklen, buf, bl, n);
+        ne = entry_new(s, h, tbl, pk, pklen, buf, bl, n, dvmax);
         if (!ne) { pthread_mutex_unlock(&s->mu); return -1; }
         ne->ver = epoch;
         if (!mw_fbatch_add_packed(&s->pend, tbl, pk, (uint32_t)pklen, buf, bl, n, dvmax)) { entry_free(s, ne); pthread_mutex_unlock(&s->mu); return -1; }        // (the change waits for the flusher with its own copy)
@@ -534,7 +534,7 @@ static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pkle
             e->blob = nb; e->cap = (uint32_t)bl; e->inl = false;
         }
         if (bl) memcpy(e->blob, buf, bl);
-        e->bloblen = (uint32_t)bl; e->n = (uint32_t)n;
+        e->bloblen = (uint32_t)bl; e->n = (uint32_t)n; e->rdv = dvmax;
         e->ver = epoch;
         if (!mw_fbatch_add_packed(&s->pend, tbl, pk, (uint32_t)pklen, buf, bl, n, dvmax)) { pthread_mutex_unlock(&s->mu); return -1; }
         e->dseq = ++s->seq; atomic_fetch_add(&m->ndirty, 1);

@@ -220,6 +220,10 @@ the metadata tests with the store under pressure.
   merger), so a lookup of a row that is not in the memory table pays 0.8, 2.2 or 5.6 reads for 10, 8 or 6 bits per 100 runs: the default is kept for the databases that update rows from the file;
   a database that mostly inserts can take 6 and save a fifth of its memory. (The memory that goes with the bits is several times the size of the filters, 340 MB for 4 bits a row against 46 MB of
   filters: the allocations of the builders are most of it, not looked into further.)
+- **The db_version of the cells (kept).** The packed cells of a row (format 3) keep the db_version of a cell as the difference from the largest one of the row (0 for the rows a commit wrote), because the row
+  already carries that number: in the block (as a difference from the previous row), in the item of the flush and in the entry of the memory table (`rdv`). The first cell had it whole, 3-4 bytes that LZ4 could
+  not squeeze. `mw_meta_row_cells` takes the db_version of the row; formats 1 and 2 are still read. A real run: 10.0 -> 7.9 bytes a row in the slots (meta included); 16 threads tracked 31.9k -> 33.7k tx/s
+  (three alternating pairs of 30 s), 4 processes the same.
 
 ## Capture and DDL
 

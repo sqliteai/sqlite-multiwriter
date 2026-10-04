@@ -256,7 +256,7 @@ static int get_one (mw_rstore *s, const mw_rman *m, sqlite3_stmt *st, uint32_t t
         if (f == 0) { cblk_unref(cb); continue; }
         int rc = 0;
         if (nc) {
-            if (!mw_meta_row_cells(c, nc, cells, n)) rc = -1;
+            if (!mw_meta_row_cells(c, nc, dv, cells, n)) rc = -1;
             else { int64_t dd = drop_of(m, tbl); if (dd) { int q = 0; for (int x = 0; x < *n; x++) if ((*cells)[x].dv >= dd) (*cells)[q++] = (*cells)[x]; *n = q; } if (!*n) { free(*cells); *cells = NULL; } }
         }
         cblk_unref(cb);
@@ -337,7 +337,7 @@ static int scan_emit (void *ctx, uint32_t blkno, const uint8_t *data, size_t len
     int rcx = 0;
     for (uint32_t i = 0; !rcx && i < b.nrows; i++) {
         rs_key k; int64_t dv; const uint8_t *cells; uint32_t nc; if (!rs_blk_row(&b, i, &k, &dv, &cells, &nc)) { rcx = -1; break; }
-        mw_mcell *c; int n; if (!mw_meta_row_cells(cells, nc, &c, &n)) { rcx = -1; break; }
+        mw_mcell *c; int n; if (!mw_meta_row_cells(cells, nc, dv, &c, &n)) { rcx = -1; break; }
         int64_t dd = drop_of(sc->m, k.tbl); if (dd) { int q = 0; for (int x = 0; x < n; x++) if (c[x].dv >= dd) c[q++] = c[x]; n = q; }
         rcx = n ? sc->cb(sc->ctx, k.tbl, k.pk, k.pklen, c, n) : 0; free(c);
     }

@@ -8,8 +8,8 @@ commit, versioned pages, compaction into the database file: `docs/engine-history
 is changed, no SQL syntax is added, triggers and hooks are not used (they do not exist for WITHOUT ROWID tables, the pre-update hook needs a compile option, and an
 application can replace the update hook of its connection).
 
-sqlite-sync (`deps/sqlite-sync`, a submodule) is the reference for the algorithms and the wire format and the oracle of the differential tests. Its SQL-level API
-(`database.h`, the metadata tables built by triggers, the `cloudsync_*` functions) is not used; of the submodule only `lz4.c` is linked into the library.
+sqlite-sync (`deps/sqlite-sync`, an optional submodule: only for `make oracle-test`) is the reference for the algorithms and the wire format and the oracle of the differential tests. Its SQL-level API
+(`database.h`, the metadata tables built by triggers, the `cloudsync_*` functions) is not used; nothing of it is linked into the library: SQLite and LZ4 are vendored in `third_party/` (SQLite 3.45.3, LZ4 1.9.x, copied unchanged from the submodule), and the wire format is kept compatible, as the oracle tests check.
 
 Open a database through the VFS with `file:db?mw=2&mw_cdc=1` (threads, one process) or `file:db?mw=2&mw_mp=1&mw_cdc=1` (processes; `mw_mp=1` is the shared mode). Without
 `mw_cdc=1` it is the plain multi-writer engine.
@@ -350,8 +350,7 @@ CDC map is created with `O_EXCL` after an unlink. A sidecar in `/dev/shm` theref
 
 ## License
 
-The code in this repository is under the licence in `LICENSE.md`. `deps/sqlite-sync` (a submodule, used for the SQLite amalgamation, `lz4.c` and the oracle tests) keeps its own licence; SQLite is public
-domain and LZ4 is BSD 2-clause.
+The code in this repository is under the licence in `LICENSE.md`. `third_party/` holds SQLite (public domain) and LZ4 (BSD 2-clause), each with its own licence; `deps/sqlite-sync` (optional, oracle tests only) keeps its own.
 
 ## Third group of corrections (open items of the review)
 

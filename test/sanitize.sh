@@ -13,11 +13,11 @@ case $KIND in
 esac
 OUT=build/$KIND; BIN=dist/$KIND; mkdir -p $OUT/oracle $BIN
 SS=deps/sqlite-sync
-CF="-O1 -g $SAN -fno-omit-frame-pointer -Isrc -Isrc/crdt -I$SS/sqlite -I$SS/src -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"
+CF="-O1 -g $SAN -fno-omit-frame-pointer -Isrc -Isrc/crdt -Ithird_party/sqlite -Ithird_party/lz4 -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"
 for f in src/*.c src/crdt/*.c; do cc -w $CF -c $f -o $OUT/$(basename $f .c).o; done
-cc -w -O1 -g $SAN -fno-omit-frame-pointer -I$SS/sqlite -DSQLITE_EXTRA_INIT=mw_extra_init -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DSQLITE_CORE -c $SS/sqlite/sqlite3.c -o $OUT/sqlite3.o
-cc -w -O1 -g $SAN -c $SS/src/lz4.c -o $OUT/lz4.o
-OCF="-O1 -g $SAN -w -I$SS/src -I$SS/src/sqlite -I$SS/src/network -I$SS/modules/fractional-indexing -I$SS/sqlite -DSQLITE_CORE -DCLOUDSYNC_OMIT_NETWORK -DCLOUDSYNC_OMIT_PRINT_RESULT"
+cc -w -O1 -g $SAN -fno-omit-frame-pointer -Ithird_party/sqlite -DSQLITE_EXTRA_INIT=mw_extra_init -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DSQLITE_CORE -c third_party/sqlite/sqlite3.c -o $OUT/sqlite3.o
+cc -w -O1 -g $SAN -c third_party/lz4/lz4.c -o $OUT/lz4.o
+OCF="-O1 -g $SAN -w -Ithird_party/lz4 -I$SS/src -I$SS/src/sqlite -I$SS/src/network -I$SS/modules/fractional-indexing -Ithird_party/sqlite -DSQLITE_CORE -DCLOUDSYNC_OMIT_NETWORK -DCLOUDSYNC_OMIT_PRINT_RESULT"
 NEED_ORACLE=0
 TESTS=${@:-"mw_metastore mw_ddl_meta mw_mpmeta mw_sync mw_capture mw_rowdiff oracle_meta oracle_sync oracle_features"}
 for t in $TESTS; do case $t in oracle_*) NEED_ORACLE=1;; esac; done

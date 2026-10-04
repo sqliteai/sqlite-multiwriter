@@ -5,8 +5,8 @@ commit, nothing in SQLite is modified, no SQL syntax is added, and every write i
 
 The CRDT metadata of [sqlite-sync](https://github.com/sqliteai/sqlite-sync) (a causal length per row, a version per cell) is captured **in the VFS, for every table**,
 and travels inside the commit record of the transaction that made it: no triggers, no update hook, no metadata tables written by SQL, no change to the application's
-tables. The database is always ready to be synchronised: `mw_sync_export` / `mw_sync_apply` speak sqlite-sync's wire format. sqlite-sync is a submodule
-(`deps/sqlite-sync`): its CRDT algorithms and payload container are the reference and the oracle of the differential tests; its SQL-level API is not used.
+tables. The database is always ready to be synchronised: `mw_sync_export` / `mw_sync_apply` speak sqlite-sync's wire format. The project builds and tests on its own: SQLite 3.45.3 and LZ4 1.9 are vendored in `third_party/`. sqlite-sync is an optional submodule
+(`deps/sqlite-sync`): its CRDT algorithms and payload container are the reference and the oracle of the differential tests (`make oracle-test`); its SQL-level API is not used.
 
     #include "multiwriter.h"        /* the VFS registers itself when SQLite initialises (SQLITE_EXTRA_INIT) */
     #include "multiwriter_sync.h"
@@ -19,7 +19,7 @@ tables. The database is always ready to be synchronised: `mw_sync_export` / `mw_
 
 Status: macOS first (Linux, iOS, Windows, Android next). `docs/design.md` is the design and its limits, `docs/engine-history.md` the measurements and decisions of the engine.
 
-    git clone --recurse-submodules <url> && cd sqlite-multiwriter
+    git clone <url> && cd sqlite-multiwriter
     make test           # engine + metadata test suite
     make oracle-test    # differential tests against sqlite-sync itself
     make test-mp        # the metadata tests with processes (mw_mp=1)
@@ -31,4 +31,4 @@ Status: macOS first (Linux, iOS, Windows, Android next). `docs/design.md` is the
 
 ## License
 
-See `LICENSE.md` (Elastic License 2.0, modified). `deps/sqlite-sync` and the bundled SQLite (public domain) and LZ4 (BSD 2-clause) keep their own licences.
+See `LICENSE.md` (Elastic License 2.0, modified). `deps/sqlite-sync` (optional) and the vendored SQLite (public domain) and LZ4 (BSD 2-clause) keep their own licences.

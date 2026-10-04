@@ -179,12 +179,13 @@ static int do_txn (agent_t *a) {
             if (cfg.begin_wait) {                                  // explicit transaction: BEGIN IMMEDIATE is where SQLite takes the write lock (and waits for it)
                 rc = exec_(a->db, "BEGIN IMMEDIATE");
                 if (rc == SQLITE_OK) rc = exec_(a->db, "SELECT count(*) FROM sqlite_master");     // (Multi-Writer takes its snapshot, and waits for admission, at the first read: the write may start after this)
-                if (rc != SQLITE_OK) { if (!sqlite3_get_autocommit(a->db)) exec_(a->db, "ROLLBACK"); return retryable(rc) ? 0 : -1; }
+                if (rc != SQLITE_OK) { if (!retryable(rc) && getenv("MW_BENCH_DEBUG")) fprintf(stderr, "bulk begin error rc=%d: %s\n", rc, sqlite3_errmsg(a->db)); if (!sqlite3_get_autocommit(a->db)) exec_(a->db, "ROLLBACK"); return retryable(rc) ? 0 : -1; }
                 a->begin_ok_ns = now_ns();
                 rc = exec_(a->db, big);
                 if (rc == SQLITE_OK) rc = exec_(a->db, "COMMIT");
                 if (rc == SQLITE_OK) { a->commits++; return 1; }
                 if (!sqlite3_get_autocommit(a->db)) exec_(a->db, "ROLLBACK");
+                if (!retryable(rc) && getenv("MW_BENCH_DEBUG")) fprintf(stderr, "bulk error rc=%d: %s\n", rc, sqlite3_errmsg(a->db));
                 return retryable(rc) ? 0 : -1;
             }
             rc = exec_(a->db, big);

@@ -161,6 +161,16 @@ the metadata tests with the store under pressure.
   column+1, version, db_version, site and sequence repeat (`cz_put`/`cz_get`; row format 2, extension 0x4f; format-1 rows are still read). A row of 100 narrow cells took ~7 bytes a cell and takes ~1.
   Measured (30 s): 16 threads 28.2k tx/s (tracked) against 45.4k untracked; 4 processes 14.8k against 25.6k; 8 processes 15.0k against 24.8k - no gain over before: the volume of the metadata is not what limits the
   gap, the CPU of the capture, the apply and the merge is. Kept for the smaller log and runs.
+- **Less CPU in the capture and the apply (measured).** The rows of the memory table are kept packed (the form of a row of a run, ~40 bytes for 17 cells instead of 550): a commit packs a row once, outside
+  the lock of its stripe, and the entry and the change that waits for the flusher take a copy of it (before: a copy of the cells, then a second packing). The owner map of the row diff takes only the
+  children of an interior page that the commit wrote itself (a root page lists hundreds, and most commits rewrite it) and stops when a pass finds nothing new (it always made three). The stripes spin a little
+  before sleeping. 1 thread 8.7k -> 8.9k, 4 threads 15.9k -> 17.2k, 16 threads 29.8k -> 29.8k tx/s (the same within the noise).
+- **Why 16 threads did not move.** With `MW_EXP_NOAPPLY=1` (nothing is installed, so nothing is flushed or merged) 16 threads give 40k tx/s against 30k, but the part that is the commit's own CPU is small
+  (a row's install is 0.3 us waiting for its stripe + 0.4 us holding it, ~70 us a commit of 520). The rest is the merger: its thread is 100% busy, half of that in the small transactions that write its
+  parts and in reading its inputs through the page store, and the run-count back-pressure takes ~10% of the writers' time (`MW_META_MAX_RUNS=100000` gives 34k for 20 s, but the backlog then grows
+  without limit: 960 age groups after 20 s). More merger threads (levels split between 2, 3, 4 threads), a fanout of 16 or 32 and bigger parts all measured the same or worse: the merges do not
+  scale because they share the page store and the write turn of the file tables. The way ahead is a cheaper merge (fewer small transactions, reading the inputs without going through the page
+  store), not more CPU saved in the commit.
 
 ## Capture and DDL
 

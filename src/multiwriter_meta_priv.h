@@ -30,8 +30,8 @@ typedef struct { fitem *v; int n, cap; uint8_t **blocks; int nblocks, capblocks;
 typedef struct mentry {
     struct mentry *next;
     uint64_t h, ver, dseq;                     // ver: epoch of the last change; dseq: the stripe's sequence number of its last change (it is dirty while that is above the stripe's flushed_seq)
-    uint32_t tbl, pklen; int n, cap; bool inl; uint8_t cls;     // inl: the cells are in the same allocation as the entry (after the key)
-    mw_mcell *cells;
+    uint32_t tbl, pklen, n, bloblen, cap; bool inl; uint8_t cls;     // the cells are kept packed (as a row of a run: ~1 byte a cell, not 32); inl: they are in the same allocation as the entry (after the key); cap: room for them
+    uint8_t *blob;
     uint8_t pk[];
 } mentry;
 
@@ -56,7 +56,7 @@ static inline void *stripe_alloc (stripe *s, size_t sz, uint8_t *cls) {
     return slab;
 }
 static inline void entry_free (stripe *s, mentry *e) {
-    if (!e->inl) free(e->cells);
+    if (!e->inl) free(e->blob);
     if (!e->cls) { free(e); return; }
     *(void **)e = s->efree[e->cls]; s->efree[e->cls] = e;
 }                        // a stripe's pending changes taken by a flush, and the sequence number they reach
@@ -134,6 +134,10 @@ static inline int cz_get (const uint8_t **p, const uint8_t *end, uint64_t v[5], 
 #endif
 
 void *mw_fbatch_alloc (fbatch *b, size_t n);
+fitem *mw_fbatch_add_packed (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t pklen, const uint8_t *blob, size_t len, int n, int64_t dv);   // the same with the cells packed already (mw_meta_pack_row)
+// packs the cells of a row (a db_version of OV_CHG becomes `chg_epoch`, if `resolve`) into `out`, which has room for MW_PACK_MAX(n) bytes; *maxdv: the largest db_version of the cells
+#define MW_PACK_MAX(n) (16 + (size_t)(n) * 48)
+size_t mw_meta_pack_row (const mw_mcell *c, int n, bool resolve, uint64_t chg_epoch, uint8_t *out, int64_t *maxdv);
 fitem *mw_fbatch_add_row (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t pklen, const mw_mcell *c, int n);   // a new item: the key copied, the cells packed; NULL on memory failure
 void   mw_fbatch_free (fbatch *b);
 

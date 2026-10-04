@@ -40,16 +40,20 @@ static bool get_var (const uint8_t **p, const uint8_t *end, uint64_t *v) {
     return false;
 }
 // the packed cells in `out` (room for 1 + 10 + 45 bytes a cell); returns the length
-static size_t row_pack (const mw_mcell *c, int n, uint8_t *out) {
+static size_t row_pack_ex (const mw_mcell *c, int n, bool resolve, uint64_t chg, uint8_t *out, int64_t *maxdv) {
     size_t w = 0; out[w++] = ROW_FORMAT; w += put_var(out + w, (uint64_t)n);
-    uint64_t prev[5];
+    uint64_t prev[5]; int64_t mx = 0;
     for (int i = 0; i < n; i++) {
-        uint64_t v[5] = { (uint32_t)(c[i].col + 1u), (uint64_t)c[i].cv, (uint64_t)c[i].dv, c[i].site, c[i].seq };
+        int64_t dv = (resolve && c[i].dv == OV_CHG) ? (int64_t)chg : c[i].dv; if (dv > mx) mx = dv;
+        uint64_t v[5] = { (uint32_t)(c[i].col + 1u), (uint64_t)c[i].cv, (uint64_t)dv, c[i].site, c[i].seq };
         w += cz_put(out + w, v, i ? prev : NULL); memcpy(prev, v, sizeof prev);
     }
+    if (maxdv) *maxdv = mx;
     return w;
 }
-#define ROW_PACK_MAX(n) (16 + (size_t)(n) * 48)
+static size_t row_pack (const mw_mcell *c, int n, uint8_t *out) { return row_pack_ex(c, n, false, 0, out, NULL); }
+size_t mw_meta_pack_row (const mw_mcell *c, int n, bool resolve, uint64_t chg_epoch, uint8_t *out, int64_t *maxdv) { return row_pack_ex(c, n, resolve, chg_epoch, out, maxdv); }
+#define ROW_PACK_MAX(n) MW_PACK_MAX(n)
 // the cells of a packed row, appended to `*c` (grown as needed; `*n` the count so far); false when the blob is not one
 static bool row_unpack (const uint8_t *p, size_t len, mw_mcell **c, int *n, int *cap) {
     const uint8_t *end = p + len; uint64_t cnt;
@@ -262,6 +266,14 @@ fitem *mw_fbatch_add_row (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t p
     if (!k) return NULL;
     memcpy(k, pk, pklen); if (len) memcpy(k + pklen, b->tmp, len);
     int64_t dv = 0; for (int i = 0; i < n; i++) if (c[i].dv > dv) dv = c[i].dv;
+    fitem *it = &b->v[b->n++]; *it = (fitem){ tbl, k, pklen, (uint32_t)n, (uint32_t)len, k + pklen, dv };
+    return it;
+}
+fitem *mw_fbatch_add_packed (fbatch *b, uint32_t tbl, const uint8_t *pk, uint32_t pklen, const uint8_t *blob, size_t len, int n, int64_t dv) {
+    if (b->n == b->cap) { int nc = b->cap ? b->cap * 2 : 1024; fitem *nv = realloc(b->v, (size_t)nc * sizeof *nv); if (!nv) return NULL; b->v = nv; b->cap = nc; }
+    uint8_t *k = mw_fbatch_alloc(b, (size_t)pklen + len + 1);
+    if (!k) return NULL;
+    memcpy(k, pk, pklen); if (len) memcpy(k + pklen, blob, len);
     fitem *it = &b->v[b->n++]; *it = (fitem){ tbl, k, pklen, (uint32_t)n, (uint32_t)len, k + pklen, dv };
     return it;
 }

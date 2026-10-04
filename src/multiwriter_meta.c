@@ -65,7 +65,7 @@ mw_meta *mw_meta_new (struct mw_db *db) {
 void mw_meta_free (mw_meta *m) {
     if (!m) return;
     for (int i = 0; i < STRIPES; i++) {
-        for (size_t k = 0; m->st[i].b && k < m->st[i].nb; k++) for (mentry *e = m->st[i].b[k], *nx; e; e = nx) { nx = e->next; if (!e->inl) free(e->cells); if (!e->cls) free(e); }
+        for (size_t k = 0; m->st[i].b && k < m->st[i].nb; k++) for (mentry *e = m->st[i].b[k], *nx; e; e = nx) { nx = e->next; if (!e->inl) free(e->blob); if (!e->cls) free(e); }
         for (int q = 0; q < m->st[i].nslabs; q++) free(m->st[i].slabs[q]); free(m->st[i].slabs); free(m->st[i].b); { size_t bm = m->st[i].pend.blockmin; mw_fbatch_free(&m->st[i].pend); (void)bm; } pthread_mutex_destroy(&m->st[i].mu);
     }
     mw_metafile_free(m); rsx_free(m->rsx); free(m->purge); free(m->bloom);
@@ -73,7 +73,7 @@ void mw_meta_free (mw_meta *m) {
     pthread_mutex_destroy(&m->site_mu); free(m->sites); free(m);
 }
 
-static size_t entry_bytes (const mentry *e) { return sizeof *e + e->pklen + (size_t)e->cap * sizeof(mw_mcell); }
+static size_t entry_bytes (const mentry *e) { return sizeof *e + e->pklen + (size_t)e->cap; }
 
 static mentry *find (stripe *s, uint64_t h, uint32_t tbl, const void *pk, size_t pklen) {
     for (mentry *e = s->b[(h >> 8) & (s->nb - 1)]; e; e = e->next) if (e->h == h && e->tbl == tbl && e->pklen == pklen && !memcmp(e->pk, pk, pklen)) return e;
@@ -108,7 +108,7 @@ static void evict (mw_meta *m, stripe *s) { size_t cap = m->cap_bytes / STRIPES 
 void mw_meta_trim (mw_meta *m, int stripe_no) {
     stripe *s = &m->st[stripe_no]; size_t cap = m->cap_bytes / STRIPES + 1;
     for (int round = 0; round < 64; round++) {
-        pthread_mutex_lock(&s->mu);
+        mw_spinlock(&s->mu);
         bool over = s->bytes > cap; if (over) evict_to(m, s, cap, 512);
         bool still = s->bytes > cap && !s->backoff;
         pthread_mutex_unlock(&s->mu);
@@ -116,15 +116,24 @@ void mw_meta_trim (mw_meta *m, int stripe_no) {
     }
 }
 
-static mentry *entry_new (stripe *s, uint64_t h, uint32_t tbl, const void *pk, size_t pklen, const mw_mcell *c, int n) {
+static mentry *entry_new (stripe *s, uint64_t h, uint32_t tbl, const void *pk, size_t pklen, const uint8_t *blob, size_t bl, int n) {
     size_t off = (sizeof(mentry) + pklen + 7) & ~(size_t)7;                          // (one allocation for the entry, its key and its cells: a row costs one take and one give back)
-    uint8_t cls; mentry *e = stripe_alloc(s, off + (size_t)n * sizeof *c, &cls);
+    uint8_t cls; mentry *e = stripe_alloc(s, off + bl, &cls);
     if (!e) return NULL;
     memset(e, 0, off);
     e->h = h; e->tbl = tbl; e->pklen = (uint32_t)pklen; memcpy(e->pk, pk, pklen);
-    e->cap = n; e->n = n; e->inl = true; e->cls = cls;
-    if (n) { e->cells = (mw_mcell *)((uint8_t *)e + off); memcpy(e->cells, c, (size_t)n * sizeof *c); }
+    e->cap = (uint32_t)bl; e->bloblen = (uint32_t)bl; e->n = (uint32_t)n; e->inl = true; e->cls = cls;
+    if (bl) { e->blob = (uint8_t *)e + off; memcpy(e->blob, blob, bl); }
     return e;
+}
+// The cells of a row packed in a buffer of this thread (a row of 17 cells is ~40 bytes packed; the entry and the change that waits for the flusher both take a copy)
+static size_t pack_tl (const mw_mcell *c, int n, bool resolve, uint64_t ep, uint8_t **buf, int64_t *dv) {
+    static __thread uint8_t *tb; static __thread size_t tcap;
+    size_t need = MW_PACK_MAX(n);
+    if (need > tcap) { uint8_t *nb = realloc(tb, need * 2); if (!nb) return (size_t)-1; tb = nb; tcap = need * 2; }
+    *buf = tb;
+    if (!n) { *dv = 0; return 0; }
+    return mw_meta_pack_row(c, n, resolve, ep, tb, dv);
 }
 
 static void insert_entry (mw_meta *m, stripe *s, mentry *e) {
@@ -152,19 +161,20 @@ void mw_meta_bloom_add (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen) 
 // the table's copy of a row (a hit), without looking at the file
 static int mem_peek (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **out, int *n) {
     uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
-    pthread_mutex_lock(&s->mu);
+    mw_spinlock(&s->mu);
     mentry *e = find(s, h, tbl, pk, pklen);
     if (!e) { pthread_mutex_unlock(&s->mu); return 0; }
     atomic_fetch_add(&m->hits, 1);
-    *n = e->n; *out = NULL;
-    if (e->n) { *out = malloc((size_t)e->n * sizeof **out); if (!*out) { pthread_mutex_unlock(&s->mu); return -1; } memcpy(*out, e->cells, (size_t)e->n * sizeof **out); }
+    *n = (int)e->n; *out = NULL;
+    if (e->n && !mw_meta_row_cells(e->blob, e->bloblen, out, n)) { pthread_mutex_unlock(&s->mu); return -1; }
     pthread_mutex_unlock(&s->mu); return 1;
 }
 // what the file said about a row goes into the table as a clean entry (if nobody put one there meanwhile)
 static void mem_cache (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, const mw_mcell *c, int n) {
     uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
-    pthread_mutex_lock(&s->mu);
-    if (!find(s, h, tbl, pk, pklen)) { mentry *ne = entry_new(s, h, tbl, pk, pklen, c, n); if (ne) { insert_entry(m, s, ne); evict(m, s); } }
+    uint8_t *buf; int64_t dv; size_t bl = pack_tl(c, n, false, 0, &buf, &dv); if (bl == (size_t)-1) return;
+    mw_spinlock(&s->mu);
+    if (!find(s, h, tbl, pk, pklen)) { mentry *ne = entry_new(s, h, tbl, pk, pklen, buf, bl, n); if (ne) { insert_entry(m, s, ne); evict(m, s); } }
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -503,29 +513,28 @@ static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pkle
     uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
     bool sen = false; for (int k = 0; k < n; k++) if (c[k].col == SEN) sen = true;
     mentry *ne = NULL;
-    pthread_mutex_lock(&s->mu);
+    uint8_t *buf; int64_t dvmax; size_t bl = pack_tl(c, n, true, epoch, &buf, &dvmax); if (bl == (size_t)-1) return -1;       // (outside the lock)
+    mw_spinlock(&s->mu);
     mentry *e = find(s, h, tbl, pk, pklen);
     if (!e) {                                                          // a new row: one allocation for the entry (its cells are the state), linked once
-        ne = entry_new(s, h, tbl, pk, pklen, c, n);
+        ne = entry_new(s, h, tbl, pk, pklen, buf, bl, n);
         if (!ne) { pthread_mutex_unlock(&s->mu); return -1; }
-        for (int k = 0; k < n; k++) if (ne->cells[k].dv == OV_CHG) ne->cells[k].dv = (int64_t)epoch;
         ne->ver = epoch;
-        if (!mw_fbatch_add_row(&s->pend, tbl, pk, (uint32_t)pklen, ne->cells, n)) { entry_free(s, ne); pthread_mutex_unlock(&s->mu); return -1; }        // (the change waits for the flusher with its own copy of the row's state)
+        if (!mw_fbatch_add_packed(&s->pend, tbl, pk, (uint32_t)pklen, buf, bl, n, dvmax)) { entry_free(s, ne); pthread_mutex_unlock(&s->mu); return -1; }        // (the change waits for the flusher with its own copy)
         ne->dseq = ++s->seq; atomic_fetch_add(&m->ndirty, 1);
         insert_entry(m, s, ne);
     } else {
         size_t before = entry_bytes(e);
-        if (n > e->cap) {
-            mw_mcell *nm;
-            if (e->inl) { nm = malloc((size_t)n * sizeof *nm); if (nm && e->n) memcpy(nm, e->cells, (size_t)e->n * sizeof *nm); }
-            else nm = realloc(e->cells, (size_t)n * sizeof *nm);
-            if (!nm) { pthread_mutex_unlock(&s->mu); return -1; }
-            e->cells = nm; e->cap = n; e->inl = false;
+        if (bl > e->cap) {
+            uint8_t *nb = malloc(bl);
+            if (!nb) { pthread_mutex_unlock(&s->mu); return -1; }
+            if (!e->inl) free(e->blob);
+            e->blob = nb; e->cap = (uint32_t)bl; e->inl = false;
         }
-        for (int k = 0; k < n; k++) { e->cells[k] = c[k]; if (c[k].dv == OV_CHG) e->cells[k].dv = (int64_t)epoch; }
-        e->n = n;
+        if (bl) memcpy(e->blob, buf, bl);
+        e->bloblen = (uint32_t)bl; e->n = (uint32_t)n;
         e->ver = epoch;
-        if (!mw_fbatch_add_row(&s->pend, tbl, pk, (uint32_t)pklen, e->cells, n)) { pthread_mutex_unlock(&s->mu); return -1; }
+        if (!mw_fbatch_add_packed(&s->pend, tbl, pk, (uint32_t)pklen, buf, bl, n, dvmax)) { pthread_mutex_unlock(&s->mu); return -1; }
         e->dseq = ++s->seq; atomic_fetch_add(&m->ndirty, 1);
         size_t after = entry_bytes(e);
         if (after != before) { s->bytes += after - before; atomic_fetch_add(&m->bytes, after - before); }

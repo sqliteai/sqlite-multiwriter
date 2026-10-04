@@ -273,12 +273,31 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_o
     }
     // owners of the pages of the committed state that the interior pages written by the commit list (a few passes: an interior page may itself be new)
     ovmap ov = {0};
-    if (own) for (int pass = 0; pass < 3; pass++) for (int i = 0; i < lane->ws_n; i++) {
-        const uint8_t *pg = imgs[i]; if (lane->ws_pgnos[i] == 1 || (pg[0] != 0x05 && pg[0] != 0x02)) continue;
-        uint32_t r = owner_new(own, &ov, lane->ws_pgnos[i]); if (!r) continue;
-        int nc = be16(pg + 3);
-        ov_put(&ov, be32(pg + 8), r);
-        for (int c = 0; c < nc; c++) { uint32_t off = (uint32_t)be16(pg + 12 + 2 * c); if (off + 4 <= pgsz) ov_put(&ov, be32(pg + off), r); }
+    if (own) {
+        // only the pages the transaction wrote can be asked for an owner: the children of an interior page that are not among them are not recorded (a root page lists hundreds of children and is rewritten by most commits)
+        uint32_t wcap = 16; while (wcap < (uint32_t)lane->ws_n * 2) wcap <<= 1;
+        uint32_t wsbuf[256], *wset = wcap <= 256 ? wsbuf : malloc((size_t)wcap * sizeof *wset);
+        if (wset) {
+            memset(wset, 0, (size_t)wcap * sizeof *wset);
+            for (int i = 0; i < lane->ws_n; i++) { uint32_t h = (lane->ws_pgnos[i] * 2654435761u) & (wcap - 1); while (wset[h]) h = (h + 1) & (wcap - 1); wset[h] = lane->ws_pgnos[i]; }
+        }
+        for (int pass = 0; pass < 3; pass++) {
+            int unresolved = 0; uint32_t before = ov.n;
+            for (int i = 0; i < lane->ws_n; i++) {
+                const uint8_t *pg = imgs[i]; if (lane->ws_pgnos[i] == 1 || (pg[0] != 0x05 && pg[0] != 0x02)) continue;
+                uint32_t r = owner_new(own, &ov, lane->ws_pgnos[i]); if (!r) { unresolved++; continue; }
+                int nc = be16(pg + 3);
+                for (int c = -1; c < nc; c++) {
+                    uint32_t ch;
+                    if (c < 0) ch = be32(pg + 8);
+                    else { uint32_t off = (uint32_t)be16(pg + 12 + 2 * c); if (off + 4 > pgsz) continue; ch = be32(pg + off); }
+                    if (wset) { uint32_t h = (ch * 2654435761u) & (wcap - 1); while (wset[h] && wset[h] != ch) h = (h + 1) & (wcap - 1); if (!wset[h]) continue; }
+                    ov_put(&ov, ch, r);
+                }
+            }
+            if (!unresolved || ov.n == before) break;                                // (nothing left to find, or the last pass found nothing new)
+        }
+        if (wset != wsbuf) free(wset);
     }
     for (int i = 0; i < lane->ws_n && oldimg; i++) {
         uint32_t pgno = lane->ws_pgnos[i];

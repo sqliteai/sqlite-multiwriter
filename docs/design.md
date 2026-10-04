@@ -188,6 +188,13 @@ the metadata tests with the store under pressure.
   ~8 us of a publication by every commit that rewrites it), and the sampled "time in mw_store_read" was waiting that overlaps with other waits (the group commit), not a cost on the critical path. Not kept:
   more code in the page store for no measurable gain. (Also: after a few runs of 4 GB each the machine throttles - 28k became 21k for both binaries until it rested - so a comparison needs
   alternating runs with pauses.)
+- **The lock of publication of a hot page (measured, fixed).** A commit holds the stripes of the pages it writes from the validation to the install, ~7 us; 4.7 of them were waiting for `seq_mu` (the lock that
+  assigns epochs and log offsets), and 97% of that wait came from 0.09% of the commits: the ones that met the compactor, which rewrote the tail of the log under `seq_mu` (550 times in 20 s; per rewrite: ~43 MB
+  of tail, wait for the writes in flight 0.7 ms, copy 3.7 ms, fsync 0.45 ms, rename and swap 0.65 ms = 5.5 ms with every committer stopped, holding its stripes, the root page of the table among them).
+  Now (staged log, one process) the compactor copies the records that are durable into the new file and fsyncs it *before* taking `seq_mu`, a second round copies what came in meanwhile, and under the lock only
+  the last records are copied (`mw_log_rewrite_prepare` / `mw_log_rewrite_tail(.., prep)`; the old path stays for the multi-process mode). 16 threads, 15 s, three alternating pairs: untracked 45.9k -> 48.3k tx/s and p99
+  2.8 -> 1.07 ms; tracked 30.9k -> 30.9k tx/s and p99 5.3 -> 1.9 ms. (A log limit of 128 MB gave the same p99 without the change, 512 MB made it worse: 20k tx/s, p99 21 ms.) Test `mw_logrewrite`
+  (1 MB limit, 8 committers, then SIGKILL at ten different moments: every acknowledged commit is there, the integrity check passes).
 
 ## Capture and DDL
 

@@ -1027,18 +1027,74 @@ int mw_db_make_visible (mw_db *db, uint64_t epoch) {
 
 // MARK: - log rewrite (keeps the log bounded under continuous load) -
 
+// The tail of the log is copied while commits go on, and only what came in meanwhile is copied under seq_mu (the whole copy, the fsync of it and the wait for the writes in flight took 5.5 ms
+// there, with every committer waiting for the lock while holding the stripes of its pages: the root page of a table was held for that long, 550 times in 20 seconds).
+// Staged log only. Phase 1 (no lock held) copies the records that are durable now; phase 2 (mw_log_rewrite_tail with the same `prep`) the rest.
+struct mw_log_prep { int nfd; char *tmp; uint64_t tail_off, copied_end; };
+static uint64_t scan_fd_after (mw_db *db, uint64_t epoch, uint64_t from, uint64_t end, uint64_t *first_after) {       // the first record newer than `epoch`, and the end of the last whole record before `end` (headers read from the file)
+    uint64_t off = from; size_t pgsz = (size_t)db->store->pgsz; if (first_after) *first_after = 0;
+    while (off + REC_HDR_SIZE <= end) {
+        rec_hdr r;
+        if (pread_all(db->logfd, &r, sizeof r, (off_t)off) != SQLITE_OK) break;
+        if (r.magic != REC_MAGIC || r.pgsz != (uint32_t)pgsz || r.npages == 0) break;
+        uint64_t next = off + REC_HDR_SIZE + (uint64_t)r.npages * (4 + pgsz) + r.ext_len;
+        if (next > end) break;
+        if (r.epoch > epoch && first_after && !*first_after) *first_after = off;
+        off = next;
+    }
+    return off;
+}
+static int copy_range (int from_fd, int to_fd, uint64_t from, uint64_t to, uint64_t out) {
+    size_t chunk = 1 << 20; uint8_t *buf = malloc(chunk); if (!buf) return SQLITE_NOMEM;
+    int rc = SQLITE_OK;
+    for (uint64_t pos = from; rc == SQLITE_OK && pos < to; ) {
+        size_t n = (size_t)(to - pos < chunk ? to - pos : chunk);
+        rc = pread_all(from_fd, buf, n, (off_t)pos);
+        if (rc == SQLITE_OK) rc = pwrite_all(to_fd, buf, n, (off_t)out);
+        pos += n; out += n;
+    }
+    free(buf);
+    return rc;
+}
+void mw_log_rewrite_abort (mw_log_prep *p) { if (!p) return; if (p->nfd >= 0) close(p->nfd); if (p->tmp) { unlink(p->tmp); sqlite3_free(p->tmp); } free(p); }
+mw_log_prep *mw_log_rewrite_prepare (mw_db *db, uint64_t base_epoch) {
+    if (db->mp || db->shared || db->logfd < 0 || !db->store || atomic_load(&db->log_mode) != 2) return NULL;
+    uint64_t E; pthread_mutex_lock(&db->log_mu); E = db->synced_off; pthread_mutex_unlock(&db->log_mu);          // (everything below is in the file, whole records)
+    uint64_t first = 0; uint64_t bound = scan_fd_after(db, base_epoch, LOG_HDR_SIZE, E, &first);
+    if (!first) return NULL;
+    mw_log_prep *p = calloc(1, sizeof *p); if (!p) return NULL;
+    p->nfd = -1; p->tail_off = first;
+    p->tmp = sqlite3_mprintf("%s.new", db->logpath); if (!p->tmp) { free(p); return NULL; }
+    p->nfd = open(p->tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (p->nfd < 0) { p->nfd = -1; mw_log_rewrite_abort(p); return NULL; }
+    int rc = flock(p->nfd, LOCK_EX | LOCK_NB) != 0 ? SQLITE_BUSY : SQLITE_OK;
+    log_hdr h; memset(&h, 0, sizeof h);
+    memcpy(h.magic, LOG_MAGIC, 8); h.version = 1; h.pgsz = (uint32_t)db->store->pgsz; h.base_epoch = base_epoch; h.salt = db->log_salt; h.cksum = hdr_cksum(&h);
+    if (rc == SQLITE_OK) rc = pwrite_all(p->nfd, &h, sizeof h, 0);
+    if (rc == SQLITE_OK) rc = copy_range(db->logfd, p->nfd, first, bound, LOG_HDR_SIZE);
+    if (rc == SQLITE_OK) p->copied_end = bound;
+    if (rc == SQLITE_OK && bound > first) {                                                      // a second round: what came in while the first one was copied
+        pthread_mutex_lock(&db->log_mu); E = db->synced_off; pthread_mutex_unlock(&db->log_mu);
+        uint64_t b2 = scan_fd_after(db, UINT64_MAX, bound, E, NULL);
+        if (b2 > bound && copy_range(db->logfd, p->nfd, bound, b2, LOG_HDR_SIZE + (bound - first)) == SQLITE_OK) p->copied_end = b2;
+    }
+    if (rc == SQLITE_OK && mw_io_fsync(p->nfd) != 0) rc = SQLITE_IOERR_FSYNC;                      // (the bulk is on the disk before the lock is taken)
+    if (rc != SQLITE_OK) { mw_log_rewrite_abort(p); return NULL; }
+    return p;
+}
+
 // Replaces the log by a new file holding only the records newer than `base_epoch` (header base = base_epoch).
 // Called from compaction with store->seq_mu held: no epoch/offset can be assigned meanwhile; records already
 // assigned are waited for (their pwrite runs outside seq_mu). crash safety: the new file is complete and
 // fsynced before rename() atomically replaces the old one.
-int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch) {
+int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch, mw_log_prep *prep) {
     mw_store *st = db->store;
     // first record newer than base_epoch, from the size records
     // The size records cannot be used to find it: local GC prunes them up to this process's oldest snapshot, which in
     // multi-process mode can be newer than base_epoch (a missing record would make the new log start after base+1: a gap).
     // Scan the headers instead.
-    uint64_t tail_off = db->logmap ? mw_log_scan_after(db, base_epoch, MW_LOG_OFF(db)) : 0;
-    if (tail_off == 0) return SQLITE_OK;                                  // no map: leave the log alone
+    uint64_t tail_off = prep ? prep->tail_off : db->logmap ? mw_log_scan_after(db, base_epoch, MW_LOG_OFF(db)) : 0;
+    if (tail_off == 0) { mw_log_rewrite_abort(prep); return SQLITE_OK; }  // no map: leave the log alone
     // wait for in-flight record writes (bounded)
     for (int spin = 0; spin < 200000; spin++) {
         pthread_mutex_lock(&db->log_mu);
@@ -1047,34 +1103,30 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch) {
         if (done && atomic_load(&db->log_mode) == 2) done = stage_drained(db);        // (staged records must be in the file: the copy below reads it)
         else if (!done && atomic_load(&db->log_mode) == 2) stage_flush(db, false);
         if (done) break;
-        if (spin == 199999) return SQLITE_BUSY;
+        if (spin == 199999) { mw_log_rewrite_abort(prep); return SQLITE_BUSY; }
         sched_yield();
     }
     uint64_t end = MW_LOG_OFF(db);
-    if (tail_off > end) return SQLITE_OK;
-    char *tmp = sqlite3_mprintf("%s.new", db->logpath);
-    if (!tmp) return SQLITE_NOMEM;
-    int nfd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (nfd < 0) { sqlite3_free(tmp); return SQLITE_CANTOPEN; }
-    int rc = SQLITE_OK;
-    if (flock(nfd, (db->mp ? LOCK_SH : LOCK_EX) | LOCK_NB) != 0) rc = SQLITE_BUSY;
-    log_hdr h;
-    memset(&h, 0, sizeof h);
-    memcpy(h.magic, LOG_MAGIC, 8);
-    h.version = 1; h.pgsz = (uint32_t)st->pgsz; h.base_epoch = base_epoch; h.salt = db->log_salt;
-    h.cksum = hdr_cksum(&h);
-    if (rc == SQLITE_OK) rc = pwrite_all(nfd, &h, sizeof h, 0);
-    size_t chunk = 1 << 20;
-    uint8_t *buf = malloc(chunk);
-    if (!buf) rc = SQLITE_NOMEM;
+    if (tail_off > end || (prep && prep->copied_end > end)) { mw_log_rewrite_abort(prep); return SQLITE_OK; }
+    char *tmp; int nfd; int rc = SQLITE_OK;
     uint64_t pos = tail_off, out = LOG_HDR_SIZE;
-    while (rc == SQLITE_OK && pos < end) {
-        size_t n = (size_t)(end - pos < chunk ? end - pos : chunk);
-        rc = pread_all(db->logfd, buf, n, (off_t)pos);
-        if (rc == SQLITE_OK) rc = pwrite_all(nfd, buf, n, (off_t)out);
-        pos += n; out += n;
+    if (prep) {                                                           // (the bulk was copied and fsynced before the lock: only what came in since is left)
+        tmp = prep->tmp; nfd = prep->nfd; pos = prep->copied_end; out = LOG_HDR_SIZE + (prep->copied_end - tail_off);
+        free(prep); prep = NULL;
+    } else {
+        tmp = sqlite3_mprintf("%s.new", db->logpath);
+        if (!tmp) return SQLITE_NOMEM;
+        nfd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (nfd < 0) { sqlite3_free(tmp); return SQLITE_CANTOPEN; }
+        if (flock(nfd, (db->mp ? LOCK_SH : LOCK_EX) | LOCK_NB) != 0) rc = SQLITE_BUSY;
+        log_hdr h;
+        memset(&h, 0, sizeof h);
+        memcpy(h.magic, LOG_MAGIC, 8);
+        h.version = 1; h.pgsz = (uint32_t)st->pgsz; h.base_epoch = base_epoch; h.salt = db->log_salt;
+        h.cksum = hdr_cksum(&h);
+        if (rc == SQLITE_OK) rc = pwrite_all(nfd, &h, sizeof h, 0);
     }
-    free(buf);
+    if (rc == SQLITE_OK) { rc = copy_range(db->logfd, nfd, pos, end, out); out += end - pos; }
     if (rc == SQLITE_OK && mw_io_fsync(nfd) != 0) rc = SQLITE_IOERR_FSYNC;
     if (rc == SQLITE_OK && mw_io_rename(tmp, db->logpath) != 0) rc = SQLITE_IOERR;
     if (rc == SQLITE_OK) mw_fault_hit(MW_CRASH_LOG_RENAME);

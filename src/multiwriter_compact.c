@@ -142,6 +142,7 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
 
     //    tell the store: versions <= T are redundant once no snapshot needs them; reset the log when it holds
     //    nothing newer than T (epoch/offset assignment happens under seq_mu, so "nothing in flight" is exact)
+    mw_log_prep *prep = MW_LOG_OFF(db) > 8 * 4096 ? mw_log_rewrite_prepare(db, T) : NULL;      // (the bulk of the new log, before the lock)
     mw_spinlock(&st->seq_mu);
     st->compacted_epoch = T;
     if (size_pages) st->base_dbsize = size_pages;
@@ -149,12 +150,15 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
     while (drop < st->nsizes && st->sizes[drop].epoch <= T) drop++;
     if (drop) { memmove(st->sizes, st->sizes + drop, (size_t)(st->nsizes - drop) * sizeof(mw_sizerec)); st->nsizes -= drop; }
     if (db->mp) {
+        mw_log_rewrite_abort(prep); prep = NULL;
         /* handled after seq_mu is released (needs the publication lock) */
     } else if (atomic_load(&db->next_epoch) == T && atomic_load(&db->epoch) == T) {
+        mw_log_rewrite_abort(prep); prep = NULL;
         if (mw_io_ftruncate(db->logfd, 64) == 0) { __atomic_store_n(&db->log_off, 64, __ATOMIC_RELAXED); mw_log_stage_reset(db, 64); mw_log_remap(db); }
     } else if (MW_LOG_OFF(db) > 8 * 4096) {
-        mw_log_rewrite_tail(db, T);                                // busy: keep only the records newer than T
+        mw_log_rewrite_tail(db, T, prep); prep = NULL;             // busy: keep only the records newer than T
     }
+    mw_log_rewrite_abort(prep);                                    // (not used: the log was small, or the other branch ran)
     pthread_mutex_unlock(&st->seq_mu);
     if (db->mp) mw_mp_rewrite_log(db, T);
     out->target_epoch = T;

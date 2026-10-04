@@ -512,7 +512,10 @@ int       mw_db_recover (mw_db *db);                                 // a failed
 int       mw_log_ensure_room (mw_db *db, uint64_t record_size);      // staged log: reserve the disk for the next records before an offset is assigned (SQLITE_FULL when there is no room: nothing was assigned yet)
 void      mw_log_reserve_space (mw_db *db);                          // caller holds store->seq_mu: grow the file ahead of log_off
 void      mw_log_remap (mw_db *db);                                  // after the file was replaced/truncated (seq_mu held)
-int       mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch);      // caller holds store->seq_mu
+typedef struct mw_log_prep mw_log_prep;
+mw_log_prep *mw_log_rewrite_prepare (mw_db *db, uint64_t base_epoch);   // staged log: copies the durable records newer than base_epoch into the new file while commits go on (NULL: not possible)
+void      mw_log_rewrite_abort (mw_log_prep *p);
+int       mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch, mw_log_prep *prep);      // caller holds store->seq_mu; consumes `prep` (may be NULL)
 bool      mw_fault_hit (mw_fault_t f);                              // error points: true = fail now; crash points never return
 int       mw_db_make_visible (mw_db *db, uint64_t epoch);
 void      mw_db_wake_all_visibility (mw_db *db);           // epoch E becomes visible only after E-1

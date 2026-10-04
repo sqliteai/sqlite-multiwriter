@@ -524,7 +524,7 @@ void mw_mp_rewrite_log (mw_db *db, uint64_t T) {
         mw_store_materialize_lazy(db->store);                        // (before seq_mu: lock order; the old mapping goes away)
         mw_log_fill_hold(db);                                        // (no prefiller writes into the old file with the new file's extent)
         pthread_mutex_lock(&db->store->seq_mu);
-        int rc = mw_log_rewrite_tail(db, T);                       // new file (header base = T) + tail, atomically renamed; we switch to it
+        int rc = mw_log_rewrite_tail(db, T, NULL);                       // new file (header base = T) + tail, atomically renamed; we switch to it
         pthread_mutex_unlock(&db->store->seq_mu);
         if (rc == SQLITE_OK) {
             db->mp_gen++;

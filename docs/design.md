@@ -238,6 +238,11 @@ the metadata tests with the store under pressure.
   benchmark's own buffers. Now the arenas of a run are measured first and allocated exactly, and a chain whose versions are all gone gives its array back. 28 s: footprint 1.1 GB -> 0.62 GB,
   2.3 M -> 89 thousand allocations; 60 s: RSS 2.4 GB -> 1.35-1.42 GB (two runs each); tx/s unchanged (31.2-32.2k before, 31.6-32.1k after), p99 the same. What is left (580 MB live at 28 s): the filters
   (180 MB for 3750 runs: `mw_meta_bloom_bits`), the slabs of the memory table (115 MB), pending rows (70 MB), the base cache (54 MB).
+- **What is left of the memory, and why it stays (analysed, nothing changed).** At 28 s, 16 tracked threads: 580 MB live, 640 MB footprint. Slabs of the memory table with 32 KB instead of 256 KB: 115 -> 87 MB
+  in the histogram, 579 -> 547 MB allocated, footprint the same (639 against 618 MB, within the noise): reverted. The pending rows (70 MB) cannot share the bytes of the table's entries without the flusher
+  visiting the entries again (a cache miss each: it was a quarter of its time before the rows were packed into the stripes' buffers) or the entries copying their cells when a flush ends (the same visit);
+  that is at most 11% of what is left, paid in the CPU of the thread that is already the busiest. The filters (180 MB) are the one big item, and shrinking them trades false positives for lookups
+  (`mw_meta_bloom_bits`). The base cache (54 MB) and the memory table (64 MB) are caps, set by `MW_META_CACHE_MB`.
 
 ## Capture and DDL
 

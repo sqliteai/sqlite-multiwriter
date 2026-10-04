@@ -138,22 +138,25 @@ static size_t pack_tl (const mw_mcell *c, int n, bool resolve, uint64_t ep, uint
     return mw_meta_pack_row(c, n, resolve, ep, tb, dv);
 }
 
-static void insert_entry (mw_meta *m, stripe *s, mentry *e) {
+typedef struct { long dirty, rows; size_t bytes; } apply_acc;                    // what a commit adds to the counters of the table: added once, not once a row (the lines of the counters bounce between the committers)
+static void insert_entry_acc (mw_meta *m, stripe *s, mentry *e, apply_acc *acc) {
     if (s->n * 2 > s->nb) grow(s);
     size_t j = (e->h >> 8) & (s->nb - 1); e->next = s->b[j]; s->b[j] = e; s->n++; s->bytes += entry_bytes(e);
-    atomic_fetch_add(&m->bytes, entry_bytes(e)); atomic_fetch_add(&m->rows, 1);
+    if (acc) { acc->bytes += entry_bytes(e); acc->rows++; } else { atomic_fetch_add(&m->bytes, entry_bytes(e)); atomic_fetch_add(&m->rows, 1); }
 }
+static void insert_entry (mw_meta *m, stripe *s, mentry *e) { insert_entry_acc(m, s, e, NULL); }
 
 // the filter of the keys that have, or had, a causal-length entry (a row that was deleted leaves one): a key that is not in it never had an earlier life, so an insert needs no
 // look in the file (false positives only cost that look)
 static uint64_t *bloom_of (mw_meta *m) { return m->shared ? m->db->shm->sen_bloom : m->bloom; }
 #define BLOOM_BITS (1u << 23)
-bool mw_meta_bloom_maybe (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen) {
+static bool bloom_maybe_h (mw_meta *m, uint64_t h) {
     uint64_t *b = bloom_of(m); if (!b) return true;
-    uint64_t h = mw_meta_hash(tbl, pk, pklen), h2 = (h >> 31) | (h << 33) | 1;
+    uint64_t h2 = (h >> 31) | (h << 33) | 1;
     for (int k = 0; k < 3; k++) { uint64_t bit = (h + (uint64_t)k * h2) & (BLOOM_BITS - 1); if (!(__atomic_load_n(&b[bit >> 6], __ATOMIC_RELAXED) & (1ull << (bit & 63)))) return false; }
     return true;
 }
+bool mw_meta_bloom_maybe (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen) { return bloom_maybe_h(m, mw_meta_hash(tbl, pk, pklen)); }
 void mw_meta_bloom_add (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen) {
     uint64_t *b = bloom_of(m); if (!b) return;
     uint64_t h = mw_meta_hash(tbl, pk, pklen), h2 = (h >> 31) | (h << 33) | 1;
@@ -161,8 +164,8 @@ void mw_meta_bloom_add (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen) 
 }
 
 // the table's copy of a row (a hit), without looking at the file
-static int mem_peek (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **out, int *n) {
-    uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
+static int mem_peek_h (mw_meta *m, uint64_t h, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **out, int *n) {
+    stripe *s = &m->st[h % STRIPES];
     mw_spinlock(&s->mu);
     mentry *e = find(s, h, tbl, pk, pklen);
     if (!e) { pthread_mutex_unlock(&s->mu); return 0; }
@@ -182,7 +185,7 @@ static void mem_cache (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, c
 
 // a copy of the cells of a row: the table first, the file on a miss (and the row is cached)
 static int load_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **out, int *n) {
-    int r = mem_peek(m, tbl, pk, pklen, out, n);
+    int r = mem_peek_h(m, mw_meta_hash(tbl, pk, pklen), tbl, pk, pklen, out, n);
     if (r != 0) return r < 0 ? -1 : 0;
     atomic_fetch_add(&m->misses, 1);
     mw_mcell *fc = NULL; int fn = 0;
@@ -317,14 +320,14 @@ static orow *ovl_row_make (mw_ovl *o, uint32_t tbl, const void *pk, size_t pklen
             memcpy(r->c, g->rows[q].c, (size_t)r->n * sizeof(mw_mcell)); found = true;
         }
     } else {
-        if (!(is_new && !mw_meta_bloom_maybe(o->m, tbl, pk, pklen))) {       // (a new key that is not in the filter is in no entry either: every entry's key went into it)
-            int pr = mem_peek(o->m, tbl, pk, pklen, &r->c, &r->n);
+        if (!(is_new && !bloom_maybe_h(o->m, h))) {       // (a new key that is not in the filter is in no entry either: every entry's key went into it)
+            int pr = mem_peek_h(o->m, h, tbl, pk, pklen, &r->c, &r->n);
             if (pr < 0) return NULL;
             found = pr == 1;
         }
     }
     if (!found) {
-        if (is_new && !mw_meta_bloom_maybe(o->m, tbl, pk, pklen)) { r->c = NULL; r->n = 0; }              // (no earlier life: nothing to load)
+        if (is_new && !bloom_maybe_h(o->m, h)) { r->c = NULL; r->n = 0; }              // (no earlier life: nothing to load)
         else *need_file = true;
     }
     r->cap = r->n;
@@ -435,12 +438,13 @@ static bool touched (const orow *r) { if (r->flags) return true; for (int k = 0;
 // the bucket holds (the touched ones in their new state, the others as the transaction read them); otherwise there is one group.
 static void put_row (wbuf *w, const uint32_t tbl, const uint8_t *pk, uint32_t pklen, const mw_mcell *c, int n) {
     w_var(w, tbl); w_var(w, pklen); w_bytes(w, pk, pklen); w_var(w, (uint64_t)n);
-    uint8_t buf[CZ_MAX * 64]; size_t bn = 0; uint64_t prev[5];                // (the cells go through a small buffer: one append for every 64)
+    uint8_t buf[(CZ_MAX + 11) * 64]; size_t bn = 0; cze ze; cz_einit(&ze);    // (the cells go through a small buffer: one append for every 64)
     for (int k = 0; k < n; k++) {
         uint64_t v[5] = { c[k].col, (uint64_t)c[k].cv, c[k].dv == OV_CHG ? 0 : (uint64_t)c[k].dv + 1, c[k].site, c[k].seq };
-        bn += cz_put(buf + bn, v, k ? prev : NULL); memcpy(prev, v, sizeof prev);
-        if (bn > sizeof buf - CZ_MAX || k == n - 1) { w_bytes(w, buf, bn); bn = 0; }
+        bn += cz_eput(&ze, buf + bn, v);
+        if (bn > sizeof buf - (CZ_MAX + 11) * 2) { w_bytes(w, buf, bn); bn = 0; }
     }
+    bn += cz_eend(&ze, buf + bn); if (bn) w_bytes(w, buf, bn);
 }
 static void put_group (wbuf *w, uint32_t bucket, wbuf *body, int nrows) {            // body: the rows; framed as [length][bucket][nrows][rows]
     wbuf h = {0}; w_var(&h, bucket); w_var(&h, (uint64_t)nrows);
@@ -511,40 +515,64 @@ int mw_ovl_groups (const mw_ovl *o, const uint32_t **bucket, const uint32_t **of
 
 // ---- applying ----
 // the row's state becomes `c` (n cells; those with dv == OV_CHG are of this commit: epoch)
-static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pklen, const mw_mcell *c, int n, uint64_t epoch) {
-    uint64_t h = mw_meta_hash(tbl, pk, pklen); stripe *s = &m->st[h % STRIPES];
-    bool sen = false; for (int k = 0; k < n; k++) if (c[k].col == SEN) sen = true;
-    mentry *ne = NULL;
-    uint8_t *buf; int64_t dvmax; size_t bl = pack_tl(c, n, true, epoch, &buf, &dvmax); if (bl == (size_t)-1) return -1;       // (outside the lock)
-    mw_spinlock(&s->mu);
-    mentry *e = find(s, h, tbl, pk, pklen);
+// One row of a commit, ready to go in: its hash, and its packed cells (in the arena of the commit)
+typedef struct { uint64_t h; uint32_t tbl, pklen, n; const uint8_t *pk; size_t off, len; int64_t dv; bool sen; } aitem;
+// (the stripe's lock held) the row goes into the table and, as a change, into the buffer that the flusher takes
+static int install_one (mw_meta *m, stripe *s, const aitem *it, const uint8_t *blob, uint64_t epoch, apply_acc *acc) {
+    mentry *e = find(s, it->h, it->tbl, it->pk, it->pklen);
     if (!e) {                                                          // a new row: one allocation for the entry (its cells are the state), linked once
-        ne = entry_new(s, h, tbl, pk, pklen, buf, bl, n, dvmax);
-        if (!ne) { pthread_mutex_unlock(&s->mu); return -1; }
+        mentry *ne = entry_new(s, it->h, it->tbl, it->pk, it->pklen, blob, it->len, (int)it->n, it->dv);
+        if (!ne) return -1;
         ne->ver = epoch;
-        if (!mw_fbatch_add_packed(&s->pend, tbl, pk, (uint32_t)pklen, buf, bl, n, dvmax)) { entry_free(s, ne); pthread_mutex_unlock(&s->mu); return -1; }        // (the change waits for the flusher with its own copy)
-        ne->dseq = ++s->seq; atomic_fetch_add(&m->ndirty, 1);
-        insert_entry(m, s, ne);
+        if (!mw_fbatch_add_packed(&s->pend, it->tbl, it->pk, it->pklen, blob, it->len, (int)it->n, it->dv)) { entry_free(s, ne); return -1; }        // (the change waits for the flusher with its own copy)
+        ne->dseq = ++s->seq; acc->dirty++;
+        insert_entry_acc(m, s, ne, acc);
     } else {
         size_t before = entry_bytes(e);
-        if (bl > e->cap) {
-            uint8_t *nb = malloc(bl);
-            if (!nb) { pthread_mutex_unlock(&s->mu); return -1; }
+        if (it->len > e->cap) {
+            uint8_t *nb = malloc(it->len);
+            if (!nb) return -1;
             if (!e->inl) free(e->blob);
-            e->blob = nb; e->cap = (uint32_t)bl; e->inl = false;
+            e->blob = nb; e->cap = (uint32_t)it->len; e->inl = false;
         }
-        if (bl) memcpy(e->blob, buf, bl);
-        e->bloblen = (uint32_t)bl; e->n = (uint32_t)n; e->rdv = dvmax;
+        if (it->len) memcpy(e->blob, blob, it->len);
+        e->bloblen = (uint32_t)it->len; e->n = it->n; e->rdv = it->dv;
         e->ver = epoch;
-        if (!mw_fbatch_add_packed(&s->pend, tbl, pk, (uint32_t)pklen, buf, bl, n, dvmax)) { pthread_mutex_unlock(&s->mu); return -1; }
-        e->dseq = ++s->seq; atomic_fetch_add(&m->ndirty, 1);
+        if (!mw_fbatch_add_packed(&s->pend, it->tbl, it->pk, it->pklen, blob, it->len, (int)it->n, it->dv)) return -1;
+        e->dseq = ++s->seq; acc->dirty++;
         size_t after = entry_bytes(e);
-        if (after != before) { s->bytes += after - before; atomic_fetch_add(&m->bytes, after - before); }
+        if (after != before) { s->bytes += after - before; acc->bytes += after - before; }
     }
-    evict(m, s);
-    pthread_mutex_unlock(&s->mu);
-    if (sen) mw_meta_bloom_add(m, tbl, pk, pklen);                     // (outside the lock: the filter is atomic and only grows)
     return 0;
+}
+// A commit's rows: packed outside any lock (into one arena), then taken stripe by stripe, a stripe's lock once for all the rows of the commit that live in it (in the order they came)
+static int install_items (mw_meta *m, aitem *it, int cnt, const uint8_t *arena, uint64_t epoch) {
+    apply_acc acc = {0}; int rc = 0;
+    int stack_ord[256]; int *ord = cnt <= 256 ? stack_ord : malloc((size_t)cnt * sizeof *ord); if (!ord) return -1;
+    int counts[STRIPES + 1]; memset(counts, 0, sizeof counts);
+    for (int i = 0; i < cnt; i++) counts[it[i].h % STRIPES + 1]++;
+    for (int k = 0; k < STRIPES; k++) counts[k + 1] += counts[k];
+    int pos[STRIPES]; memcpy(pos, counts, sizeof pos);
+    for (int i = 0; i < cnt; i++) ord[pos[it[i].h % STRIPES]++] = i;
+    for (int k = 0; k < STRIPES && rc == 0; k++) {
+        if (counts[k] == counts[k + 1]) continue;
+        stripe *s = &m->st[k]; mw_spinlock(&s->mu);
+        for (int q = counts[k]; q < counts[k + 1] && rc == 0; q++) rc = install_one(m, s, &it[ord[q]], arena + it[ord[q]].off, epoch, &acc);
+        evict(m, s);
+        pthread_mutex_unlock(&s->mu);
+    }
+    if (acc.dirty) atomic_fetch_add(&m->ndirty, acc.dirty);
+    if (acc.bytes) atomic_fetch_add(&m->bytes, acc.bytes);
+    if (acc.rows) atomic_fetch_add(&m->rows, acc.rows);
+    for (int i = 0; i < cnt; i++) if (it[i].sen) mw_meta_bloom_add(m, it[i].tbl, it[i].pk, it[i].pklen);       // (outside the locks: the filter is atomic and only grows)
+    if (ord != stack_ord) free(ord);
+    return rc;
+}
+static int install_row (mw_meta *m, uint32_t tbl, const uint8_t *pk, size_t pklen, const mw_mcell *c, int n, uint64_t epoch) {
+    uint8_t *buf; int64_t dvmax; size_t bl = pack_tl(c, n, true, epoch, &buf, &dvmax); if (bl == (size_t)-1) return -1;
+    bool sen = false; for (int k = 0; k < n; k++) if (c[k].col == SEN) sen = true;
+    aitem it = { mw_meta_hash(tbl, pk, pklen), tbl, (uint32_t)pklen, (uint32_t)n, pk, 0, bl, dvmax, sen };
+    return install_items(m, &it, 1, buf, epoch);
 }
 
 static void purge_table (mw_meta *m, uint32_t tbl, uint64_t epoch) {
@@ -566,8 +594,18 @@ int mw_meta_apply (mw_meta *m, mw_ovl *o, uint64_t epoch) {
     if (m->shared) return 0;
     epoch += (uint64_t)m->origin;                                       // (from here on: the db_version of the commit)                                           // (the publisher installed the commit's buckets in the shared index)
     for (int i = 0; i < o->npurge; i++) purge_table(m, o->purge[i], epoch);
-    for (int i = 0; i < o->n; i++) { orow *r = &o->rows[i]; if (!touched(r)) continue; if (install_row(m, r->tbl, r->pk, r->pklen, r->c, r->n, epoch) != 0) return -1; }
-    return 0;
+    static __thread aitem *items; static __thread int icap; static __thread uint8_t *arena; static __thread size_t acap;
+    int cnt = 0; size_t used = 0;
+    if (o->n > icap) { aitem *ni = realloc(items, (size_t)o->n * sizeof *ni); if (!ni) return -1; items = ni; icap = o->n; }
+    for (int i = 0; i < o->n; i++) {
+        orow *r = &o->rows[i]; if (!touched(r)) continue;
+        size_t need = used + MW_PACK_MAX(r->n); if (need > acap) { size_t nc = need * 2 + 4096; uint8_t *na = realloc(arena, nc); if (!na) return -1; arena = na; acap = nc; }
+        int64_t dv = 0; size_t len = r->n ? mw_meta_pack_row(r->c, r->n, true, epoch, arena + used, &dv) : 0;
+        bool sen = false; for (int k = 0; k < r->n; k++) if (r->c[k].col == SEN) sen = true;
+        items[cnt++] = (aitem){ mw_meta_hash(r->tbl, r->pk, r->pklen), r->tbl, (uint32_t)r->pklen, (uint32_t)r->n, r->pk, used, len, dv, sen };
+        used += len;
+    }
+    return cnt ? install_items(m, items, cnt, arena, epoch) : 0;
 }
 
 // Walks an extension: sites, purges, rows (with the cells they carry, dv resolved to `epoch`). Any callback may be NULL.
@@ -589,12 +627,12 @@ int mw_ext_walk (const uint8_t *ext, uint32_t len, uint64_t epoch, mw_ext_row_fn
             const uint8_t *pk = p; p += pklen;
             if (r_var(&p, end, &nc) || nc > (1u << 20)) { free(cells); return -1; }
             if ((int)nc > ccap) { ccap = (int)nc * 2 + 4; mw_mcell *nm = realloc(cells, (size_t)ccap * sizeof *nm); if (!nm) { free(cells); return -1; } cells = nm; }
-            uint64_t pv[5];
+            czd zd; cz_dinit(&zd);
             for (uint64_t k = 0; k < nc; k++) {
-                uint64_t v[5]; if (cz_get(&p, end, v, k ? pv : NULL)) { free(cells); return -1; }
-                memcpy(pv, v, sizeof pv);
+                uint64_t v[5]; if (cz_dget(&zd, &p, end, v)) { free(cells); return -1; }
                 cells[k] = (mw_mcell){ (int64_t)v[1], v[2] ? (int64_t)(v[2] - 1) : (int64_t)epoch, (uint32_t)v[0], (uint32_t)v[3], (uint32_t)v[4] };
             }
+            if (zd.rep) { free(cells); return -1; }
             if (row_cb && row_cb(arg, (uint32_t)bucket, (uint32_t)tbl, pk, (size_t)pklen, cells, (int)nc) != 0) { free(cells); return -1; }
         }
     }

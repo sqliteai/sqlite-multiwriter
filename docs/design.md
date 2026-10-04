@@ -224,6 +224,13 @@ the metadata tests with the store under pressure.
   already carries that number: in the block (as a difference from the previous row), in the item of the flush and in the entry of the memory table (`rdv`). The first cell had it whole, 3-4 bytes that LZ4 could
   not squeeze. `mw_meta_row_cells` takes the db_version of the row; formats 1 and 2 are still read. A real run: 10.0 -> 7.9 bytes a row in the slots (meta included); 16 threads tracked 31.9k -> 33.7k tx/s
   (three alternating pairs of 30 s), 4 processes the same.
+- **The capture and the apply in the commit (measured, kept: less CPU, same tx/s).** A commit's rows are packed into one arena outside any lock and installed stripe by stripe (one lock for all the rows of the commit
+  that live in a stripe, in their order), with the counters of the table (rows, bytes, dirty) added once a commit instead of once a row (three atomics a row on lines that the 16 committers share); the
+  runs of cells that follow the usual pattern (next column, same version, db_version and site, next sequence number) are a byte and a count in the extension and in the packed rows (a row of 17 columns:
+  the first cell and 2 bytes; extension 0x50, row format 4; the older ones are read); the row diff reads an old page into the buffer it keeps instead of copying it, reserves the rows of a page at once, and the
+  hash of a key is computed once for the filter and the table. `prepare` 36.8 -> 33.9 us a commit, CPU of the run -6% (315 -> 296 s of 30 s), p50 361 -> 352 us; the throughput does not move
+  (33.5k tx/s before and after, three alternating pairs; 4 processes the same): the 16 committers' cycle is no longer limited by what they do, but by the back-pressure of the merges (7.7% of their time, 24.5 s
+  of 320) and the log that the merges share with them (see above).
 
 ## Capture and DDL
 

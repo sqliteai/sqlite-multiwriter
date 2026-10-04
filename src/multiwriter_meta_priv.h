@@ -15,7 +15,7 @@ struct mw_db; struct mw_lane;
 #define STRIPES 64
 #define SEN CRDT_COL_SENTINEL
 #define OV_CHG INT64_MIN                 // in an overlay cell: written by this commit (its db_version is the commit's epoch, not known yet)
-#define EXT_VERSION 0x4f                // the format of the extension of a commit record (bumped when it changes)
+#define EXT_VERSION 0x50                // the format of the extension of a commit record (bumped when it changes)
 #define F_DROP 1                         // the non-sentinel cells of the row are removed
 #define F_ZERO 2                         // the non-sentinel cells get version 0 and the db_version of the commit
 
@@ -111,23 +111,50 @@ static inline int cz_rvar (const uint8_t **p, const uint8_t *end, uint64_t *v) {
     return -1;
 }
 #define CZ_MAX 52                                                        // the most one cell takes
-static inline size_t cz_put (uint8_t *out, const uint64_t v[5], const uint64_t *prev) {
+// A run of cells that all follow the pattern 0x1f (the next column, the same version, db_version and site, the next sequence number: the cells of a row written by one commit) is one byte 0x3f and
+// the number of them: a row of 17 columns takes the first cell, and 2 bytes.
+#define CZ_STEP 0x1f
+#define CZ_RUN  0x20
+typedef struct { uint64_t prev[5]; int have; uint64_t run; } cze;
+static inline void cz_einit (cze *e) { e->have = 0; e->run = 0; }
+static inline size_t cz_eflush (cze *e, uint8_t *out) {
     size_t w = 0;
-    if (!prev) { for (int i = 0; i < 5; i++) w += cz_var(out + w, v[i]); return w; }
+    if (e->run == 1) out[w++] = CZ_STEP; else if (e->run > 1) { out[w++] = CZ_STEP | CZ_RUN; w += cz_var(out + w, e->run); }
+    e->run = 0; return w;
+}
+static inline size_t cz_eput (cze *e, uint8_t *out, const uint64_t v[5]) {            // `out` has room for CZ_MAX + 11 bytes
+    size_t w = 0;
+    if (!e->have) { for (int i = 0; i < 5; i++) w += cz_var(out + w, v[i]); e->have = 1; memcpy(e->prev, v, sizeof e->prev); return w; }
+    const uint64_t *prev = e->prev;
     unsigned ctl = (v[0] == prev[0] + 1) | (unsigned)(v[1] == prev[1]) << 1 | (unsigned)(v[2] == prev[2]) << 2 | (unsigned)(v[3] == prev[3]) << 3 | (unsigned)(v[4] == prev[4] + 1) << 4;
-    out[w++] = (uint8_t)ctl;
-    for (int i = 0; i < 5; i++) if (!(ctl & (1u << i))) w += cz_var(out + w, v[i]);
+    if (ctl == CZ_STEP) e->run++;
+    else {
+        w += cz_eflush(e, out);
+        out[w++] = (uint8_t)ctl;
+        for (int i = 0; i < 5; i++) if (!(ctl & (1u << i))) w += cz_var(out + w, v[i]);
+    }
+    memcpy(e->prev, v, sizeof e->prev);
     return w;
 }
-static inline int cz_get (const uint8_t **p, const uint8_t *end, uint64_t v[5], const uint64_t *prev) {
-    if (!prev) { for (int i = 0; i < 5; i++) if (cz_rvar(p, end, &v[i])) return -1; return 0; }
+static inline size_t cz_eend (cze *e, uint8_t *out) { return cz_eflush(e, out); }
+typedef struct { uint64_t prev[5]; int have; uint64_t rep; } czd;
+static inline void cz_dinit (czd *d) { d->have = 0; d->rep = 0; }
+static inline int cz_dget (czd *d, const uint8_t **p, const uint8_t *end, uint64_t v[5]) {
+    if (d->rep) { d->rep--; v[0] = d->prev[0] + 1; v[1] = d->prev[1]; v[2] = d->prev[2]; v[3] = d->prev[3]; v[4] = d->prev[4] + 1; memcpy(d->prev, v, sizeof d->prev); return 0; }
+    if (!d->have) { for (int i = 0; i < 5; i++) if (cz_rvar(p, end, &v[i])) return -1; d->have = 1; memcpy(d->prev, v, sizeof d->prev); return 0; }
     if (*p >= end) return -1;
     unsigned ctl = *(*p)++;
-    if (ctl & ~0x1fu) return -1;
+    if (ctl & ~(0x1fu | CZ_RUN)) return -1;
+    if (ctl & CZ_RUN) {
+        if ((ctl & 0x1f) != CZ_STEP) return -1;
+        uint64_t r; if (cz_rvar(p, end, &r) || r < 2 || r > (1u << 24)) return -1;
+        d->rep = r - 1; ctl &= 0x1f;
+    }
     for (int i = 0; i < 5; i++) {
-        if (ctl & (1u << i)) v[i] = (i == 1 || i == 2 || i == 3) ? prev[i] : prev[i] + 1;
+        if (ctl & (1u << i)) v[i] = (i == 1 || i == 2 || i == 3) ? d->prev[i] : d->prev[i] + 1;
         else if (cz_rvar(p, end, &v[i])) return -1;
     }
+    memcpy(d->prev, v, sizeof d->prev);
     return 0;
 }
 

@@ -93,13 +93,13 @@ static bool read_group (mw_meta *m, uint64_t loc, uint64_t epoch, uint32_t bucke
         if (rv(&q, end, &nc) || nc > (1u << 20)) goto bad;
         rows[i].c = malloc((size_t)(nc ? nc : 1) * sizeof(mw_mcell)); if (!rows[i].c) goto bad;
         rows[i].n = (int)nc;
-        uint64_t pv[5];
+        czd zd; cz_dinit(&zd);
         for (uint64_t k = 0; k < nc; k++) {
             uint64_t v[5];
-            if (cz_get(&q, end, v, k ? pv : NULL)) goto bad;
-            memcpy(pv, v, sizeof pv);
+            if (cz_dget(&zd, &q, end, v)) goto bad;
             rows[i].c[k] = (mw_mcell){ (int64_t)v[1], v[2] ? (int64_t)(v[2] - 1) : (int64_t)dvres, (uint32_t)v[0], (uint32_t)v[3], (uint32_t)v[4] };
         }
+        if (zd.rep) goto bad;
         if (nc) { int kept = purge_filter(db, rows[i].tbl, rows[i].c, (int)nc); if (kept == 0) { free(rows[i].c); rows[i].c = NULL; rows[i].tbl = 0xFFFFFFFFu; rows[i].n = 0; } else rows[i].n = kept; }
         continue;
     bad:
@@ -231,13 +231,13 @@ static void col_cb (void *arg, uint32_t bucket, uint64_t epoch, uint64_t loc) {
         const uint8_t *pk = q; q += pklen;
         if (rv(&q, end, &nc) || nc > (1u << 20)) { c->err = 1; return; }
         if ((int)nc > c->ccap) { int cc = (int)nc * 2 + 8; mw_mcell *nm = realloc(c->cells, (size_t)cc * sizeof *nm); if (!nm) { c->err = 1; return; } c->cells = nm; c->ccap = cc; }
-        uint64_t pv[5];
+        czd zd; cz_dinit(&zd);
         for (uint64_t k = 0; k < nc; k++) {
             uint64_t v[5];
-            if (cz_get(&q, end, v, k ? pv : NULL)) { c->err = 1; return; }
-            memcpy(pv, v, sizeof pv);
+            if (cz_dget(&zd, &q, end, v)) { c->err = 1; return; }
             c->cells[k] = (mw_mcell){ (int64_t)v[1], v[2] ? (int64_t)(v[2] - 1) : (int64_t)dvres, (uint32_t)v[0], (uint32_t)v[3], (uint32_t)v[4] };
         }
+        if (zd.rep) { c->err = 1; return; }
         int n = purge_filter(db, (uint32_t)tbl, c->cells, (int)nc);
         int dirtyc = 0;
         for (int k = 0; k < n; k++) if (c->cells[k].dv > (int64_t)c->F) dirtyc++;

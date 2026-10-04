@@ -177,6 +177,7 @@ static int rows_of (mw_lane *lane, const uint8_t *const *imgs, bool new_state, c
     const int hdr = interior ? 12 : 8;
     int nc = be16(pg + 3);
     const uint32_t U = pgsz, M = ((U - 12) * 32 / 255) - 23, X = kind == 0x0d ? U - 35 : ((U - 12) * 64 / 255) - 23;
+    if (rs->n + nc > rs->cap) { int ncap = rs->cap ? rs->cap : 64; while (ncap < rs->n + nc) ncap *= 2; rd_row *p = realloc(rs->a, (size_t)ncap * sizeof *p); if (!p) return -1; rs->a = p; rs->cap = ncap; }      // (room for the cells of the page: not a growth every time the array doubles)
     for (int i = 0; i < nc; i++) {
         uint32_t off = (uint32_t)be16(pg + hdr + 2 * i);
         if (off < (uint32_t)hdr || off >= pgsz) return -1;
@@ -310,7 +311,9 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_o
         if (kn == 'O') opaque++; else if (kn == 'I') index_pages++; else if (kn == 'T') interior++; else if (kn == 'S') schema++;
         bool in_fn = nfn && bsearch(&pgno, fn, (size_t)nfn, sizeof *fn, cmp_u32), in_fo = nfo && bsearch(&pgno, fo, (size_t)nfo, sizeof *fo, cmp_u32);
         if ((kn == 'L' || (own && kn == 'I')) && !in_fn) { if (rows_of(lane, imgs, true, imgs[i], pgno, pgsz, &newr, own ? owner_new(own, &ov, pgno) : 0, cat, false) < 0) bad++; }
-        if (have_old && (ko == 'L' || (own && ko == 'I')) && !in_fo) { uint8_t *cp = malloc(pgsz); if (cp) { memcpy(cp, oldimg, pgsz); keeps = realloc(keeps, (size_t)(nkeeps + 1) * sizeof *keeps); keeps[nkeeps++] = cp; if (rows_of(lane, imgs, false, cp, pgno, pgsz, &oldr, own && own->old_owner ? own->old_owner(own->ctx, pgno) : 0, ocat, false) < 0) bad++; } }
+        if (have_old && (ko == 'L' || (own && ko == 'I')) && !in_fo) { uint8_t *nxt = malloc(pgsz); uint8_t **nk = nxt ? realloc(keeps, (size_t)(nkeeps + 1) * sizeof *keeps) : NULL;           // (the buffer that was read is kept as it is - the old rows point into it - and the next page is read into a new one: no copy)
+          if (nk) { keeps = nk; uint8_t *cp = oldimg; keeps[nkeeps++] = cp; oldimg = nxt; if (rows_of(lane, imgs, false, cp, pgno, pgsz, &oldr, own && own->old_owner ? own->old_owner(own->ctx, pgno) : 0, ocat, false) < 0) bad++; }
+          else { free(nxt); bad++; } }
     }
     // pages the transaction freed (on the freelist now, not before) and not rewritten: their old rows are old rows that are gone
     for (int k = 0; k < nfn && oldimg; k++) {

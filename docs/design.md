@@ -181,6 +181,13 @@ the metadata tests with the store under pressure.
 - **What the page store costs everybody.** 10% of the reads of a page wait for the stripe lock, and 85% of those are for page 1: the header is rewritten by every commit that grows the file (the database
   size), and every transaction reads it. The workers spend 8.5% (untracked) to 13.6% (tracked) of their time in `mw_store_read` waiting; more spinning (`MW_SPIN_US` 500, 5000) made it worse. This is
   the next lever for both variants: a lock-free path for the newest version of page 1 (the size and the cookie are already kept in atomics).
+- **Page 1 without the lock (tried, dropped).** A ring of the last 64 versions of page 1 read under a seqlock (the installing commit writes it under the page's stripe; a reader takes the newest slot not newer
+  than its snapshot, checks the sequence number after the copy, and falls back to the lock if a writer was in the way; 8 slots were not enough: commits are installed before they are visible, and a group of
+  the log is longer than that). It worked as intended - contended reads of the store went from 10% to 2.3% and page 1 left the list - and nothing else moved: 16 threads 31.1k / 30.4k / 30.1k / 30.1k
+  against 30.9k / 30.8k / 31.2k / 31.3k tx/s (tracked), 4/32/64 threads untracked within 1.5%, latency p50 and CPU the same. The waiting moved to the root page of the table (the same stripe held for the
+  ~8 us of a publication by every commit that rewrites it), and the sampled "time in mw_store_read" was waiting that overlaps with other waits (the group commit), not a cost on the critical path. Not kept:
+  more code in the page store for no measurable gain. (Also: after a few runs of 4 GB each the machine throttles - 28k became 21k for both binaries until it rested - so a comparison needs
+  alternating runs with pauses.)
 
 ## Capture and DDL
 

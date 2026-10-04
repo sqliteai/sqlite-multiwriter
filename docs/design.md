@@ -272,6 +272,14 @@ the metadata tests with the store under pressure.
   at 30 s, 2.6 GB at 211 s and 3.4-3.55 GB from 300 s on (it stops growing), the log 13.6 MB at the end, the files of the engine 5-372 MB, the backlog of the merges bounded (58 age groups at level 0, 187 in all, 24 thousand
   runs), 4393 merges of 2.2 billion rows, 2.05 million commits delayed by the back-pressure (1778 s of the 9600 thread-seconds). The database of 115 GB opens at once (18 MB of RSS to read it); the integrity check takes 30 s.
   One transaction ended with an error in this run, as in 3 of ~60 other runs of 10-60 s (never in 20 runs with `MW_BENCH_DEBUG=1`, which prints the error code and message; not found yet).
+- **Corrections after a review of the whole repository (five readers, by area; the ones that were checked in the code were fixed).** (1) A commit that is taken back because its log record cannot be written now puts back the head
+  and the cookie of page 1 (and drops the copy of it that relocations keep): they stayed at the epoch of a commit that never was, which made every later commit see a schema change. (2) A connection that closes while it holds the DDL
+  barrier (a `CREATE TEMP TABLE` takes it without a snapshot of the main file) gives it back; the pointer to the closed connection stayed in `ddl_owner` and every writer got `SQLITE_BUSY` for ever (`mw_rollback` fails with `BUSY`
+  without the fix). (3) The recovery in place (`mw_meta_reset`) forgets the list of runs, the blocks and the slots that the run store had cached or taken (`rsx_reset`): the file tables went back in time, and run numbers and versions are reused.
+  (4) `mw_sync_apply`, the backfill and the declared commit check that no row of the overlay failed to load: a row that could not be read is not a row that is not there. (5) The knobs of measurement that throw
+  metadata away (`MW_EXP_NOEXT`, `MW_EXP_NOAPPLY`, `MW_EXP_SKIPWRITE`, `MW_META_NOMERGE`, `MW_META_NOCOMPRESS`) and `MW_MP_PRIVATE_OK` are no longer read by a normal build (`make EXPERIMENTS=1`).
+  Reported and **not** fixed yet: the order of the compaction and of the fsync of the log in the shared mode (the file can get ahead of what is durable at a power failure), the epoch of own pages of a lane after several
+  commits in one snapshot, the unlink order of the lock files, the ticket lock after `kill -9`, and the recovery of the log on read errors (see the review).
 
 ## Capture and DDL
 

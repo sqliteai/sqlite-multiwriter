@@ -11,6 +11,9 @@ SRC_DIR := src
 BUILD := build
 DIST := dist
 
+ifdef EXPERIMENTS
+CFLAGS += -DMW_EXPERIMENTS      # (make EXPERIMENTS=1: the knobs of measurement MW_EXP_*, MW_META_NOMERGE, MW_META_NOCOMPRESS)
+endif
 CFLAGS += -O2 -g -Wall -Wno-unused-function -I$(SRC_DIR) -I$(SRC_DIR)/crdt -I$(SQLITE_DIR) -Ideps/sqlite-sync/src -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS
 SQLITE_FLAGS := -DSQLITE_EXTRA_INIT=mw_extra_init -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DSQLITE_CORE
 LDFLAGS += -lpthread -lm

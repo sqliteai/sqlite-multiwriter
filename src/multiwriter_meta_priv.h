@@ -15,6 +15,12 @@ struct mw_db; struct mw_lane;
 #define STRIPES 64
 #define SEN CRDT_COL_SENTINEL
 #define OV_CHG INT64_MIN                 // in an overlay cell: written by this commit (its db_version is the commit's epoch, not known yet)
+// Knobs of measurement that throw metadata away (the flush that writes nothing, the runs that are not merged): read only in a build with -DMW_EXPERIMENTS (make EXPERIMENTS=1), never from the environment of a normal one.
+#ifdef MW_EXPERIMENTS
+#define mw_exp(name) (getenv(name) != NULL)
+#else
+#define mw_exp(name) 0
+#endif
 #define EXT_VERSION 0x50                // the format of the extension of a commit record (bumped when it changes)
 #define F_DROP 1                         // the non-sentinel cells of the row are removed
 #define F_ZERO 2                         // the non-sentinel cells get version 0 and the db_version of the commit

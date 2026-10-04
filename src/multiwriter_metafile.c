@@ -489,7 +489,9 @@ static void *merger_main (void *arg) {
     return NULL;
 }
 static void merge_kick (mw_meta *m) {
+#ifdef MW_EXPERIMENTS
     if (getenv("MW_META_NOMERGE")) return;
+#endif
     pthread_mutex_lock(&m->mth_mu);
     m->mkick = true;
     if (!m->mth_running && !m->mth_stop) { if (pthread_create(&m->mth, NULL, merger_main, m) == 0) m->mth_running = true; }
@@ -538,7 +540,7 @@ static int flush_impl (mw_meta *m, bool wait) {
     atomic_fetch_add(&mw_ft[1], now_ns() - tc0);
     uint64_t hw0 = sh ? atomic_load(&sh->dv_hwm) : atomic_load(&m->hwm);
     for (int i = 0; i < n; i++) if ((uint64_t)v[i].dv > hw0) hw0 = (uint64_t)v[i].dv;
-    if (getenv("MW_EXP_SKIPWRITE")) rc = SQLITE_OK; else          // (experiment: the cost of everything but the file)
+    if (mw_exp("MW_EXP_SKIPWRITE")) rc = SQLITE_OK; else          // (experiment: the cost of everything but the file)
     rc = write_range(m, m->wr, v, 0, n, true, V, hw0, nsites, sflushed, purge, npurge);
     mw_fbatch_free(&fb);
     if (rc == SQLITE_OK) {
@@ -556,7 +558,7 @@ static int flush_impl (mw_meta *m, bool wait) {
         }
         atomic_fetch_add(&m->n_flushes, 1);
     }
-    if (rc == SQLITE_OK && !atomic_load(&m->quiescing) && !getenv("MW_META_NOMERGE")) {         // the runs the flushes made are merged into bigger ones (a few rounds a flush at most)
+    if (rc == SQLITE_OK && !atomic_load(&m->quiescing) && !mw_exp("MW_META_NOMERGE")) {         // the runs the flushes made are merged into bigger ones (a few rounds a flush at most)
         merge_kick(m);
     }
     atomic_fetch_add(&m->flush_ns, now_ns() - t0);
@@ -781,6 +783,7 @@ void mw_meta_reset (mw_meta *m) {
     if (run) { pthread_join(m->th, NULL); m->th_running = false; }
     pthread_mutex_lock(&m->mth_mu); m->mth_stop = true; pthread_cond_broadcast(&m->mth_cv); bool mrun = m->mth_running; pthread_mutex_unlock(&m->mth_mu);
     if (mrun) { pthread_join(m->mth, NULL); m->mth_running = false; }
+    rsx_reset(m->rsx);                                                    // (the file tables went back in time: what the run store remembers of them is of another timeline)
     pthread_mutex_lock(&m->file_mu);
     for (int i = 0; i < STRIPES; i++) {
         stripe *s = &m->st[i]; pthread_mutex_lock(&s->mu);

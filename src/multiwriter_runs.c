@@ -258,7 +258,12 @@ static int flush_block (rs_builder *b) {
     buf[0] = 3; memcpy(buf + 1, &n, 4);
     for (uint32_t i = 0; i < nr; i++) { uint32_t o = b->offs[i] + (uint32_t)base; memcpy(buf + 5 + (size_t)i * 4, &o, 4); }
     memcpy(buf + base, b->rows, b->nbytes);
-    static int nocomp = -1; if (nocomp < 0) nocomp = getenv("MW_META_NOCOMPRESS") != NULL;
+    static int nocomp = -1;
+#ifdef MW_EXPERIMENTS
+    if (nocomp < 0) nocomp = getenv("MW_META_NOCOMPRESS") != NULL;
+#else
+    nocomp = 0;
+#endif
     const uint8_t *stored = buf; size_t slen = len; uint8_t *cmp = NULL;
     if (!nocomp && len >= 512 && len < (1u << 26)) {                                 // compressed when that gains a tenth or more
         int bound = LZ4_compressBound((int)len); cmp = malloc((size_t)bound + 5);

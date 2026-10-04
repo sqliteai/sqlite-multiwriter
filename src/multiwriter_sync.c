@@ -273,6 +273,7 @@ static int apply_changes (sqlite3 *db, sysch *sc, mw_ovl *ov, const chg *ch, int
             int nw = 0; for (int k = i; k < n && k < i + 512; k++) { syt *tk = by_name(sc, ch[k].tbl, ch[k].tbllen); if (tk) wants[nw++] = (mw_want){ tk->tid, ch[k].pk, ch[k].pklen, false }; }
             mw_ovl_prefetch(ov, wants, nw);
         }
+        if (mw_ovl_err(ov)) { rc = SQLITE_IOERR; break; }                            // (a row that could not be read is not a row that is not there: the merge would let a remote change win against a newer cell)
         syt *t = by_name(sc, c->tbl, c->tbllen);
         bool sentinel = c->collen == strlen(CRDT_SENTINEL) && !memcmp(c->col, CRDT_SENTINEL, c->collen);
         int cell = sentinel ? -1 : t ? cell_by_name(t, c->col, c->collen) : -1;
@@ -282,6 +283,7 @@ static int apply_changes (sqlite3 *db, sysch *sc, mw_ovl *ov, const chg *ch, int
         memcpy(cc.site, c->site, 16);
         crdt_actions act;
         if (crdt_merge(ops, ov, &cc, 0, true, &act) != 0) { rc = SQLITE_ERROR; break; }
+        if (mw_ovl_err(ov)) { rc = SQLITE_IOERR; break; }
         if (act.n) st->applied++;
         for (int k = 0; k < act.n && rc == SQLITE_OK; k++) {
             if (act.kind[k] == CRDT_ACT_DELETE_ROW) rc = group_delete(db, &g);
@@ -370,7 +372,8 @@ int mw_sync_backfill (sqlite3 *db) {
                 have_last = true;
             }
             sqlite3_finalize(st);
-            if (!mw_ovl_empty(ov)) {
+            if (mw_ovl_err(ov)) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); rc = SQLITE_IOERR; }          // (a row that could not be read: no metadata is made up for it)
+            else if (!mw_ovl_empty(ov)) {
                 sqlite3_file_control(db, "main", MW_FCNTL_DECLARE, ov);
                 rc = sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS mw_state(k TEXT PRIMARY KEY NOT NULL, v) WITHOUT ROWID; INSERT OR REPLACE INTO mw_state(k, v) VALUES('backfill', strftime('%s','now') || '.' || abs(random()))", NULL, NULL, NULL);       // (a commit has to write a page for the declared metadata to be logged)
                 if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);

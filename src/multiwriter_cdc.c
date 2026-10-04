@@ -292,10 +292,13 @@ void mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs) {
         free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0;
         int erc = ensure_ready(lane->db, c); if (erc) lane->cdc_err = erc;
         if (mw_ovl_encode(lane->cdc_decl, &lane->cdc_ext, &lane->cdc_ext_len) != 0) { lane->cdc_ext = NULL; lane->cdc_ext_len = 0; lane->cdc_err = SQLITE_NOMEM; }
+        else if (mw_ovl_err(lane->cdc_decl)) lane->cdc_err = mw_ovl_err(lane->cdc_decl);                 // (a row of the merge could not be read: the commit is refused, not written with metadata decided on a guess)
     } else build_delta(lane, c, plan.purge, plan.npurge);
     { mw_ovl *act = lane->cdc_decl ? lane->cdc_decl : lane->cdc_ovl; if (act && lane->cdc_ext_len) lane->cdc_ng = mw_ovl_groups(act, (const uint32_t **)&lane->cdc_gbucket, (const uint32_t **)&lane->cdc_goff, (const uint64_t **)&lane->cdc_gseen); }
     free(plan.skip); free(plan.skip_old); free(plan.purge);
+#ifdef MW_EXPERIMENTS                                                                  // (measurements of what the capture costs: they throw metadata away, so they are not in a normal build)
     { static int noext = -1; if (noext < 0) noext = getenv("MW_EXP_NOEXT") != NULL; if (noext) { free(lane->cdc_ext); lane->cdc_ext = NULL; lane->cdc_ext_len = 0; } }      // (experiment: the work of the capture without its bytes in the log)
+#endif
     // the rows point into the catalog they were decoded with: it stays alive until the apply step of the same commit
     if (newcat) { mw_cat_free(cat); lane->cdc_cat = newcat; } else lane->cdc_cat = cat;
     atomic_fetch_add(&c->ns_prepare, now_ns() - t0);
@@ -376,7 +379,11 @@ void mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch) {
     mw_cdc *c = db->cdc;
     mw_ovl *act = lane->cdc_decl ? lane->cdc_decl : lane->cdc_ovl;
     lane->cdc_ng = 0;
+#ifdef MW_EXPERIMENTS
     static int noapply = -1; if (noapply < 0) noapply = getenv("MW_EXP_NOAPPLY") != NULL;          // (experiment: what the memory table and the flush cost)
+#else
+    const int noapply = 0;
+#endif
     if (act && lane->cdc_ext_len && !db->shared && !noapply) { mw_meta_apply(c->meta, act, epoch); uint64_t d = mw_meta_dirty(c->meta); if (d >= 16384) mw_meta_kick(c->meta);
         uint64_t lim = mw_meta_dirty_limit(c->meta);                           // back-pressure: the flusher is far behind the writers; they wait (outside the lock, in publish_finish), more as the backlog grows
         if (d > lim) { uint64_t w = (d - lim) * 1000 / lim; lane->bp_wait_us = (uint32_t)(w > 20000 ? 20000 : w < 20 ? 20 : w); atomic_fetch_add(&mw_bp[0], lane->bp_wait_us); atomic_fetch_add(&mw_bp[1], 1); } }

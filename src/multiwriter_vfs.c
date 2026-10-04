@@ -264,7 +264,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
             return SQLITE_NOMEM;
         }
         mw_lane_init(lane, db);
-        if (sqlite3_uri_boolean(name, "mw_cdc", 0) && mode >= 2 && mpmode == 1 && !getenv("MW_MP_PRIVATE_OK")) { /* private-store multi-process mode keeps the pages in every process; the metadata design needs the shared mode */ mw_lane_free(lane); mw_db_release(db); f->real->pMethods->xClose(f->real); f->base.pMethods = NULL; return SQLITE_MISUSE; }
+        if (sqlite3_uri_boolean(name, "mw_cdc", 0) && mode >= 2 && mpmode == 1) { /* private-store multi-process mode keeps the pages in every process; the metadata design needs the shared mode */ mw_lane_free(lane); mw_db_release(db); f->real->pMethods->xClose(f->real); f->base.pMethods = NULL; return SQLITE_MISUSE; }
         if (sqlite3_uri_boolean(name, "mw_cdc", 0) && mode >= 2) {
             sqlite3_mutex_enter(db->mu); int crc = db->cdc ? SQLITE_OK : mw_cdc_open(db); sqlite3_mutex_leave(db->mu);
             if (crc != SQLITE_OK) {                                  // (a database that is to be tracked does not open untracked: its commits would carry no metadata)

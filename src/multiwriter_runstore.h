@@ -57,6 +57,7 @@ int rsx_tx_drop_table (rsx_tx *t, sqlite3 *c, uint32_t tbl, int64_t dv);
 int rsx_tx_finish (rsx_tx *t, sqlite3 *c);                                  // the version and counters into mw_state; call before COMMIT
 void rsx_tx_end (rsx_tx *t, bool committed);                                // after COMMIT (or ROLLBACK): publishes the new list of runs, or forgets it; frees t
 // one round of merging: the runs of the lowest level that has `fanout` or more age groups into the next level. Returns 1 if it merged, 0 if there was nothing to do, <0 an error.
+void rsx_reset (mw_rstore *s);        // the cached list of runs, the blocks and the slots taken are forgotten (the file tables went back in time)
 int rsx_merge (mw_rstore *s, sqlite3 *rd, sqlite3 *wr, sqlite3 *wr2, int fanout, uint64_t part_rows);   // wr2: a connection of its own for the thread that writes the finished parts (NULL: the merge writes them itself)
 
 // how far the merges are behind: the age groups at level 0 and in all

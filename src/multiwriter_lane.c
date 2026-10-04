@@ -362,6 +362,7 @@ void mw_lane_reset (mw_lane *lane) {
 
 void mw_lane_free (mw_lane *lane) {
     if (!lane) return;
+    if (lane->db && (lane->ddl_active || lane->db->ddl_owner == lane)) mw_lane_ddl_end(lane);        // (a connection that closes inside a DDL, without a snapshot of the main file, gives the barrier back: its pointer must not stay behind)
     if (lane->mp_slot >= 0 && lane->db && lane->db->mp) mw_mp_slot_free(lane->db, lane->mp_slot);
     for (int i = 0; i < lane->nshm; i++) sqlite3_free(lane->shm[i]);
     sqlite3_free(lane->wal.buf);

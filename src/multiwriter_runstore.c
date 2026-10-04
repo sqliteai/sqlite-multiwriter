@@ -161,6 +161,15 @@ mw_rstore *rsx_new (size_t cache_bytes) {
     return s;
 }
 static void cblk_unref (cblk *b) { if (b && atomic_fetch_sub(&b->refs, 1) == 1) free(b); }
+// The file tables went back to an earlier state (recovery in place rolled the database back to its last durable commit): the list of runs and the blocks that were read, the slots this process had taken
+// (the transactions that took them were rolled back too) and the numbers it had taken for runs are of a timeline that no longer exists, and run numbers and versions will be used again. Nothing else runs on the store.
+void rsx_reset (mw_rstore *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->mu); mw_rman *o = s->cur; s->cur = NULL; atomic_store(&s->bl0, 0); atomic_store(&s->ball, 0); pthread_mutex_unlock(&s->mu);
+    rsx_man_release(o);
+    for (size_t i = 0; i < s->ncs; i++) { pthread_mutex_t *mu = &s->cmu[i % CSTRIPES]; pthread_mutex_lock(mu); cblk *b = s->cs[i].b; s->cs[i].b = NULL; pthread_mutex_unlock(mu); cblk_unref(b); }
+    pthread_mutex_lock(&s->pmu); s->npool = 0; s->nh = 0; pthread_mutex_unlock(&s->pmu);
+}
 void rsx_free (mw_rstore *s) {
     if (!s) return;
     for (size_t i = 0; i < s->ncs; i++) cblk_unref(s->cs[i].b);

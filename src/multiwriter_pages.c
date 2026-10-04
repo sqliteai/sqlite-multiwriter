@@ -406,6 +406,9 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     if (lane && lane->holds_reloc) MW_T1(MW_ST_H_SEQ, tsq0);
     uint64_t tin0 = MW_T0();
 
+    // (what the install changes outside the chains, for the case that the record cannot be written and the commit is taken back: the head of page 1 and its cookie are the ones the next commits validate against)
+    const uint64_t p1_prev_head = atomic_load_explicit(&st->p1_head_epoch, memory_order_acquire); const uint32_t p1_prev_cookie = atomic_load_explicit(&st->p1_cookie, memory_order_relaxed);
+    bool wrote_p1 = false; for (int i = 0; i < n; i++) if (pgnos[i] == 1) wrote_p1 = true;
     lpush lc = {0}, ld = {0};
     for (int i = 0; i < n; i++) chain_install_batched(st, pgnos[i], chains[i], epoch, copies[i], &lc, &ld);
     lists_splice(st, &lc, &ld);                                  // (still under the stripe locks: the lists never miss a page a compactor could look for)
@@ -447,6 +450,11 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
                     atomic_fetch_sub(&st->versions, 1); atomic_fetch_sub(&st->versions_allocated, 1); atomic_fetch_sub(&st->bytes, (uint64_t)st->pgsz);
                 }
             }
+            if (wrote_p1 && atomic_load_explicit(&st->p1_head_epoch, memory_order_acquire) == epoch) {       // (page 1 of the commit that never was must not be the head that later commits see, or a relocation's copy of it)
+                atomic_store_explicit(&st->p1_cookie, p1_prev_cookie, memory_order_relaxed);
+                atomic_store_explicit(&st->p1_head_epoch, p1_prev_head, memory_order_release);
+            }
+            if (db->p1_cache_epoch == epoch) db->p1_cache_epoch = 0;
             stripes_unlock(st, &again);
         }
         mw_db_wake_all_visibility(db);

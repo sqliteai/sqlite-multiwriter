@@ -195,6 +195,17 @@ the metadata tests with the store under pressure.
   the last records are copied (`mw_log_rewrite_prepare` / `mw_log_rewrite_tail(.., prep)`; the old path stays for the multi-process mode). 16 threads, 15 s, three alternating pairs: untracked 45.9k -> 48.3k tx/s and p99
   2.8 -> 1.07 ms; tracked 30.9k -> 30.9k tx/s and p99 5.3 -> 1.9 ms. (A log limit of 128 MB gave the same p99 without the change, 512 MB made it worse: 20k tx/s, p99 21 ms.) Test `mw_logrewrite`
   (1 MB limit, 8 committers, then SIGKILL at ten different moments: every acknowledged commit is there, the integrity check passes).
+- **A merge that costs less changes nothing now (measured, nothing kept).** `bench/bench_merge.c` merges 8 runs of rows like the benchmark's in memory: 45 ns a row (22 M rows/s), 14.3 bytes a row stored.
+  The merger thread of a real run does ~5.5 M rows/s, so the merge proper is a quarter of its time; the rest is reading blocks and writing parts through the engine. What was tried, each against the same
+  binary in alternating 30 s runs (29.4k tx/s, tracked, 16 threads): the inputs of a merge removed by the writer thread while the next merge starts (the runs a merge is working on are excluded from the
+  next choice) 29.6-29.9k; the level 0 merged between the parts of a big merge (the runs of the flushes pile up behind a merge of the second level, 8 times the size) no better; a second merger thread for
+  the level 0 22-28k (worse: the two take turns on the same b-trees and the page store, RSS up to 2.7 GB); a flush of 4 or 8 times more rows, parts of 64k or 128k rows, fanouts 6 and 12, `LZ4` acceleration
+  4 and 8: all within the noise (+-3%); letting the age groups of all levels go to 6 or 12 times the limit (`all - 3 * MW_META_MAX_RUNS` today) +4-5%, and with no back-pressure at all 38k tx/s for 20-30 s, but
+  then the merges are starved (35 M rows merged against 100 M) and the backlog grows without limit.
+- **Why: the merges and the flushes share the log with the writers.** In a 20 s run the log carried 18.8 GB of user commits (32 KB each) and 3.7 GB of commits of the metadata (21 thousand, 179 KB each, the
+  blocks of the runs as page images): a sixth more bytes through the one group-commit pipeline, and the transactions of the merge and the flush take turns on the b-trees of `mw_slots` / `mw_free`
+  (`rsx_wlock`). The process uses ~9.8 of the 18 cores, so it is not the CPU. What would cut it is writing fewer bytes: the blocks hold 14.5 bytes a row (9 of them the key, ascending: a key stored as a
+  difference from the previous one with restart points would save ~40%), or fewer passes (every row is written once by the flush and once at each level: 4 times in a run of 60 s).
 
 ## Capture and DDL
 

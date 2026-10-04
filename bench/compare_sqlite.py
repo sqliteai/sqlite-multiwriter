@@ -28,7 +28,7 @@ def clean(db):
 
 def common(mode, extra, db, n):
     mp = (1 if kind == "procs" or os.environ.get("THREADS_MP") else 0) if mode == "multiwriter" else 0       # (threads: the engine of one process, mw_mp=0; THREADS_MP=1: the shared mode with threads)
-    return [BIN, "--mode", mode, "--workload", "bulk", "--path", db, "--mp", str(mp), "--sync", "full", "--retry", "1000", "--begin-wait"] + extra
+    return [BIN, "--mode", mode, "--workload", os.environ.get("WORKLOAD", "bulk"), "--path", db, "--mp", str(mp), "--sync", "full", "--retry", "1000", "--begin-wait"] + (["--think-us", os.environ["THINK_US"]] if os.environ.get("THINK_US") else []) + extra
 
 def run(variant, n):
     mode, extra = VARIANTS[variant]

@@ -777,7 +777,7 @@ uint64_t mw_db_gc (mw_db *db) {
         }
         if (drop) { memmove(c->v, c->v + drop, (size_t)(c->n - drop) * sizeof(mw_pv)); c->n -= drop; }
         if (c->n > 0) LIST_PUSH(st, cand_head, cand_next, pgno, c);    // still pinned by an old snapshot, or not yet materialised in the real file: stay a candidate
-        else c->queued = 0;
+        else { c->queued = 0; free(c->v); c->v = NULL; c->cap = 0; }   // (a page with no version in memory keeps no array of them: a database of millions of pages that were each written once held 150-200 MB of them)
         pthread_mutex_unlock(mu);
     }
     // size records: keep the newest one visible to `oldest` and everything after it

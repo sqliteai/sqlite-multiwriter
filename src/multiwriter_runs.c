@@ -163,8 +163,17 @@ rs_run *rs_run_decode (int64_t id, int64_t age, int lvl, uint64_t nrows, uint32_
     if (len < 2 || *p++ != 2 || !get_var(&p, end, &nf) || nf == 0 || nf > (1u << 26) || nf != nblk) return NULL;
     rs_run *r = calloc(1, sizeof *r); if (!r) return NULL;
     r->id = id; r->age = age; r->lvl = lvl; r->nrows = nrows; r->nblk = nblk; r->dvmax = dvmax; r->nfence = (uint32_t)nf; atomic_init(&r->refs, 1);
-    r->ftbl = malloc(nf * 4); r->foff = malloc(nf * 4); r->flen = malloc(nf * 4); r->fdv = malloc(nf * 8); r->farena = malloc((size_t)(end - p) + 1);
-    r->slen = malloc(nf * 4); r->loff = malloc(nf * 4); r->llen = malloc(nf * 4); r->larena = malloc((size_t)(end - p) + 1);
+    r->ftbl = malloc(nf * 4); r->foff = malloc(nf * 4); r->flen = malloc(nf * 4); r->fdv = malloc(nf * 8);
+    r->slen = malloc(nf * 4); r->loff = malloc(nf * 4); r->llen = malloc(nf * 4);
+    { size_t ft = 0, lt = 0; const uint8_t *q = p;                                      // (the keys of the fences and the locators take what they take, not the size of the whole meta: that was 3 allocations of the size of the filter for every run)
+      for (uint64_t i = 0; i < nf; i++) {
+          uint64_t t, l, d, sl, ll;
+          if (!get_var(&q, end, &t) || !get_var(&q, end, &l) || l > (uint64_t)(end - q)) goto bad;
+          q += l; ft += (size_t)l;
+          if (!get_var(&q, end, &d) || !get_var(&q, end, &sl) || !get_var(&q, end, &ll) || ll > (uint64_t)(end - q)) goto bad;
+          q += ll; lt += (size_t)ll;
+      }
+      r->farena = malloc(ft + 1); r->larena = malloc(lt + 1); }
     if (!r->ftbl || !r->foff || !r->flen || !r->fdv || !r->farena || !r->slen || !r->loff || !r->llen || !r->larena) goto bad;
     size_t fa = 0, la = 0;
     for (uint64_t i = 0; i < nf; i++) {

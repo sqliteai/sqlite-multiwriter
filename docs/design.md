@@ -231,6 +231,13 @@ the metadata tests with the store under pressure.
   hash of a key is computed once for the filter and the table. `prepare` 36.8 -> 33.9 us a commit, CPU of the run -6% (315 -> 296 s of 30 s), p50 361 -> 352 us; the throughput does not move
   (33.5k tx/s before and after, three alternating pairs; 4 processes the same): the 16 committers' cycle is no longer limited by what they do, but by the back-pressure of the merges (7.7% of their time, 24.5 s
   of 320) and the log that the merges share with them (see above).
+- **Where the memory went, and two leaks of address space that were fixed (measured).** `vmmap` / `heap` / `malloc_history` on 16 tracked threads after 28 s: 1.1 GB live in 2.3 million allocations, 19%
+  fragmentation (so the allocator was not the problem). By stack, at 140 s (1.28 GB live): 46% `rs_run_decode`, which allocated the arenas of the fence keys and of the locators of a run with the size
+  of its whole meta (the filter included) - three 49 KB blocks for every run, 1 needed; 17% the arrays of versions of the page chains (`chain_reserve`: 48-112 bytes for each of the 1.4 million pages
+  that were ever written, kept for ever after the garbage collector had dropped their versions); 6% the base cache of pages (cap 64 MB), 8% the memory table (cap 64 MB), 13% SQLite's page caches and the
+  benchmark's own buffers. Now the arenas of a run are measured first and allocated exactly, and a chain whose versions are all gone gives its array back. 28 s: footprint 1.1 GB -> 0.62 GB,
+  2.3 M -> 89 thousand allocations; 60 s: RSS 2.4 GB -> 1.35-1.42 GB (two runs each); tx/s unchanged (31.2-32.2k before, 31.6-32.1k after), p99 the same. What is left (580 MB live at 28 s): the filters
+  (180 MB for 3750 runs: `mw_meta_bloom_bits`), the slabs of the memory table (115 MB), pending rows (70 MB), the base cache (54 MB).
 
 ## Capture and DDL
 

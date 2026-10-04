@@ -1,6 +1,6 @@
 //
 //  multiwriter_seglog.h
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Segmented commit log for the shared mode of multi-process Multi-Writer (mw_mp=2): "<db>-mw.<N>", N = 1, 2, ...
 //

@@ -1,6 +1,6 @@
 //
 //  multiwriter_wait.h
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Waiting on a 32-bit word in memory shared between processes, woken by a store + wake from another one (a futex). Polling with nanosleep wakes up 100-400 us late on
 //  macOS, which is longer than a commit: admission and lock hand-offs between 1000 processes need the waiter to run when the word changes.

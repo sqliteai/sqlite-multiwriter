@@ -1,6 +1,6 @@
 //
 //  multiwriter_lane.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Private write lanes. In private-lane mode ("mw=2") each connection gets:
 //    - its own in-memory "-wal" (no real file): SQLite believes it is the only writer, so

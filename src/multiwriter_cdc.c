@@ -76,7 +76,7 @@ void mw_cdc_close (mw_db *db) {
 int mw_cdc_shared_create (mw_db *db) {                                      // the first opener of the database
     char *p = mw_sidecar_path(db->path, "mwown"); if (!p) return SQLITE_NOMEM;
     unlink(p);
-    int fd = open(p, O_RDWR | O_CREAT, 0644); sqlite3_free(p);
+    int fd = open(p, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, mw_file_mode(db->path)); sqlite3_free(p);          // (it was unlinked just above: a file or a link that is there now is somebody else's)
     if (fd < 0) return SQLITE_CANTOPEN;
     int rc = mw_io_ftruncate(fd, (off_t)OWN_FILE_BYTES) == 0 ? SQLITE_OK : SQLITE_IOERR;
     close(fd); return rc;

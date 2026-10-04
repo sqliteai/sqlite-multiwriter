@@ -1,6 +1,6 @@
 //
 //  multiwriter_tx.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Transaction identity and the active-snapshot registry.
 //

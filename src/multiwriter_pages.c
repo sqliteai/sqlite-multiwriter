@@ -1,6 +1,6 @@
 //
 //  multiwriter_pages.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  The versioned committed page store and the commit protocol on top of it.
 //

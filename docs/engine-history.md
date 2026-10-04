@@ -1,3 +1,5 @@
+> **OBSOLETE — historical document.** It describes the first prototype, built inside sqlite-sync (`MULTIWRITER=1` builds, `cloudsync_changes`, the rebase of tracked tables). That engine is no longer this project: metadata is captured in the VFS and kept in the version store, and sqlite-sync is only used for the SQLite amalgamation, LZ4 and the oracle tests. For the current design read `design.md`; numbers and statements below are not current.
+
 # Multi-Writer mode for SQLite (experimental)
 
 > **Status: experimental research branch (`multiwriter`).** Everything here is opt-in and compiled only

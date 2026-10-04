@@ -1,6 +1,6 @@
 //
 //  multiwriter_boot.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Bootstrap for the Multi-Writer build. SQLite is compiled with
 //  -DSQLITE_EXTRA_INIT=mw_extra_init, so this runs at the end of sqlite3_initialize():

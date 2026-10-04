@@ -1,6 +1,6 @@
 //
 //  multiwriter_db.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Per-database state shared by every connection (lane) of this process that opened the
 //  same file. The registry is keyed by the full path SQLite hands to xOpen.

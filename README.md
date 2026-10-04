@@ -25,3 +25,10 @@ Status: macOS first (Linux, iOS, Windows, Android next). `docs/design.md` is the
     make test-mp        # the metadata tests with processes (mw_mp=1)
     make bench          # dist/mw_bench;  bench/compare_sqlite.py: against stock SQLite
     test/sanitize.sh asan|ubsan|tsan [tests]
+
+    make test-stress    # long-running stress and soak tests
+    make test-io        # errors of the file system and a full disk
+
+## License
+
+See `LICENSE.md` (Elastic License 2.0, modified). `deps/sqlite-sync` and the bundled SQLite (public domain) and LZ4 (BSD 2-clause) keep their own licences.

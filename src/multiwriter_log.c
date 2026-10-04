@@ -1,6 +1,6 @@
 //
 //  multiwriter_log.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Durable commit log ("<db>-mw"). Committed state = real database file + committed page versions;
 //  the versions live in memory, so every commit is first appended here as one checksummed record:
@@ -253,7 +253,7 @@ static int log_replay (mw_db *db, mw_store *st, int pgsz, uint64_t base, uint64_
 int mw_log_open (mw_db *db, int pgsz) {
     db->logpath = sqlite3_mprintf("%s-mw", db->path);
     if (!db->logpath) return SQLITE_NOMEM;
-    db->logfd = open(db->logpath, O_RDWR | O_CREAT, 0644);
+    db->logfd = open(db->logpath, O_RDWR | O_CREAT | O_NOFOLLOW, mw_file_mode(db->path));
     db->has_log = db->logfd >= 0;
     if (db->logfd < 0) return SQLITE_CANTOPEN;
     // single-process mode owns the log exclusively; multi-process mode shares it (a non-mp opener asking for EX is refused)
@@ -1085,7 +1085,7 @@ mw_log_prep *mw_log_rewrite_prepare (mw_db *db, uint64_t base_epoch) {
     mw_log_prep *p = calloc(1, sizeof *p); if (!p) return NULL;
     p->nfd = -1; p->tail_off = first;
     p->tmp = sqlite3_mprintf("%s.new", db->logpath); if (!p->tmp) { free(p); return NULL; }
-    p->nfd = open(p->tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    p->nfd = open(p->tmp, O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW, mw_file_mode(db->path));
     if (p->nfd < 0) { p->nfd = -1; mw_log_rewrite_abort(p); return NULL; }
     int rc = flock(p->nfd, LOCK_EX | LOCK_NB) != 0 ? SQLITE_BUSY : SQLITE_OK;
     log_hdr h; memset(&h, 0, sizeof h);
@@ -1136,7 +1136,7 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch, mw_log_prep *prep) {
     } else {
         tmp = sqlite3_mprintf("%s.new", db->logpath);
         if (!tmp) return SQLITE_NOMEM;
-        nfd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        nfd = open(tmp, O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW, mw_file_mode(db->path));
         if (nfd < 0) { sqlite3_free(tmp); return SQLITE_CANTOPEN; }
         if (flock(nfd, (db->mp ? LOCK_SH : LOCK_EX) | LOCK_NB) != 0) rc = SQLITE_BUSY;
         log_hdr h;

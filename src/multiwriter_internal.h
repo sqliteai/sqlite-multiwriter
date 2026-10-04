@@ -1,6 +1,6 @@
 //
 //  multiwriter_internal.h
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Internal structures shared by the Multi-Writer translation units.
 //  Locking rules (also documented at each field):
@@ -18,7 +18,6 @@
 #include "multiwriter_shidx.h"
 #include <stdbool.h>
 #include "multiwriter.h"
-#include "multiwriter_vsshared.h"
 #include "multiwriter_catalog.h"
 
 // One row of the net change of a commit. pk: the key as sqlite-sync encodes it (NULL if the row could not be decoded); oldpk: an update that changed the key; changed: bit i = cell i of
@@ -86,10 +85,12 @@ typedef struct mw_shm {
     uint32_t          sl_pad;
     _Atomic uint64_t  sl_end;             // ... and the offset in it (moved only under the publication lock)
     _Atomic uint64_t  seg_first_epoch[256];   // the epoch segment s was opened for, at [s % 256]
+    _Atomic uint32_t  seg_first_id[256];      // ... and the segment that it belongs to: with more than 256 live segments a slot is taken by a later one, and then the epoch is read from the file of the segment
     _Atomic uint64_t  pend_epoch, pend_off; _Atomic uint32_t pend_seg;       // the record being published (epoch, where it starts): set when it is appended, cleared when it is visible
     _Atomic uint64_t  sy_done;            // everything up to this log position (segment << 40 | offset) is durable: the group commit across processes
     _Atomic uint32_t  sy_wake;            // changed + woken when a sync finishes: the commits waiting for durability sleep on it
     _Atomic int32_t   sy_leader;          // process running the fsync everybody waits for (0 = none)
+    _Atomic uint32_t  broken;             // a commit failed after its pages were installed in the index and before it was published (its versions sit at an epoch that the next commit would reuse): no process publishes any more until all have closed
     _Atomic uint32_t  sy_failed;          // an fsync of the log failed: the data it should have covered may never reach the disk, and a later fsync that succeeds (the kernel forgets the error) must not acknowledge it: every commit that is not durable yet fails, in every process, until the log is closed by all
     _Atomic uint32_t  base_dbsize;        // database size in pages at the compaction base (what the real file holds)
     _Atomic uint64_t  compact_req_ns;     // shared mode: a process has claimed the next compaction at this time (0 = none; a claim older than 2 s is void)
@@ -386,6 +387,7 @@ struct mw_db {
     struct mw_seglog *sl;                  // the segmented log (shared mode)
     shidx            *ix;                  // the shared version index (shared mode)
     shidx            *rx;                  // the shared index of the CRDT metadata (row buckets -> where their newest state is in the log; mw_cdc=1)
+    bool              mp_stale_owner;      // the header said that the publication lock was held by our own pid when we registered: a process that died with it (repaired once the database is open)
     bool              mp_lazy;             // multi-process catch-up installs lazy versions (set once the database is open; MW_MP_LAZY enables, off by default)
     bool              mp_first;            // this process initialised the shared state
     bool              orphaned;            // inherited through fork(): the child must not use (or tear down) the parent's state; it opens its own

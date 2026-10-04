@@ -1,6 +1,6 @@
 //
 //  multiwriter_mp.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Multi-process mode (URI mw_mp=1): several processes, each with several connections, on one database.
 //
@@ -80,13 +80,28 @@ static bool pid_alive (mw_db *db, int32_t pid) {
 
 // MARK: - open / close -
 
+// Everything in the header that carries our pid at the moment we register is of a process that died and whose pid we were given (a live process has its own pid): its snapshot slots, the
+// publication lock, the DDL owner, its tickets. Left alone they would be taken for ours (alive) for as long as we live, and nobody would ever steal them.
+static void mp_drop_own_stale (mw_db *db) {
+    mw_shm *sh = db->shm; const int32_t me = (int32_t)getpid();
+    for (int i = 0; i < MW_MP_SLOTS; i++) {
+        int32_t p = atomic_load(&sh->slots[i].pid);
+        if (p == me && atomic_compare_exchange_strong(&sh->slots[i].pid, &p, -1)) {
+            atomic_store(&sh->slots[i].snap, MW_MP_NONE); atomic_store(&sh->slots[i].minres, 0); atomic_store(&sh->slots[i].writing, 0); atomic_store(&sh->slots[i].pid, 0);
+        }
+    }
+    int32_t o = me; if (atomic_compare_exchange_strong(&sh->pub_owner, &o, 0)) db->mp_stale_owner = true;       // (it may have died inside a publication: the repair runs when the database is open)
+    int32_t d = me; atomic_compare_exchange_strong(&sh->ddl_pid, &d, 0);
+    for (int i = 0; i < 1024; i++) { int32_t t = me; atomic_compare_exchange_strong(&sh->pub_tk_pid[i], &t, 0); }
+}
+
 int mw_mp_open (mw_db *db) {
     db->mp_path = mw_sidecar_path(db->path, "mwlock");
     db->mp_pubpath = mw_sidecar_path(db->path, "mwlk");
     if (!db->mp_path || !db->mp_pubpath) return SQLITE_NOMEM;
     size_t len = (sizeof(mw_shm) + 4095) & ~(size_t)4095;
     for (int attempt = 0; attempt < 500; attempt++) {
-        db->mp_lockfd = open(db->mp_path, O_RDWR | O_CREAT, 0644);
+        db->mp_lockfd = open(db->mp_path, O_RDWR | O_CREAT | O_NOFOLLOW, mw_file_mode(db->path));
         if (db->mp_lockfd < 0) return SQLITE_CANTOPEN;
         bool first = flock(db->mp_lockfd, LOCK_EX | LOCK_NB) == 0;         // nobody else alive: we (re)initialise
         if (!first && flock(db->mp_lockfd, LOCK_SH) != 0) { close(db->mp_lockfd); db->mp_lockfd = -1; return SQLITE_BUSY; }   // blocks while the first process initialises
@@ -98,7 +113,7 @@ int mw_mp_open (mw_db *db) {
         // publication/compaction byte locks live on a file of their own: on BSD/macOS flock() and fcntl() locks on
         // one file conflict with each other, and every process holds a shared flock on the header file. (Opened only now: while
         // we hold the header lock nobody can unlink it.)
-        db->mp_pubfd = open(db->mp_pubpath, O_RDWR | O_CREAT, 0644);
+        db->mp_pubfd = open(db->mp_pubpath, O_RDWR | O_CREAT | O_NOFOLLOW, mw_file_mode(db->path));
         if (db->mp_pubfd < 0) { close(db->mp_lockfd); db->mp_lockfd = -1; return SQLITE_CANTOPEN; }
         // (every failure from here on gives the files back: the flock on the header file is what the other processes wait for while the first one initialises it)
         #define MP_OPEN_FAIL(code) do { close(db->mp_pubfd); db->mp_pubfd = -1; close(db->mp_lockfd); db->mp_lockfd = -1; return (code); } while (0)
@@ -130,6 +145,7 @@ int mw_mp_open (mw_db *db) {
             db->mp_proc = i;
         }
         if (db->mp_proc < 0) { db->mp = false; db->shm = NULL; munmap(m, len); MP_OPEN_FAIL(SQLITE_FULL); }
+        if (!first) mp_drop_own_stale(db);
         if (!first) { db->mp_gen = MW_LOG_GEN(atomic_load(&db->shm->log_pos)); db->mp_base_seen = atomic_load(&db->shm->base_epoch); }
         return SQLITE_OK;
     }
@@ -390,6 +406,7 @@ int mw_mp_slot_alloc (mw_db *db) {
             if (atomic_compare_exchange_strong(&sh->slots[i].pid, &exp, (int32_t)getpid())) {
                 atomic_store(&sh->slots[i].snap, MW_MP_NONE);
                 atomic_store(&sh->slots[i].minres, 0);
+                atomic_store(&sh->slots[i].writing, 0);                         // (a slot that a dead process left in a write transaction would make a DDL of another wait the full 2 s)
                 return i;
             }
         }

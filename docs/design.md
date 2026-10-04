@@ -330,3 +330,34 @@ stores (`mw_mp=3`: the metadata design needs the shared mode; opening it with `m
 `make test` (the engine and the metadata: capture against a model, the store across restarts and SIGKILL, DDL, sync convergence and atomicity, multi-process with a live reader
 and SIGKILL rounds), `make oracle-test` (differential tests against sqlite-sync: primary-key encoding, local generation, merge of 37 thousand changes, 4000 transactions of the
 live store, features, 300 rounds of two peers exchanging payloads through the real encoder and decoder), `make test-mp` (the metadata tests again with the processes mode), `make test-io` (errors of the file system and a full disk: see above). All of it also runs on Linux (a gcc 14 container, `--privileged` for the size-limited tmpfs of `mw_diskfull`; `kill -USR1 <pid>` of a test prints the stacks of its threads).
+
+## Parameters (URI and environment)
+
+URI parameters (`file:db?mw=1&...`, read at open): `mw` (0/1/2, the engine), `mw_mp` (0 one process, 1 processes in shared mode, 2 shared, 3 private stores), `mw_cdc` (1: capture of the changes in the commit),
+`mw_sys` (internal connections of the metadata store), `mw_fullfsync` (F_FULLFSYNC on macOS), `mw_profile` (`small`: caches 8 MB, Bloom 8 bits, log 16 MB), `cache`, `mw_base_cache_mb`,
+`mw_meta_cache_mb`, `mw_meta_bloom_bits`, `mw_log_max_mb`, `mw_gc`, `mw_hot_credit`, `mw_readcheck`, `mw_noreloc`, `mw_noroute`, `mw_nomerge` (tests and experiments: not for production).
+`mw_norebase` belongs to the first prototype and is a no-op for the metadata path.
+
+Environment (defaults of the same knobs and diagnostics): `MW_FULLFSYNC`, `MW_PROFILE`, `MW_META_CACHE_MB`, `MW_META_BLOOM_BITS`, `MW_META_ALL_MULT` (back-pressure, in run groups), `MW_META_FLUSH_MS|ROWS`,
+`MW_META_FANOUT`, `MW_META_MAX_RUNS`, `MW_META_PART_ROWS`, `MW_META_BUILDERS`, `MW_META_KICK_MS`, `MW_META_SWEEP_MS`, `MW_META_LZ4_ACCEL`, `MW_SEG_MB`, `MW_IDX_ENTRIES`, `MW_ROWIDX_ENTRIES`,
+`MW_SIDECAR_DIR` (where the shared maps go: `/dev/shm` on Linux), `MW_MP_LAZY`, `MW_MP_PRIVATE`, `MW_SPIN_US`, `MW_POOL_BATCH`, `MW_SYNC_COMPRESS`; diagnostics: `MW_DEBUG`, `MW_TIMING`, `MW_IO_TRACE`,
+`MW_CDC_STATS`, `MW_COMPACT_TRACE`. Measurement only (built with `make EXPERIMENTS=1`): `MW_EXP_NOEXT`, `MW_EXP_NOAPPLY`, `MW_META_NOMERGE`, `MW_META_NOCOMPRESS`.
+
+## Security of the files
+
+The log, the segments, the shared maps and the lock files are created with the mode of the database file (without execute bits; 0600 if it does not exist yet) and opened with `O_NOFOLLOW`; the
+CDC map is created with `O_EXCL` after an unlink. A sidecar in `/dev/shm` therefore has the same readers as the database. Not covered: a hostile local user who owns the directory of the database.
+
+## License
+
+The code in this repository is under the licence in `LICENSE.md`. `deps/sqlite-sync` (a submodule, used for the SQLite amalgamation, `lz4.c` and the oracle tests) keeps its own licence; SQLite is public
+domain and LZ4 is BSD 2-clause.
+
+## Third group of corrections (open items of the review)
+
+Fixed: the first epoch of a segment is kept in a tagged table (no more `%256` collisions) with a fallback to the segment header; the entries of a dead process whose pid was reused are dropped at
+registration and repaired at open; a publisher that dies inside GC is repaired (`gc_active`, `shidx_gc_repair`); a record appended before a failed shared install is undone, and a failed `mm_install` marks the
+database `broken`; `mm_head`/`read_group` propagate I/O errors instead of reporting "absent"; a full site table is an error, not a silent ordinal; sidecars take the mode of the database and are opened with
+`O_NOFOLLOW` (and `O_EXCL` for the CDC map). Removed: the vstore/vsshared prototypes and their benchmarks, `test/pending`. `mw_norebase`/the rebase path remain (still reachable from `lane_can_rebase`).
+Tested: the whole suite, test-mp, test-io, test-stress, oracle-test, `mw_mpmeta` x3, ASan on the touched tests, Linux (gcc 14) on the same. Not proven by a dedicated test: pid reuse, GC death repair, the
+`broken` flag, ticket stall, file modes. TSan reported one warning in one `mw_mpmeta` run that did not recur in three more (not analysed); `mw_syfail` cannot run under TSan (fork). No A/B perf run for this group.

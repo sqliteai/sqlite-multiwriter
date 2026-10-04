@@ -198,7 +198,7 @@ static int load_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_
 int mw_meta_row (mw_meta *m, uint32_t tbl, const void *pk, size_t pklen, mw_mcell **cells, int *n) {
     if (m->shared) {
         mw_meta_ready(m);
-        mm_group g; mm_head(m, mw_bucket_of(tbl, pk, pklen), &g);
+        mm_group g; if (mm_head(m, mw_bucket_of(tbl, pk, pklen), &g) != 0) return -1;
         for (int q = 0; q < g.n; q++) if (g.rows[q].tbl == tbl && g.rows[q].pklen == pklen && !memcmp(g.rows[q].pk, pk, pklen)) {
             *n = g.rows[q].n; *cells = malloc((size_t)(*n ? *n : 1) * sizeof(mw_mcell)); if (!*cells) { mm_group_free(&g); return -1; }
             memcpy(*cells, g.rows[q].c, (size_t)*n * sizeof(mw_mcell)); mm_group_free(&g); return 0;
@@ -411,7 +411,7 @@ static void ops_zero_cols (void *st, uint32_t tbl, const void *pk, size_t pklen,
 }
 static bool ops_row_known (void *st, uint32_t tbl, const void *pk, size_t pklen) { orow *r = ovl_row(st, tbl, pk, pklen, true); return r && r->n > 0; }
 static bool ops_value (void *st, uint32_t tbl, const void *pk, size_t pklen, uint32_t col, crdt_value *out) { mw_ovl *o = st; return o->vfn && o->vfn(o->varg, tbl, pk, pklen, col, out); }
-static uint32_t ops_site_ord (void *st, const uint8_t site[16]) { mw_ovl *o = st; uint32_t ord = mw_meta_site_ord(o->m, site); return ord; }
+static uint32_t ops_site_ord (void *st, const uint8_t site[16]) { mw_ovl *o = st; uint32_t ord = mw_meta_site_ord(o->m, site); if (ord == UINT32_MAX) { if (!o->err) o->err = SQLITE_FULL; return 0; } return ord; }        // (the table of sites is full: the commit is refused through the error of the overlay, not written with a remote site taken for this one)
 static bool ops_site_bytes (void *st, uint32_t ord, uint8_t out[16]) { mw_ovl *o = st; return mw_meta_site_id(o->m, ord, out); }
 
 static const crdt_ops OPS = { ops_get, ops_put, ops_drop_cols, ops_zero_cols, ops_row_known, ops_value, ops_site_ord, ops_site_bytes };

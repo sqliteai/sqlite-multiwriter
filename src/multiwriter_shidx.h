@@ -1,6 +1,6 @@
 //
 //  multiwriter_shidx.h
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Shared version index for multi-process Multi-Writer (phase 1: the data structure on its own).
 //
@@ -34,6 +34,7 @@ typedef struct {
     uint32_t max_entries;         // versions held at once (default 4M x 32 bytes of address space; the file is sparse)
     uint32_t nslots;              // snapshot registry size = most concurrent read transactions over all processes (default 4096)
     uint32_t max_cands;           // pages with several versions waiting for GC (default max_entries / 4; on overflow the next GC scans everything)
+    uint32_t mode;                // the mode of the file when it is created (0: 0600)
 } shidx_params;
 
 typedef struct {
@@ -73,6 +74,7 @@ uint64_t shidx_gc (shidx *ix, uint64_t base);
 // The same, with the floor decided by the caller (it runs its own registry of snapshots and guarantees that none below `floor` exists or can be taken).
 uint64_t shidx_gc_floor (shidx *ix, uint64_t floor, uint64_t base);
 // Free entries (versions that fit); `need` more than that: the caller must GC or compact first.
+void shidx_gc_repair (shidx *ix);        // a publisher died inside the lock: a collection that was running is redone from every page
 uint32_t shidx_room (shidx *ix);
 // Lock-free scan (any process, while the writer works): for every page whose newest version <= `upto` is newer than `base`, calls cb(pgno, epoch, loc). The caller must keep the
 // writer's GC from freeing versions <= upto (a floor that does not pass it) while it scans.

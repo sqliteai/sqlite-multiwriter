@@ -1,6 +1,6 @@
 //
 //  multiwriter.h
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Experimental Multi-Writer mode for SQLite (compile-time: CLOUDSYNC_MULTIWRITER).
 //  See docs/multiwriter.md. Not part of the normal SQLite/PostgreSQL builds.

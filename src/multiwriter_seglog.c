@@ -1,6 +1,6 @@
 //
 //  multiwriter_seglog.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Segmented commit log of the shared mode: see multiwriter_seglog.h.
 //
@@ -52,6 +52,7 @@ struct mw_seglog {
     uint32_t         pgsz;
     uint64_t         salt;
     uint64_t         seg_bytes;
+    mode_t           mode;          // of the files it creates (that of the database)
     mw_shm          *shm;
     pthread_mutex_t  map_mu;
     segmap           maps[MW_SEG_MAPS];
@@ -60,6 +61,10 @@ struct mw_seglog {
 
 // MARK: - helpers -
 
+static void first_epoch_set (mw_shm *sh, uint32_t seg, uint64_t epoch) {
+    atomic_store_explicit(&sh->seg_first_epoch[seg % 256], epoch, memory_order_release);
+    atomic_store_explicit(&sh->seg_first_id[seg % 256], seg, memory_order_release);
+}
 static uint64_t fnv64 (uint64_t h, const void *p, size_t n) {
     const unsigned char *b = p;
     while (n >= 8) { uint64_t w; memcpy(&w, b, 8); h ^= w; h *= 0x9E3779B97F4A7C15ull; h ^= h >> 32; b += 8; n -= 8; }
@@ -143,7 +148,7 @@ static void map_release (segmap *m) { atomic_fetch_sub(&m->users, 1); }
 static int seg_create (mw_seglog *sl, uint32_t seg, uint64_t size, uint64_t base, bool tmp, bool fill) {
     char path[620]; seg_path(sl, seg, path, sizeof path);
     if (tmp) strncat(path, ".new", sizeof path - strlen(path) - 1);
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW, sl->mode);
     if (fd < 0) return SQLITE_CANTOPEN;
     int rc = write_hdr(sl, fd, base);
     if (rc == SQLITE_OK && fill) {
@@ -215,6 +220,7 @@ int mw_seglog_open (mw_db *db, mw_seglog_replay_fn fn, void *ctx, uint64_t *base
     sl->prefix = malloc(pl);
     if (!sl->prefix) { free(sl); return SQLITE_NOMEM; }
     snprintf(sl->prefix, pl, "%s-mw.", db->path);
+    sl->mode = mw_file_mode(db->path);
     sl->pgsz = (uint32_t)db->store->pgsz;
     sl->seg_bytes = env_seg_bytes();
     sl->shm = db->shm;
@@ -254,7 +260,7 @@ int mw_seglog_open (mw_db *db, mw_seglog_replay_fn fn, void *ctx, uint64_t *base
         sqlite3_randomness(sizeof sl->salt, &sl->salt);
         rc = seg_create(sl, 1, sl->seg_bytes, base, false, true);
         if (rc != SQLITE_OK) { free(ids); return rc; }
-        atomic_store(&sh->seg_first_epoch[1 % 256], 2);
+        first_epoch_set(sh, 1, 2);
         atomic_store(&sh->seg_min, 1);
     } else {
         // base = the largest of the headers; salt = the first one's
@@ -308,8 +314,8 @@ int mw_seglog_open (mw_db *db, mw_seglog_replay_fn fn, void *ctx, uint64_t *base
             }
             free(buf);
             close(fd);
-            if (first_in_seg) { atomic_store(&sh->seg_first_epoch[ids[i].id % 256], first_in_seg); good_seg = ids[i].id; good_end = off; }
-            else if (i == 0) { atomic_store(&sh->seg_first_epoch[ids[i].id % 256], base + 1); good_seg = ids[i].id; good_end = MW_SEG_HDR; }
+            if (first_in_seg) { first_epoch_set(sh, ids[i].id, first_in_seg); good_seg = ids[i].id; good_end = off; }
+            else if (i == 0) { first_epoch_set(sh, ids[i].id, base + 1); good_seg = ids[i].id; good_end = MW_SEG_HDR; }
             else { stop = true; }                                                          // a segment without a valid first record: nothing after the previous one belongs to the log
         }
         cur_seg = good_seg; cur_end = good_end;
@@ -383,7 +389,7 @@ static int seg_roll (mw_db *db, mw_seglog *sl, uint32_t cur, uint64_t need, uint
     }
     // the header of the new segment carries the current base (recovery takes the largest over the segments)
     { char p[620]; seg_path(sl, next, p, sizeof p); int fd = open(p, O_RDWR); if (fd >= 0) { write_hdr(sl, fd, atomic_load(&sh->base_epoch)); close(fd); } }
-    atomic_store(&sh->seg_first_epoch[next % 256], first_epoch);
+    first_epoch_set(sh, next, first_epoch);
     atomic_store(&sh->seg_next_ready, 0);
     atomic_store(&sh->log_ready, 0);
     // (the segment first, then the offset in it: a holder that dies between the two leaves the new segment with the old offset, which the repair of the next holder sees - there is no record at the head of the
@@ -510,7 +516,7 @@ void mw_seglog_prefill_bg (mw_db *db) {
     char tmp[640]; seg_path(sl, next, tmp, sizeof tmp); strncat(tmp, ".new", sizeof tmp - strlen(tmp) - 1);
     if (atomic_load(&sh->sl_seg) == seg && atomic_load(&sh->seg_next_ready) != next) {
         uint64_t done = atomic_load(&sh->log_ready);
-        int fd = open(tmp, O_RDWR | (done == 0 ? (O_CREAT | O_TRUNC) : 0), 0644);
+        int fd = open(tmp, O_RDWR | O_NOFOLLOW | (done == 0 ? (O_CREAT | O_TRUNC) : 0), sl->mode);
         if (fd >= 0) {
             int rc = SQLITE_OK;
             if (done == 0) { rc = write_hdr(sl, fd, atomic_load(&sh->base_epoch)); done = MW_SEG_HDR; }
@@ -591,13 +597,25 @@ int mw_seglog_set_base (mw_db *db, uint64_t base) {
     return rc;
 }
 
+// The epoch that segment `seg` starts at: from the table when its slot is still its own, from the first record of its file when a later segment took the slot (more than 256 segments live). 0: unknown.
+static uint64_t first_epoch_get (mw_db *db, uint32_t seg) {
+    mw_shm *sh = db->shm;
+    if (atomic_load_explicit(&sh->seg_first_id[seg % 256], memory_order_acquire) == seg) { uint64_t v = atomic_load_explicit(&sh->seg_first_epoch[seg % 256], memory_order_acquire); if (v) return v; }
+    char path[620]; seg_path(db->sl, seg, path, sizeof path);
+    int fd = open(path, O_RDONLY); if (fd < 0) return 0;
+    rec_hdr r; uint64_t e = 0;
+    if (pread_all(fd, &r, sizeof r, (off_t)MW_SEG_HDR) == SQLITE_OK && r.magic == REC_MAGIC && r.pgsz == db->sl->pgsz) e = r.epoch;
+    close(fd);
+    return e;
+}
+
 void mw_seglog_trim (mw_db *db, uint64_t base) {
     mw_seglog *sl = db->sl;
     mw_shm *sh = db->shm;
     uint32_t mn = atomic_load(&sh->seg_min), cur = atomic_load(&sh->sl_seg);
     // a segment holds nothing newer than `base` when the next one starts at an epoch <= base + 1
     while (mn < cur) {
-        uint64_t next_first = atomic_load(&sh->seg_first_epoch[(mn + 1) % 256]);
+        uint64_t next_first = first_epoch_get(db, mn + 1);
         if (next_first == 0 || next_first > base + 1) break;
         // the new oldest segment's header must carry the base before the old one goes (recovery reads it from there)
         char path[620]; seg_path(sl, mn + 1, path, sizeof path);

@@ -1,6 +1,6 @@
 //
 //  multiwriter_shared.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Shared mode of multi-process Multi-Writer (URI mw_mp=2): the version index and the page images are shared by every process, nobody keeps a private store.
 //
@@ -85,7 +85,7 @@ int mw_shared_open (mw_db *db) {
     char *ixp = mw_sidecar_path(db->path, "mwidx");
     if (!ixp) return SQLITE_NOMEM;
     if (db->mp_first) shidx_unlink(ixp);                                        // volatile: rebuilt from the log below
-    shidx_params p = { 24, 4u << 20, MW_MP_SLOTS, 0 };
+    shidx_params p = { 24, 4u << 20, MW_MP_SLOTS, 0, (uint32_t)mw_file_mode(db->path) };
     const char *e = getenv("MW_IDX_ENTRIES");
     if (e && atoi(e) > 1000) p.max_entries = (uint32_t)atoi(e);
     db->ix = shidx_open(ixp, &p);
@@ -98,7 +98,7 @@ int mw_shared_open (mw_db *db) {
     if (db->cdc) {                                                              // the shared index of the CRDT metadata (volatile: rebuilt from the log below), and the owner maps
         char *rxp = mw_sidecar_path(db->path, "mwrow"); if (!rxp) return SQLITE_NOMEM;
         if (db->mp_first) { shidx_unlink(rxp); int crc = mw_cdc_shared_create(db); if (crc != SQLITE_OK) { sqlite3_free(rxp); return crc; } }
-        shidx_params rp = { 21, 4u << 20, 16, 0 };
+        shidx_params rp = { 21, 4u << 20, 16, 0, (uint32_t)mw_file_mode(db->path) };
         const char *re = getenv("MW_ROWIDX_ENTRIES"); if (re && atoi(re) > 1000) rp.max_entries = (uint32_t)atoi(re);
         db->rx = shidx_open(rxp, &rp); sqlite3_free(rxp);
         if (!db->rx) return SQLITE_CANTOPEN;
@@ -121,6 +121,7 @@ int mw_shared_open (mw_db *db) {
 
 int mw_shared_open_finish (mw_db *db) {
     mw_shm *sh = db->shm;
+    if (db->mp_stale_owner) { db->mp_stale_owner = false; mw_mp_lock(db); mw_shared_repair(db); mw_mp_unlock(db); }       // (the publisher that died had our pid: what it left half done is finished or undone)
     if (db->mp_first) {
         atomic_store(&sh->log_pos, MW_LOG_POS(atomic_load(&sh->sl_seg), atomic_load(&sh->sl_end)));
         atomic_store(&sh->committed_epoch, atomic_load(&db->epoch));
@@ -151,6 +152,7 @@ void mw_shared_close (mw_db *db, bool sole) {
 // metadata, publish) or torn (undo: the cursor goes back, the header is cleared). Either way nobody else saw the commit, and the log has exactly one record for every epoch.
 void mw_shared_repair (mw_db *db) {
     mw_shm *sh = db->shm;
+    if (db->ix) shidx_gc_repair(db->ix);
     {   // a holder that died in the roll to a new segment: the cursor is in the new segment but still at the offset of the old one; there is no record at the head of a segment that was just rolled to
         uint32_t cs = atomic_load(&sh->sl_seg); uint64_t ce = atomic_load(&sh->sl_end);
         if (ce > MW_SEG_HDR && !atomic_load(&sh->pend_epoch)) {
@@ -232,7 +234,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     const bool adopt = v && v->adopt_images;
     #define ADOPT_FREE() do { if (adopt) for (int _i = 0; _i < n; _i++) free((void *)images[_i]); } while (0)
     int rc = SQLITE_OK;
-    if (atomic_load(&db->failed)) { ADOPT_FREE(); return SQLITE_IOERR; }
+    if (atomic_load(&db->failed) || atomic_load(&sh->broken)) { ADOPT_FREE(); return SQLITE_IOERR; }
 
     uint64_t tv0 = MW_T0();
     // ---- validate -----------------------------------------------------------------------------------
@@ -306,14 +308,19 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     MW_T1(MW_ST_APPEND, ta0);
     if (rc != SQLITE_OK) { if (n > 16) free(locs); ADOPT_FREE(); return rc; }          // (the append failed before it touched anything the others can see: this commit fails, the database does not)
     uint64_t ti0 = MW_T0();
-    if (shidx_install(ix, epoch, new_dbsize, n, pgnos, locs) != 0) { if (n > 16) free(locs); ADOPT_FREE(); atomic_store(&db->failed, 1); return SQLITE_FULL; }
+    if (shidx_install(ix, epoch, new_dbsize, n, pgnos, locs) != 0) {                // (nothing was installed: the record is taken out of the log again, so that the log has exactly one record for the epoch that the next commit takes)
+        mw_seglog_discard(db, atomic_load(&sh->pend_seg), atomic_load(&sh->pend_off));
+        atomic_store(&sh->sl_seg, atomic_load(&sh->pend_seg)); atomic_store_explicit(&sh->sl_end, atomic_load(&sh->pend_off), memory_order_release);
+        atomic_store_explicit(&sh->pend_epoch, 0, memory_order_release);
+        if (n > 16) free(locs); ADOPT_FREE(); return SQLITE_FULL;
+    }
     MW_T1(MW_ST_SH_INSTALL, ti0);
     if (n > 16) free(locs);
     if (db->cdc && lane) {                                                       // the metadata of the commit: its buckets in the shared index, the owner maps follow the commit's pages
         uint64_t to0 = MW_T0();
         mw_cdc_apply_owner(db, lane, pgnos, images, n);
         MW_T1(MW_ST_SH_OWNER, to0); to0 = MW_T0();
-        if (db->rx) { int mrc = mm_install(db, lane, epoch, ext_loc); if (mrc != SQLITE_OK) { ADOPT_FREE(); atomic_store(&db->failed, 1); return mrc; } }
+        if (db->rx) { int mrc = mm_install(db, lane, epoch, ext_loc); if (mrc != SQLITE_OK) { ADOPT_FREE(); atomic_store(&sh->broken, 1); atomic_store(&db->failed, 1); return mrc; } }
         MW_T1(MW_ST_SH_MM, to0);
     }
     ADOPT_FREE();

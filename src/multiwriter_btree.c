@@ -1,6 +1,6 @@
 //
 //  multiwriter_btree.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Validation of a read of an *interior* b-tree page by what the transaction actually used from it.
 //

@@ -1,6 +1,6 @@
 //
 //  multiwriter_reloc.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Page relocation: a commit that conflicts *only because other commits extended the file*.
 //

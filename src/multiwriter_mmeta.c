@@ -33,7 +33,7 @@ uint32_t mm_site_ord (mw_meta *m, const uint8_t id[16]) {
     pthread_mutex_lock(&g_site_mu);
     mw_mp_meta_lock(m->db, 0, true);
     n = sh_nsites(m);
-    uint32_t r = 0; bool found = false;
+    uint32_t r = UINT32_MAX; bool found = false;                              // (UINT32_MAX: the table is full - ordinal 0 is this database, and a remote site must not be taken for it)
     for (uint32_t i = 0; i < n && !found; i++) if (!memcmp(sh->sites[i], id, 16)) { r = i; found = true; }
     if (!found && n < MW_MAX_SITES) { memcpy(sh->sites[n], id, 16); atomic_store_explicit(&sh->nsites, n + 1, memory_order_release); r = n; }
     mw_mp_meta_unlock(m->db, 0);
@@ -47,9 +47,10 @@ void mm_site_install_db (mw_db *db, uint32_t ord, const uint8_t id[16]) {
     pthread_mutex_lock(&g_site_mu);
     mw_mp_meta_lock(db, 0, true);
     uint32_t n = atomic_load_explicit(&sh->nsites, memory_order_acquire);
-    while (n <= ord) { memset(sh->sites[n], 0, 16); n++; atomic_store_explicit(&sh->nsites, n, memory_order_release); }
+    while (n < ord) { memset(sh->sites[n], 0, 16); n++; atomic_store_explicit(&sh->nsites, n, memory_order_release); }
     static const uint8_t zero[16] = {0};
-    if (!memcmp(sh->sites[ord], zero, 16)) memcpy(sh->sites[ord], id, 16);
+    if (n == ord) { memcpy(sh->sites[ord], id, 16); atomic_store_explicit(&sh->nsites, ord + 1, memory_order_release); }     // (the id is there before the count says that it is: a reader without the lock must not see a zero id)
+    else if (!memcmp(sh->sites[ord], zero, 16)) memcpy(sh->sites[ord], id, 16);
     mw_mp_meta_unlock(db, 0);
     pthread_mutex_unlock(&g_site_mu);
 }
@@ -75,20 +76,21 @@ static int purge_filter (mw_db *db, uint32_t tbl, mw_mcell *c, int n) {
 }
 
 // the group that starts at `loc` of the log (a version installed at `epoch`): its rows. false: the segment is gone (the state it held is older than the base, so it is in the file)
-static bool read_group (mw_meta *m, uint64_t loc, uint64_t epoch, uint32_t bucket_hint, mm_group *g) {
+// 1: read; 0: the segment is gone (below the base of the log); -1: it could not be read or it is damaged (a bucket taken for empty would make the commit rewrite it from nothing and lose the newest cells of the others)
+static int read_group (mw_meta *m, uint64_t loc, uint64_t epoch, uint32_t bucket_hint, mm_group *g) {
     mw_db *db = m->db; (void)bucket_hint;
     const uint64_t dvres = epoch + (uint64_t)mw_meta_origin(m);                 // (the db_version of the commit whose cells say "this commit")
-    uint8_t hb[5]; if (!mw_seglog_read(db, loc, 0, 5, hb)) return false;
-    const uint8_t *p = hb; uint64_t glen; if (rv(&p, hb + 5, &glen) || glen > (64u << 20)) return false;
+    uint8_t hb[5]; if (!mw_seglog_read(db, loc, 0, 5, hb)) return MW_LOC_SEG(loc) < atomic_load(&db->shm->seg_min) ? 0 : -1;
+    const uint8_t *p = hb; uint64_t glen; if (rv(&p, hb + 5, &glen) || glen > (64u << 20)) return -1;
     size_t hl = (size_t)(p - hb), total = hl + (size_t)glen;
-    uint8_t *raw = malloc(total ? total : 1); if (!raw) return false;
-    if (!mw_seglog_read(db, loc, 0, (uint32_t)total, raw)) { free(raw); return false; }
+    uint8_t *raw = malloc(total ? total : 1); if (!raw) return -1;
+    if (!mw_seglog_read(db, loc, 0, (uint32_t)total, raw)) { free(raw); return MW_LOC_SEG(loc) < atomic_load(&db->shm->seg_min) ? 0 : -1; }
     const uint8_t *q = raw + hl, *end = raw + total; uint64_t bucket, nrows;
-    if (rv(&q, end, &bucket) || rv(&q, end, &nrows) || nrows > (1u << 24)) { free(raw); return false; }
-    mm_row *rows = calloc((size_t)(nrows ? nrows : 1), sizeof *rows); if (!rows) { free(raw); return false; }
+    if (rv(&q, end, &bucket) || rv(&q, end, &nrows) || nrows > (1u << 24)) { free(raw); return -1; }
+    mm_row *rows = calloc((size_t)(nrows ? nrows : 1), sizeof *rows); if (!rows) { free(raw); return -1; }
     for (uint64_t i = 0; i < nrows; i++) {
         uint64_t tbl, pklen, nc;
-        if (rv(&q, end, &tbl) || rv(&q, end, &pklen) || q + pklen > end) goto bad;
+        if (rv(&q, end, &tbl) || rv(&q, end, &pklen) || pklen > (uint64_t)(end - q)) goto bad;
         rows[i].tbl = (uint32_t)tbl; rows[i].pk = q; rows[i].pklen = (uint32_t)pklen; q += pklen;
         if (rv(&q, end, &nc) || nc > (1u << 20)) goto bad;
         rows[i].c = malloc((size_t)(nc ? nc : 1) * sizeof(mw_mcell)); if (!rows[i].c) goto bad;
@@ -104,18 +106,20 @@ static bool read_group (mw_meta *m, uint64_t loc, uint64_t epoch, uint32_t bucke
         continue;
     bad:
         for (uint64_t j = 0; j <= i; j++) free(rows[j].c);
-        free(rows); free(raw); return false;
+        free(rows); free(raw); return -1;
     }
     int w = 0; for (uint64_t i = 0; i < nrows; i++) if (rows[i].tbl != 0xFFFFFFFFu) rows[w++] = rows[i];       // (the rows of dropped tables are gone)
     g->raw = raw; g->rawlen = total; g->rows = rows; g->n = w; g->bucket = (uint32_t)bucket; g->epoch = epoch;
-    return true;
+    return 1;
 }
 
 int mm_head (mw_meta *m, uint32_t bucket, mm_group *g) {
     memset(g, 0, sizeof *g);
     uint64_t ep, loc;
     if (!shidx_lookup(m->db->rx, bucket, UINT64_MAX, &ep, &loc)) return 0;
-    if (!read_group(m, loc, ep, bucket, g)) { memset(g, 0, sizeof *g); g->epoch = ep; return 0; }     // (unreadable: its segment is gone, so it is older than the base and its rows are in the file; the epoch is still the one the transaction read)
+    int rg = read_group(m, loc, ep, bucket, g);
+    if (rg < 0) { memset(g, 0, sizeof *g); return -1; }
+    if (rg == 0) { memset(g, 0, sizeof *g); g->epoch = ep; return 0; }     // (unreadable: its segment is gone, so it is older than the base and its rows are in the file; the epoch is still the one the transaction read)
     return 0;
 }
 

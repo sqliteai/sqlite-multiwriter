@@ -1,6 +1,6 @@
 //
 //  multiwriter_shidx.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Shared version index: see multiwriter_shidx.h.
 //
@@ -53,7 +53,7 @@ typedef struct {
     _Atomic uint32_t pad2;
     // writer only
     uint64_t installed;             // newest installed epoch
-    uint32_t arena_top, free_head, n_free, blocks_top, cand_n, cand_overflow;
+    uint32_t arena_top, free_head, n_free, blocks_top, cand_n, cand_overflow, gc_active;      // gc_active: a collection is in progress (it rebuilds the candidate list at its end: a holder that dies in it leaves pages that are marked as candidates and are on no list)
     uint64_t st_installs, st_freed, st_live, st_gc_runs, st_gc_full;
     _Atomic uint64_t st_hazard;     // lookups that met a recycled entry (must stay 0)
 } hdr;
@@ -88,7 +88,7 @@ static inline _Atomic uint32_t *head_ref (shidx *ix, uint32_t pgno, bool create)
 static size_t align_up (size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
 shidx *shidx_open (const char *path, const shidx_params *params) {
-    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, params && params->mode ? (mode_t)params->mode : (mode_t)0600);          // (not through a link that somebody put there)
     if (fd < 0) return NULL;
     if (flock(fd, LOCK_EX) != 0) { close(fd); return NULL; }
     struct stat sb;
@@ -370,6 +370,7 @@ static uint64_t gc_run (shidx *ix, uint64_t f, uint64_t base) {
     hdr *h = ix->h;
     uint64_t freed = 0;
     h->st_gc_runs++;
+    h->gc_active = 1;
     if (h->cand_overflow) {                                         // the candidate list lost entries: look at every page
         h->st_gc_full++;
         h->cand_overflow = 0; h->cand_n = 0;
@@ -387,6 +388,7 @@ static uint64_t gc_run (shidx *ix, uint64_t f, uint64_t base) {
                 if (more) { uint32_t w2 = atomic_load_explicit(hr, memory_order_relaxed); if (w2 && !(w2 & QBIT)) { cand_push(ix, pgno); atomic_store_explicit(hr, w2 | QBIT, memory_order_release); } }
             }
         }
+        h->gc_active = 0;
         return freed;
     }
     uint32_t n = h->cand_n;
@@ -399,8 +401,11 @@ static uint64_t gc_run (shidx *ix, uint64_t f, uint64_t base) {
         if (more) ix->cand[keep++] = pgno + 1;
     }
     h->cand_n = keep;
+    h->gc_active = 0;
     return freed;
 }
+// A publisher died inside the lock: if it was in a collection, the candidate list may be short of pages that are marked as in it; the next collection looks at every page and rebuilds it.
+void shidx_gc_repair (shidx *ix) { hdr *h = ix->h; if (h->gc_active) { h->cand_overflow = 1; h->gc_active = 0; } }
 
 int shidx_reap (shidx *ix, bool (*alive)(int32_t pid, void *ctx), void *ctx) {
     int n = 0;

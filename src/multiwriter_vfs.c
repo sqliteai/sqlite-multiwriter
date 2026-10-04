@@ -1,6 +1,6 @@
 //
 //  multiwriter_vfs.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Wrapper VFS: delegates every operation to the platform default VFS and, for now,
 //  only counts/traces events. Follows the pattern of SQLite's own vfstrace.

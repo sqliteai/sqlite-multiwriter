@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #if defined(__linux__)
 #include <linux/falloc.h>
 #endif
@@ -53,6 +54,9 @@ static inline int mw_sys_fsync (int fd) {
     return fsync(fd);
 }
 void mw_set_fullfsync (int on);
+// The mode of the files that the engine creates next to a database (the log, the segments, the maps): that of the database file without the bits of execution, 0600 when it is not there. A database that only
+// its owner can read must not have its pages in a log that anybody can read, and one that a group shares must have its sidecars open to the group.
+static inline mode_t mw_file_mode (const char *dbpath) { struct stat sb; return (dbpath && stat(dbpath, &sb) == 0) ? (mode_t)(sb.st_mode & 0666) : (mode_t)0600; }
 static inline int mw_io_fsync (int fd) { int e = mw_io_hit(MW_IO_SYNC, NULL); if (e) { errno = e; return -1; } return mw_sys_fsync(fd); }
 static inline int mw_io_msync (void *a, size_t n, int fl) { int e = mw_io_hit(MW_IO_SYNC, NULL); if (e) { errno = e; return -1; } return msync(a, n, fl); }
 static inline int mw_io_ftruncate (int fd, off_t n) { int e = mw_io_hit(MW_IO_TRUNC, NULL); if (e) { errno = e; return -1; } return ftruncate(fd, n); }

@@ -38,7 +38,7 @@ TEST_BIN := $(patsubst test/%.c,$(DIST)/%,$(TEST_SRC))
 IO_TESTS := $(DIST)/mw_ioerr $(DIST)/mw_diskfull                       # (minutes: make test-io)
 FAST_BIN := $(filter-out $(IO_TESTS),$(TEST_BIN))
 
-.PHONY: all test bench clean
+.PHONY: all test bench clean test-mp test-stress test-io oracle-test
 all: $(TEST_BIN)
 
 $(BUILD)/sqlite3.o: $(SQLITE_DIR)/sqlite3.c

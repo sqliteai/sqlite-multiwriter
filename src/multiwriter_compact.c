@@ -1,6 +1,6 @@
 //
 //  multiwriter_compact.c
-//  cloudsync
+//  sqlite-multiwriter
 //
 //  Compaction (checkpoint): materialises committed page versions into the real database file so it
 //  becomes an ordinary stock SQLite database again. It never takes part in transaction publication:

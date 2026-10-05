@@ -225,6 +225,7 @@ struct mw_lane {
     uint64_t    reloc_t0;        // (timing) when the relocation mutex was taken
     bool        holds_reloc;     // this lane holds db->reloc_mu (released by the publisher right after its pages are installed)
     bool        noroute;         // URI mw_noroute=1: validate every read page as a whole (measurement)
+    int         prep_delay_us;   // URI mw_prep_delay_us=N (tests): wait N us between the preparation of a relocation and the publication lock, so that the end of the file moves in between
     bool        nomerge;         // URI mw_nomerge=1: never merge interior pages (measurement)
     uint64_t    dsz_epoch;       // database size at this snapshot epoch, cached (the size at a given epoch never changes): xFileSize is called several times per transaction
     uint32_t    dsz_val;
@@ -321,7 +322,7 @@ struct mw_db {
     pthread_mutex_t   reloc_mu;            // serialises page relocations (they all chase the same end of the file); not held across the log fsync
     _Atomic uint64_t  n_merges;            // interior pages merged three-way instead of refusing the transaction
     _Atomic uint64_t  n_reads_saved;       // read conflicts on interior pages whose routing for the pages the transaction used was unchanged
-    _Atomic uint64_t  n_read_conflicts, n_pk_collisions, n_cell_conflicts, n_relocations;
+    _Atomic uint64_t  n_read_conflicts, n_pk_collisions, n_cell_conflicts, n_relocations, n_prep_used, n_prep_dropped, n_prep_rewrote;
     // durable log (multiwriter_log.c)
     char             *logpath;
     int               logfd;               // -1 = no log (never for a private-lane db)

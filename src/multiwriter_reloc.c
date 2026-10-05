@@ -250,6 +250,7 @@ void mw_lane_reloc_prepare (mw_lane *lane, const uint32_t *pgnos, const uint8_t 
 }
 void mw_lane_reloc_discard (mw_lane *lane) {
     rprep_box *b = lane->rprep; if (!b) return;
+    atomic_fetch_add(&lane->db->n_prep_dropped, 1);
     lane->rprep = NULL; rprep_free(&b->p); free(b);
 }
 
@@ -266,8 +267,8 @@ int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgno
     int result = MW_CONFLICT;
     for (int attempt = 0; attempt < 4; attempt++) {
         rprep P0, *P = &P0;
-        rprep_box *pre = attempt == 0 ? lane->rprep : NULL;
-        if (pre && pre->p.n == n && pre->p.ws_dbsize == ws_dbsize && pre->p.snap_dbsize == snap_dbsize) { P0 = pre->p; free(pre); lane->rprep = NULL; }      // (prepared before the lock: the copies and the references renumbered for the end of the file as it was then)
+        rprep_box *pre = attempt == 0 ? lane->rprep : NULL; bool used_pre = false;
+        if (pre && pre->p.n == n && pre->p.ws_dbsize == ws_dbsize && pre->p.snap_dbsize == snap_dbsize) { P0 = pre->p; free(pre); lane->rprep = NULL; atomic_fetch_add(&db->n_prep_used, 1); used_pre = true; }      // (prepared before the lock: the copies and the references renumbered for the end of the file as it was then)
         else { mw_lane_reloc_discard(lane); int prc = reloc_phase1(lane, pgnos, imgs, n, ws_dbsize, snap_dbsize, P); if (prc != SQLITE_OK) { result = prc; break; } }
         const uint32_t growth = P->growth; (void)growth;
         const int i1 = P->i1, ncf = P->ncf, reserved = P->reserved;
@@ -302,6 +303,7 @@ int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgno
             }
             if (rc == SQLITE_OK) {
                 uint32_t delta = cur - snap_dbsize;
+                if (delta != delta0 && used_pre) atomic_fetch_add(&db->n_prep_rewrote, 1);
                 if (delta != delta0) for (int k = 0; k < c.nrec; k++) wr32(nim[c.rec[k].slot] + c.rec[k].off, c.rec[k].orig + delta);
                 for (int i = 0; i < n; i++) npg[i] = pgnos[i] > snap_dbsize ? pgnos[i] + delta : pgnos[i];
                 // page 1: the latest one, counter + 1, size extended (the transaction changed nothing else on it)

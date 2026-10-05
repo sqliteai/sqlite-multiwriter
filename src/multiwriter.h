@@ -69,6 +69,7 @@ typedef struct {
     uint64_t pages_published, log_sync_ns, gate_closures, backpressure_stalls, hot_serialised;
     uint64_t log_bytes, compactions, compaction_ns, compacted_pages, log_syncs;
     uint64_t rebases, rebase_retries, rebase_max_attempts, rebase_ns, unrebasable, read_conflicts, pk_collisions;
+    uint64_t reloc_prep_used, reloc_prep_dropped, reloc_prep_rewrote;   // processes mode: phase 1 of a relocation made before the publication lock: used / thrown away (the plain publication succeeded, or it did not fit) / used with the references rewritten because the end of the file moved meanwhile
     uint64_t relocations;           // commits saved by renumbering their new pages after other commits extended the file
     uint64_t merges;                // interior b-tree pages rewritten by two transactions that were merged instead of refusing the second
     uint64_t reads_saved;           // read conflicts on interior pages avoided because the pages the transaction went through were routed unchanged

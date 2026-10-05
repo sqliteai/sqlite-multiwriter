@@ -176,7 +176,7 @@ static int lane_publish_inner (mw_lane *lane) {
     // lock is long, somebody commits meanwhile and the prepared relocation would be refused again (3.7 lock rounds per commit at 128 processes, 335 us of lock per commit).
     // The rebase (tracked tables) replays SQL and runs without the lock.
     bool mp_hold = db->mp && !(lane->rs_overflow && lane->readcheck);
-    if (mp_hold) mw_lane_reloc_prepare(lane, lane->ws_pgnos, imgs, lane->ws_n, lane->ws_dbsize, snap_size);       // (the private copies of the relocation that the commit most likely needs: made before the lock)
+    if (mp_hold) { mw_lane_reloc_prepare(lane, lane->ws_pgnos, imgs, lane->ws_n, lane->ws_dbsize, snap_size); if (lane->prep_delay_us > 0 && lane->rprep) usleep((useconds_t)lane->prep_delay_us); }       // (the private copies of the relocation that the commit most likely needs: made before the lock)
     if (mp_hold) {                                                // (what does not depend on the state of the others is made before the lock: the hashes of the pages of the record)
         lane->pre_ch = malloc((size_t)lane->ws_n * sizeof(uint64_t)); lane->pre_use = NULL;
         if (lane->pre_ch) { for (int i = 0; i < lane->ws_n; i++) lane->pre_ch[i] = mw_seglog_content_hash(imgs[i], (size_t)w->pgsz); lane->pre_use = lane->pre_ch; }

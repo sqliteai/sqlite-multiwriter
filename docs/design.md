@@ -426,3 +426,29 @@ references before the relocation mutex was reached. Phase 1 of the relocation (`
 when it still fits (same write set, size and snapshot); under the lock only the references are rewritten if the end moved meanwhile, page 1 is merged, and the pages that the relocation changed get their hashes. Without a prepared phase 1 (threads mode, or a
 second attempt) the code is the same as before. Result: the lock is held 42.3 -> 38.9 us per commit and waited for 184 -> 145 us; throughput +3% at 8 processes (17.4k -> 17.9k in the run with the timing, 17.3k against 17.4k in three alternating runs: within the noise), 16 processes
 15.1k -> 16.3k, 32 processes 15.0k -> 15.1k; threads (16, tracked) 34.5k -> 34.4k. Small, and the lock is still held 39 us: the rest is the copy into the segment (12 us), `mm_install` (7.5 us), page 1 and the merges. Tests: suite, test-mp, test-stress, ASan and Linux on the multi-process and relocation tests.
+
+`test/mw_relocprep.c` (6 connections in the processes mode inserting rows with overflow chains, an index and a hot row; `mw_prep_delay_us` makes the end of the file move between the preparation and the lock; counters `reloc_prep_used/dropped/rewrote` in the statistics):
+data, index and integrity_check agree in all three runs, with 89-118 prepared phases used and 36-117 of them rewritten for a new end of the file; with the rewrite switched off (a mutation of the code) the test fails with 21-26 failures (corrupted database). A prepared phase that is thrown away
+(the plain publication succeeded after all) happens too (3-16 times per run). A prepared phase that does not fit the write set cannot arise from `lane_publish` (the arguments are the same ones): only the defensive check covers it, no test.
+
+## Full comparison after the changes of the day (2026-10-05, SQLite 3.53.4, bulk 100 rows, 10 s, synchronous=FULL; `bench/results/final_*_2026-10-05.jsonl`)
+
+| threads | Multi-Writer tx/s | retries | failed | SQLite tx/s | retries | failed |
+|---|---|---|---|---|---|---|
+| 1 | 10879 | 18 | 0 | 14405 | 0 | 0 |
+| 2 | 15555 | 75 | 0 | 10071 | 114598 | 0 |
+| 4 | 22449 | 305 | 0 | 9428 | 127204 | 0 |
+| 8 | 31040 | 507 | 0 | 9052 | 142306 | 0 |
+| 16 | 34719 | 1298 | 0 | 8998 | 176504 | 0 |
+| 32 | 37351 | 1686 | 0 | 8778 | 238591 | 0 |
+| 64 | 34228 | 4440 | 0 | 8467 | 355414 | 0 |
+
+| processes | Multi-Writer tx/s | retries | failed | SQLite tx/s | retries | failed |
+|---|---|---|---|---|---|---|
+| 1 | 11133 | 15 | 0 | 14321 | 0 | 0 |
+| 2 | 14899 | 263 | 0 | 10009 | 119658 | 0 |
+| 4 | 19738 | 716 | 0 | 9506 | 127436 | 0 |
+| 8 | 18520 | 2242 | 0 | 8997 | 143201 | 0 |
+| 16 | 16070 | 8550 | 0 | 8722 | 166282 | 0 |
+| 32 | 15489 | 10679 | 0 | 8437 | 211192 | 0 |
+| 64 | 13921 | 11956 | 0 | 8222 | 295934 | 0 |

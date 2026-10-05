@@ -286,6 +286,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         lane->noreloc = sqlite3_uri_boolean(name, "mw_noreloc", 0) != 0;
         lane->noroute = sqlite3_uri_boolean(name, "mw_noroute", 0) != 0;
         lane->nomerge = sqlite3_uri_boolean(name, "mw_nomerge", 0) != 0;
+        lane->prep_delay_us = (int)sqlite3_uri_int64(name, "mw_prep_delay_us", 0);
         if (sqlite3_uri_parameter(name, "mw_hot_credit")) lane->hot_credit = (int)sqlite3_uri_int64(name, "mw_hot_credit", 16);
         lane->readcheck = sqlite3_uri_boolean(name, "mw_readcheck", 1) != 0;
         f->lane = lane;

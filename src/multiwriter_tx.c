@@ -251,6 +251,7 @@ void mw_lane_fill_stats (mw_lane *lane, mw_db_stats *st) {
     st->ddl_barriers = atomic_load(&db->n_ddl_barriers);
     st->rebases = atomic_load(&db->n_rebases);
     st->relocations = atomic_load(&db->n_relocations);
+    st->reloc_prep_used = atomic_load(&db->n_prep_used); st->reloc_prep_dropped = atomic_load(&db->n_prep_dropped); st->reloc_prep_rewrote = atomic_load(&db->n_prep_rewrote);
     st->reads_saved = atomic_load(&db->n_reads_saved);
     st->merges = atomic_load(&db->n_merges);
     st->rebase_retries = atomic_load(&db->n_rebase_retries);

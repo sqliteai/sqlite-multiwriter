@@ -9,7 +9,7 @@ is changed, no SQL syntax is added, triggers and hooks are not used (they do not
 application can replace the update hook of its connection).
 
 sqlite-sync (`deps/sqlite-sync`, an optional submodule: only for `make oracle-test`) is the reference for the algorithms and the wire format and the oracle of the differential tests. Its SQL-level API
-(`database.h`, the metadata tables built by triggers, the `cloudsync_*` functions) is not used; nothing of it is linked into the library: SQLite and LZ4 are vendored in `third_party/` (SQLite 3.45.3, LZ4 1.9.x, copied unchanged from the submodule), and the wire format is kept compatible, as the oracle tests check.
+(`database.h`, the metadata tables built by triggers, the `cloudsync_*` functions) is not used; nothing of it is linked into the library: SQLite and LZ4 are vendored in `third_party/` (SQLite 3.53.4, LZ4 1.9.x, copied unchanged from the submodule), and the wire format is kept compatible, as the oracle tests check.
 
 Open a database through the VFS with `file:db?mw=2&mw_cdc=1` (threads, one process) or `file:db?mw=2&mw_mp=1&mw_cdc=1` (processes; `mw_mp=1` is the shared mode). Without
 `mw_cdc=1` it is the plain multi-writer engine.

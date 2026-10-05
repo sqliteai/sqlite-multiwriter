@@ -5,7 +5,7 @@ commit, nothing in SQLite is modified, no SQL syntax is added, and every write i
 
 The CRDT metadata of [sqlite-sync](https://github.com/sqliteai/sqlite-sync) (a causal length per row, a version per cell) is captured **in the VFS, for every table**,
 and travels inside the commit record of the transaction that made it: no triggers, no update hook, no metadata tables written by SQL, no change to the application's
-tables. The database is always ready to be synchronised: `mw_sync_export` / `mw_sync_apply` speak sqlite-sync's wire format. The project builds and tests on its own: SQLite 3.45.3 and LZ4 1.9 are vendored in `third_party/`. sqlite-sync is an optional submodule
+tables. The database is always ready to be synchronised: `mw_sync_export` / `mw_sync_apply` speak sqlite-sync's wire format. The project builds and tests on its own: SQLite 3.53.4 and LZ4 1.9 are vendored in `third_party/`. sqlite-sync is an optional submodule
 (`deps/sqlite-sync`): its CRDT algorithms and payload container are the reference and the oracle of the differential tests (`make oracle-test`); its SQL-level API is not used.
 
     #include "multiwriter.h"        /* the VFS registers itself when SQLite initialises (SQLITE_EXTRA_INIT) */

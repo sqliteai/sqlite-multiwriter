@@ -132,6 +132,10 @@ static void child_main (int slot, int generation) {
     if (sqlite3_step(q) != SQLITE_ROW) _exit(2);
     c.seq = (uint64_t)sqlite3_column_int64(q, 0); sqlite3_finalize(q);
     put_rec(fd, REC_RESOLVE, slot, c.seq, 0, NULL, 0);
+    if (rnd(&c.rng) % 3 != 0) {                                                                      // most incarnations also die on their own at a point of the publication (inside the lock, mid-record, just after it): the repair of a dead publisher
+        static const mw_fault_t pts[] = { MW_CRASH_MID_LOG, MW_CRASH_BEFORE_LOG, MW_CRASH_SHARED_APPENDED, MW_CRASH_SHARED_INSTALLED, MW_CRASH_AFTER_LOG, MW_CRASH_AFTER_VISIBLE };
+        mw_fault_arm(pts[rnd(&c.rng) % (sizeof pts / sizeof *pts)], 20 + (int)(rnd(&c.rng) % 800));
+    }
     for (;;) {
         int got;
         if (rnd(&c.rng) % 6 == 0) { ro_t ro; run_ro(&c, &ro, &got); } else { rw_t tx; run_rw(&c, &tx, &got); }
@@ -252,13 +256,20 @@ static void run_procs (const char *name, int keys, int nprocs, double secs, int 
     g_path = path; g_keys = keys; g_secs = secs;
     pid_t pid[32]; int gen[32]; struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int i = 0; i < nprocs; i++) { gen[i] = 0; pid[i] = fork(); if (pid[i] == 0) child_main(i, 0); }
-    unsigned rng = 555u; int kills = 0;
+    unsigned rng = 555u; int kills = 0, crashes = 0; double next_kill = (double)kill_ms / 1000.0;
     for (;;) {
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
-        if ((double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9 > secs) break;
-        usleep((useconds_t)(kill_ms * 500 + rnd(&rng) % (uint64_t)(kill_ms * 1000)));
-        int v = (int)(rnd(&rng) % (uint64_t)nprocs); kill(pid[v], SIGKILL); int st; waitpid(pid[v], &st, 0); kills++;
-        gen[v]++; pid[v] = fork(); if (pid[v] == 0) child_main(v, gen[v]);
+        double el = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        if (el > secs) break;
+        usleep(5000);
+        for (int i = 0; i < nprocs; i++) {                                                           // a process that died by itself (a crash point): replaced
+            int st; if (waitpid(pid[i], &st, WNOHANG) == pid[i]) { crashes++; gen[i]++; pid[i] = fork(); if (pid[i] == 0) child_main(i, gen[i]); }
+        }
+        if (el > next_kill) {                                                                        // and now and then one is killed from outside, at whatever moment it is in
+            int v = (int)(rnd(&rng) % (uint64_t)nprocs); kill(pid[v], SIGKILL); int st; waitpid(pid[v], &st, 0); kills++;
+            gen[v]++; pid[v] = fork(); if (pid[v] == 0) child_main(v, gen[v]);
+            next_kill = el + (double)(kill_ms / 2 + (int)(rnd(&rng) % (uint64_t)kill_ms)) / 1000.0;
+        }
     }
     for (int i = 0; i < nprocs; i++) { kill(pid[i], SIGKILL); int st; waitpid(pid[i], &st, 0); }
     // what the database has of each process's transactions
@@ -287,11 +298,11 @@ static void run_procs (const char *name, int keys, int nprocs, double secs, int 
     long rows, model_rows, bad_final, dup; int integ; final_check(path, &M, &rows, &model_rows, &bad_final, &dup, &integ);
     // the sequence numbers: what the database says each process committed last is what the records say
     long bad_seq = 0; for (int slot = 0; slot < nprocs; slot++) { uint64_t mx = 0; for (size_t i = 0; i < S.nknown; i++) if (S.known[i]->slot == slot && S.known[i]->seq > mx) mx = S.known[i]->seq; for (size_t i = 0; i < S.ndoubt; i++) if (S.doubt[i]->slot == slot && S.doubt[i]->seq > mx) mx = S.doubt[i]->seq; if (mx != final_seq[slot]) REPORT(bad_seq, "process %d: the database's last sequence number is %llu, the records' %llu", slot, (unsigned long long)final_seq[slot], (unsigned long long)mx); }
-    printf("%s: %d keys, %d processes, %d kills: %ld transactions acknowledged, %ld read-only; %ld in doubt after a kill, %ld of them committed; table %ld rows (model %ld)\n", name, keys, nprocs, kills, committed, (long)S.nro, in_doubt, in_doubt_committed, rows, model_rows);
+    printf("%s: %d keys, %d processes, %d kills and %d crashes at a publication point: %ld transactions acknowledged, %ld read-only; %ld in doubt after a kill, %ld of them committed; table %ld rows (model %ld)\n", name, keys, nprocs, kills, crashes, committed, (long)S.nro, in_doubt, in_doubt_committed, rows, model_rows);
     printf("   reads that differ from the serial order %ld, UNIQUE broken %ld, read-only inconsistent %ld, duplicate epochs %ld, epochs with nobody to account for them %ld, in doubt that fit no epoch %ld, final differs %ld, duplicate u %ld, sequence numbers %ld, integrity %s\n",
            V.bad_read, V.bad_unique, V.bad_ro, V.bad_dup_epoch, V.bad_gap, V.bad_tail, bad_final, dup, bad_seq, integ ? "ok" : "BAD");
     CHECK(V.bad_read == 0); CHECK(V.bad_unique == 0); CHECK(V.bad_ro == 0); CHECK(V.bad_dup_epoch == 0); CHECK(V.bad_gap == 0); CHECK(V.bad_tail == 0); CHECK(bad_final == 0); CHECK(dup == 0); CHECK(bad_seq == 0); CHECK(integ); CHECK(rows == model_rows);
-    CHECK(committed >= 500); CHECK(kills >= 5);
+    CHECK(committed >= 500); CHECK(kills + crashes >= 10);
     free(S.known); free(S.doubt); free(S.ro); free(M.m); free(M.owner);
     mw_rmdb(path);
 }

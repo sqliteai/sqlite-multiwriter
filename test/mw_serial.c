@@ -27,9 +27,9 @@ typedef struct { uint64_t snap, commit; uint64_t seq; int n; op_t op[MAXOPS]; in
 typedef struct { uint64_t snap; int n; int key[ROKEYS], ex[ROKEYS], v[ROKEYS], u[ROKEYS], pl[ROKEYS], w[ROKEYS]; } ro_t;
 typedef struct { rw_t *rw; size_t nrw, caprw; ro_t *ro; size_t nro, capro; long busy, constraint, other; } rec_t;
 
-static const char *g_path; static int g_keys; static double g_secs; static int g_procs_mode;
+static const char *g_path; static int g_keys; static double g_secs; static int g_procs_mode, g_threadmode;      // g_threadmode: the "processes" of the power-loss run are threads of one process (the engine's single-process mode)
 static int open_db (const char *path, sqlite3 **db) {
-    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=16%s", path, (g_procs_mode || getenv("MW_TEST_MP")) ? "&mw_mp=1" : "");
+    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=16%s", path, ((g_procs_mode && !g_threadmode) || getenv("MW_TEST_MP")) ? "&mw_mp=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;
@@ -120,10 +120,11 @@ static void *worker (void *arg) {
     sqlite3_finalize(c.sel); sqlite3_close(db); return NULL;
 }
 
+static void rec_name (char *fn, size_t n, const char *path, int slot);
 // a process: runs until it is killed. It first says which of its sequence numbers the database has (RESOLVE: the transaction that the previous incarnation left in doubt has committed if its number is not above it).
-static void child_main (int slot, int generation) {
+static void slot_loop (int slot, int generation, int arm_crash) {
     sqlite3 *db; if (open_db(g_path, &db) != SQLITE_OK) _exit(2);
-    char fn[300]; snprintf(fn, sizeof fn, "%s.rec%d", g_path, slot);
+    char fn[300]; rec_name(fn, sizeof fn, g_path, slot);
     int fd = open(fn, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd < 0) _exit(2);
     rec_t R; memset(&R, 0, sizeof R);
     ctx_t c = { .db = db, .rng = 31337u + 7919u * (unsigned)slot + 104729u * (unsigned)generation, .slot = slot, .fd = fd, .R = &R };
@@ -132,7 +133,7 @@ static void child_main (int slot, int generation) {
     if (sqlite3_step(q) != SQLITE_ROW) _exit(2);
     c.seq = (uint64_t)sqlite3_column_int64(q, 0); sqlite3_finalize(q);
     put_rec(fd, REC_RESOLVE, slot, c.seq, 0, NULL, 0);
-    if (rnd(&c.rng) % 3 != 0) {                                                                      // most incarnations also die on their own at a point of the publication (inside the lock, mid-record, just after it): the repair of a dead publisher
+    if (arm_crash && rnd(&c.rng) % 3 != 0) {                                                         // most incarnations also die on their own at a point of the publication (inside the lock, mid-record, just after it): the repair of a dead publisher
         static const mw_fault_t pts[] = { MW_CRASH_MID_LOG, MW_CRASH_BEFORE_LOG, MW_CRASH_SHARED_APPENDED, MW_CRASH_SHARED_INSTALLED, MW_CRASH_AFTER_LOG, MW_CRASH_AFTER_VISIBLE, MW_CRASH_SHARED_GC, MW_CRASH_SHARED_GC };       // (twice: the collection runs every 16 commits, and a dead holder in it is a case of its own)
         mw_fault_arm(pts[rnd(&c.rng) % (sizeof pts / sizeof *pts)], 20 + (int)(rnd(&c.rng) % 800));
     }
@@ -141,6 +142,8 @@ static void child_main (int slot, int generation) {
         if (rnd(&c.rng) % 6 == 0) { ro_t ro; run_ro(&c, &ro, &got); } else { rw_t tx; run_rw(&c, &tx, &got); }
     }
 }
+static void child_main (int slot, int generation) { slot_loop(slot, generation, 1); }
+static void *slot_thread (void *arg) { slot_loop((int)(intptr_t)arg, 0, 0); return NULL; }
 
 typedef struct { int ex, v, u, pl, w; } mrow;
 static int same (int ex, int v, int u, int pl, int w, const mrow *m) { return ex == m->ex && (!ex || (v == m->v && u == m->u && pl == m->pl && w == m->w)); }
@@ -251,10 +254,14 @@ static void run_threads (const char *name, int keys, int threads, double secs) {
 }
 
 // ---- real processes killed with SIGKILL ----
-static void run_procs (const char *name, int keys, int nprocs, double secs, int kill_ms, const char *idx_entries) {
+static const char *g_recdir;                                                                              // where the record files are (default: next to the database; for the power-loss test: a directory that the loss does not touch)
+static void rec_name (char *fn, size_t n, const char *path, int slot) { if (g_recdir) snprintf(fn, n, "%s/rec%d", g_recdir, slot); else snprintf(fn, n, "%s.rec%d", path, slot); }
+
+// Starts the processes, kills some of them at random moments while others die at crash points, for `secs`. cut_cmd: the end is a loss of power instead of a normal one: all processes are stopped (nothing is acknowledged
+// after that), the command runs (it cuts the power of the disk), then they are killed.
+static void procs_run (const char *path, int keys, int nprocs, double secs, int kill_ms, const char *idx_entries, const char *cut_cmd, int *kills_out, int *crashes_out) {
     if (idx_entries) setenv("MW_IDX_ENTRIES", idx_entries, 1); else unsetenv("MW_IDX_ENTRIES");
-    char path[256]; mw_tmpdb(path, sizeof path, "serialp"); g_procs_mode = 1; make_db(path, nprocs);
-    g_path = path; g_keys = keys; g_secs = secs;
+    g_procs_mode = 1; g_path = path; g_keys = keys; g_secs = secs;
     pid_t pid[32]; int gen[32]; struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int i = 0; i < nprocs; i++) { gen[i] = 0; pid[i] = fork(); if (pid[i] == 0) child_main(i, 0); }
     unsigned rng = 555u; int kills = 0, crashes = 0; double next_kill = (double)kill_ms / 1000.0;
@@ -272,16 +279,27 @@ static void run_procs (const char *name, int keys, int nprocs, double secs, int 
             next_kill = el + (double)(kill_ms / 2 + (int)(rnd(&rng) % (uint64_t)kill_ms)) / 1000.0;
         }
     }
+    if (cut_cmd) {
+        for (int i = 0; i < nprocs; i++) kill(pid[i], SIGSTOP);
+        for (int i = 0; i < nprocs; i++) { int st; waitpid(pid[i], &st, WUNTRACED); }                  // (stopped: whatever they were doing, nothing more is acknowledged)
+        printf("power cut: %s\n", cut_cmd); fflush(stdout);
+        int rc = system(cut_cmd); CHECK(rc == 0);
+    }
     for (int i = 0; i < nprocs; i++) { kill(pid[i], SIGKILL); int st; waitpid(pid[i], &st, 0); }
+    *kills_out = kills; *crashes_out = crashes;
+}
+
+static void procs_verify (const char *name, const char *path, int keys, int nprocs, int kills, int crashes, int min_events) {
+    g_procs_mode = 1; g_path = path; g_keys = keys;
     // what the database has of each process's transactions
-    sqlite3 *chk; CHECK_RC(open_db(path, &chk), SQLITE_OK);
+    sqlite3 *chk; CHECK_RC(open_db(path, &chk), SQLITE_OK);                                              // (after a loss of power this open is the recovery)
     uint64_t final_seq[32] = {0}; for (int i = 0; i < nprocs; i++) { char q[100]; snprintf(q, sizeof q, "SELECT seq FROM txlog WHERE slot = %d", i); sqlite3_stmt *st; sqlite3_prepare_v2(chk, q, -1, &st, NULL); if (sqlite3_step(st) == SQLITE_ROW) final_seq[i] = (uint64_t)sqlite3_column_int64(st, 0); sqlite3_finalize(st); }
     sqlite3_close(chk);
     // the record files
     txset S = {0}; size_t cap_k = 1 << 16, cap_d = 1 << 12, cap_r = 1 << 16; S.known = malloc(cap_k * sizeof *S.known); S.doubt = malloc(cap_d * sizeof *S.doubt); S.ro = malloc(cap_r * sizeof *S.ro);
     long committed = 0, in_doubt = 0, in_doubt_committed = 0, full_errors = 0;
     for (int slot = 0; slot < nprocs; slot++) {
-        char fn[300]; snprintf(fn, sizeof fn, "%s.rec%d", path, slot); FILE *f = fopen(fn, "rb"); if (!f) continue;
+        char fn[300]; rec_name(fn, sizeof fn, path, slot); FILE *f = fopen(fn, "rb"); if (!f) continue;
         rw_t *pending = NULL; rhdr h;
         while (fread(&h, sizeof h, 1, f) == 1) {
             if (h.type == REC_INTENT) { rw_t *t = malloc(sizeof *t); if (fread(t, sizeof *t, 1, f) != 1) { free(t); break; } if (pending) free(pending); pending = t; }
@@ -298,19 +316,54 @@ static void run_procs (const char *name, int keys, int nprocs, double secs, int 
     }
     model M = new_model(keys); viol V; memset(&V, 0, sizeof V); replay(&S, &M, &V);
     long rows, model_rows, bad_final, dup; int integ; final_check(path, &M, &rows, &model_rows, &bad_final, &dup, &integ);
-    // the sequence numbers: what the database says each process committed last is what the records say
+    // the sequence numbers: what the database says each process committed last is what the records say (an acknowledged transaction that the database does not have shows here)
     long bad_seq = 0; for (int slot = 0; slot < nprocs; slot++) { uint64_t mx = 0; for (size_t i = 0; i < S.nknown; i++) if (S.known[i]->slot == slot && S.known[i]->seq > mx) mx = S.known[i]->seq; for (size_t i = 0; i < S.ndoubt; i++) if (S.doubt[i]->slot == slot && S.doubt[i]->seq > mx) mx = S.doubt[i]->seq; if (mx != final_seq[slot]) REPORT(bad_seq, "process %d: the database's last sequence number is %llu, the records' %llu", slot, (unsigned long long)final_seq[slot], (unsigned long long)mx); }
     printf("%s: %d keys, %d processes, %d kills and %d crashes at a publication point: %ld transactions acknowledged, %ld read-only; %ld in doubt after a kill, %ld of them committed; table %ld rows (model %ld); commits refused with SQLITE_FULL (the index of versions had no room): %ld\n", name, keys, nprocs, kills, crashes, committed, (long)S.nro, in_doubt, in_doubt_committed, rows, model_rows, full_errors);
     printf("   reads that differ from the serial order %ld, UNIQUE broken %ld, read-only inconsistent %ld, duplicate epochs %ld, epochs with nobody to account for them %ld, in doubt that fit no epoch %ld, final differs %ld, duplicate u %ld, sequence numbers %ld, integrity %s\n",
            V.bad_read, V.bad_unique, V.bad_ro, V.bad_dup_epoch, V.bad_gap, V.bad_tail, bad_final, dup, bad_seq, integ ? "ok" : "BAD");
     CHECK(V.bad_read == 0); CHECK(V.bad_unique == 0); CHECK(V.bad_ro == 0); CHECK(V.bad_dup_epoch == 0); CHECK(V.bad_gap == 0); CHECK(V.bad_tail == 0); CHECK(bad_final == 0); CHECK(dup == 0); CHECK(bad_seq == 0); CHECK(integ); CHECK(rows == model_rows);
-    CHECK(committed >= 500); CHECK(kills + crashes >= 10); CHECK(full_errors == 0);                       // (the index of versions is collected: a holder that died in a collection must not leave pages that nobody collects)
+    CHECK(committed >= 500); CHECK(kills + crashes >= min_events); CHECK(full_errors == 0);                       // (the index of versions is collected: a holder that died in a collection must not leave pages that nobody collects)
     free(S.known); free(S.doubt); free(S.ro); free(M.m); free(M.owner);
+}
+
+static void run_procs (const char *name, int keys, int nprocs, double secs, int kill_ms, const char *idx_entries) {
+    char path[256]; mw_tmpdb(path, sizeof path, "serialp"); g_procs_mode = 1; make_db(path, nprocs);
+    int kills, crashes; procs_run(path, keys, nprocs, secs, kill_ms, idx_entries, NULL, &kills, &crashes);
+    procs_verify(name, path, keys, nprocs, kills, crashes, 10);
     mw_rmdb(path);
+}
+
+// Power-loss test (test/power/run.sh): the database is on a disk with a volatile write cache that is cut at the end of the run phase; the verify phase runs on what the disk kept.
+//   MW_SERIAL_MODE=threads: one process with a thread for each slot instead of the processes mode.   MW_SERIAL_PHASE=run|verify  MW_SERIAL_DB=<path>  MW_SERIAL_REC=<dir that the loss does not touch>  [MW_SERIAL_KEYS=300 MW_SERIAL_PROCS=6 MW_SERIAL_SECS=6]  MW_SERIAL_CUT_CMD=<command>
+static int power_phase (const char *phase) {
+    g_threadmode = getenv("MW_SERIAL_MODE") && !strcmp(getenv("MW_SERIAL_MODE"), "threads");
+    const char *path = getenv("MW_SERIAL_DB"); g_recdir = getenv("MW_SERIAL_REC");
+    if (!path || !g_recdir) { printf("MW_SERIAL_DB and MW_SERIAL_REC are needed\n"); return 2; }
+    int keys = getenv("MW_SERIAL_KEYS") ? atoi(getenv("MW_SERIAL_KEYS")) : 300, nprocs = getenv("MW_SERIAL_PROCS") ? atoi(getenv("MW_SERIAL_PROCS")) : 6; double secs = getenv("MW_SERIAL_SECS") ? atof(getenv("MW_SERIAL_SECS")) : 6.0;
+    if (!strcmp(phase, "run")) {
+        g_procs_mode = 1; make_db(path, nprocs); sync();                                                   // (the database exists on the disk before the run)
+        int kills = 0, crashes = 0;
+        if (g_threadmode) {                                                                                 // one process, a thread for each slot (the engine's single-process mode: the staged log of the process)
+            g_path = path; g_keys = keys; g_secs = secs;
+            pid_t pid = fork();
+            if (pid == 0) { pthread_t th[32]; for (int i = 0; i < nprocs; i++) pthread_create(&th[i], NULL, slot_thread, (void *)(intptr_t)i); for (;;) pause(); }
+            usleep((useconds_t)(secs * 1e6));
+            kill(pid, SIGSTOP); int st; waitpid(pid, &st, WUNTRACED);
+            const char *cut = getenv("MW_SERIAL_CUT_CMD"); if (cut) { printf("power cut: %s\n", cut); fflush(stdout); CHECK(system(cut) == 0); }
+            kill(pid, SIGKILL); waitpid(pid, &st, 0);
+        } else procs_run(path, keys, nprocs, secs, 250, NULL, getenv("MW_SERIAL_CUT_CMD"), &kills, &crashes);
+        printf("run phase: %d kills, %d crashes at a publication point, then the power cut\n", kills, crashes);
+        char fn[400]; snprintf(fn, sizeof fn, "%s/events", g_recdir); FILE *f = fopen(fn, "w"); if (f) { fprintf(f, "%d %d\n", kills, crashes); fclose(f); }
+    } else {
+        int kills = 0, crashes = 0; char fn[400]; snprintf(fn, sizeof fn, "%s/events", g_recdir); FILE *f = fopen(fn, "r"); if (f) { if (fscanf(f, "%d %d", &kills, &crashes) != 2) kills = crashes = 0; fclose(f); }
+        procs_verify("after the loss of power", path, keys, nprocs, kills, crashes, 0);
+    }
+    MW_DONE();
 }
 
 int main (void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    if (getenv("MW_SERIAL_PHASE")) return power_phase(getenv("MW_SERIAL_PHASE"));
     run_threads("hot (few keys, many conflicts)", 12, 8, 3.0);
     run_threads("medium", 200, 8, 3.0);
     run_threads("wide (many pages, pages freed and reused)", 3000, 8, 4.0);

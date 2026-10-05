@@ -158,6 +158,11 @@ static void map_release (segmap *m) { atomic_fetch_sub(&m->users, 1); }
 
 // Creates "<prefix><seg>" (or "...new" for a segment being prepared) with its header, zero-filled to `size`: written blocks, not a sparse file (appending into a hole while
 // another process fsyncs the file stalls: see the log of the other multi-process mode).
+// A segment that was created or renamed is in its directory only once the directory is flushed (ext4 and xfs also flush it with the fsync of the new file; the standard does not promise it).
+static void sync_dir_of (const char *path) {
+    char dir[700]; snprintf(dir, sizeof dir, "%s", path); char *sl = strrchr(dir, '/'); if (sl) { if (sl == dir) sl[1] = 0; else *sl = 0; } else snprintf(dir, sizeof dir, ".");
+    int fd = open(dir, O_RDONLY); if (fd >= 0) { (void)mw_sys_fsync(fd); close(fd); }
+}
 static int seg_create (mw_seglog *sl, uint32_t seg, uint64_t size, uint64_t base, bool tmp, bool fill) {
     char path[620]; seg_path(sl, seg, path, sizeof path);
     if (tmp) strncat(path, ".new", sizeof path - strlen(path) - 1);
@@ -175,6 +180,7 @@ static int seg_create (mw_seglog *sl, uint32_t seg, uint64_t size, uint64_t base
     } else if (rc == SQLITE_OK && mw_io_ftruncate(fd, (off_t)size) != 0) rc = mw_io_rc(errno, SQLITE_IOERR);
     close(fd);
     if (rc != SQLITE_OK) unlink(path);                         // (a segment that could not be made whole is not left behind)
+    else if (!tmp) sync_dir_of(path);
     return rc;
 }
 
@@ -546,7 +552,7 @@ void mw_seglog_prefill_bg (mw_db *db) {
                 atomic_store(&sh->log_ready, done);
                 if (done >= sl->seg_bytes) {
                     char fin[640]; seg_path(sl, next, fin, sizeof fin);
-                    if (mw_io_rename(tmp, fin) == 0) atomic_store(&sh->seg_next_ready, next);
+                    if (mw_io_rename(tmp, fin) == 0) { sync_dir_of(fin); atomic_store(&sh->seg_next_ready, next); }
                 }
             }
         }

@@ -418,3 +418,11 @@ renumbers keeps it), folded in order with the page numbers, then the extension, 
 the merged ones: they are made in the lock), and the readers (replay, peek, the recovery of a dead publisher) compute the same value from the bytes of the record. The copy of the pages stays in the lock (the offset is only known there). 8 processes, tracked, alternating runs:
 16.1-17.1k tx/s before, 18.0-18.2k after (+9%); 4 processes 16.4k -> 17.2k, 16 processes 14.8k -> 15.7k, 32 processes 14.6k -> 15.1k. Tests: suite, test-mp, test-stress, ASan and Linux on the multi-process tests (including SIGKILL at every step of the publication).
 Next in the lock: the private copies of the pages that the relocation makes (it runs inside the same hold in this mode) and the 12.5 us of the copy into the segment.
+
+## The private copies of the relocation outside the publication lock (measured 2026-10-05)
+
+In the processes mode the first publication of a commit that grows the file fails (another commit extended it) and the relocation then runs inside the same hold of the publication lock: 9 us of it went to the copies of the pages and the renumbering of the
+references before the relocation mutex was reached. Phase 1 of the relocation (`reloc_phase1`: checks, conflict scan, private copies, references patched for the end of the file as it was) is now made before the lock (`mw_lane_reloc_prepare`), and `mw_lane_relocate` takes it
+when it still fits (same write set, size and snapshot); under the lock only the references are rewritten if the end moved meanwhile, page 1 is merged, and the pages that the relocation changed get their hashes. Without a prepared phase 1 (threads mode, or a
+second attempt) the code is the same as before. Result: the lock is held 42.3 -> 38.9 us per commit and waited for 184 -> 145 us; throughput +3% at 8 processes (17.4k -> 17.9k in the run with the timing, 17.3k against 17.4k in three alternating runs: within the noise), 16 processes
+15.1k -> 16.3k, 32 processes 15.0k -> 15.1k; threads (16, tracked) 34.5k -> 34.4k. Small, and the lock is still held 39 us: the rest is the copy into the segment (12 us), `mm_install` (7.5 us), page 1 and the merges. Tests: suite, test-mp, test-stress, ASan and Linux on the multi-process and relocation tests.

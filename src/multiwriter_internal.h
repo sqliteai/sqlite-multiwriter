@@ -280,6 +280,7 @@ struct mw_lane {
     int         own_n, own_cap;
     uint64_t    own_epoch;           // epoch of its latest commit
     uint64_t   *own_ep;              // (parallel to own_pg) the epoch of the latest commit of this snapshot that wrote each page: a page is validated against the commit that wrote it, not against the latest commit of the lane
+    void       *rprep;               // multi-process: phase 1 of the relocation, made before the publication lock (reloc.c)
     uint64_t   *pre_ch;              // multi-process: the hashes of the pages of the commit, made before the publication lock (parallel to the write set; freed at the end of the commit)
     const uint64_t *pre_use;         // the ones the next shared publication uses (set for one publication: the relocation clears the entries of the pages it changes)
     bool        poisoned;            // a commit of this snapshot was relocated (its pages went to other numbers): the lane's private WAL still has the old ones, so the snapshot takes no more commits
@@ -499,6 +500,8 @@ bool      mw_interior_merge (const uint8_t *base, const uint8_t *ours, const uin
 bool      mw_interior_routes_same (const uint8_t *old, const uint8_t *nw, int pgsz, int reserved, const uint32_t *used, int nused);
 uint64_t  mw_store_head_epoch (mw_store *st, uint32_t pgno);                                   // newest committed version's epoch (0: none)
 bool      mw_store_head_image (mw_store *st, uint32_t pgno, uint8_t *dst, uint64_t *epoch);   // newest committed image of a page, and its epoch, atomically
+void      mw_lane_reloc_prepare (mw_lane *lane, const uint32_t *pgnos, const uint8_t *const *imgs, int n, uint32_t ws_dbsize, uint32_t snap_dbsize);   // before the lock: the private copies of a relocation
+void      mw_lane_reloc_discard (mw_lane *lane);
 int       mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgnos, const uint8_t *const *imgs, int n, uint32_t ws_dbsize, uint32_t snap_dbsize, int sync, uint64_t *out_epoch);
 int       mw_db_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uint32_t *pgnos, const uint8_t *const *images, int n, uint32_t ws_dbsize, uint32_t snap_dbsize, int sync, uint64_t *out_epoch);
 int       mw_store_install_recovered (mw_store *st, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images);

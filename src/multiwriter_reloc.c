@@ -149,21 +149,34 @@ static void patch_btree_page (rctx *c, uint8_t *pg) {
 
 #define RELOC_UNLOCK do { if (lane->holds_reloc) { lane->holds_reloc = false; MW_T1(MW_ST_RELOCHOLD, lane->reloc_t0); pthread_mutex_unlock(&db->reloc_mu); } } while (0)
 
-// Publishes the transaction again with its new pages moved above the current end of the file. Returns SQLITE_OK if it committed,
-// MW_RELOC_NA if the conflict is not a growth-only one (or a check failed), MW_CONFLICT if the attempts were beaten by other extensions,
-// or another code for a real error.
-int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgnos, const uint8_t *const *imgs, int n,
-                      uint32_t ws_dbsize, uint32_t snap_dbsize, int sync, uint64_t *out_epoch) {
-    mw_db *db = lane->db;
-    mw_store *st = db->store;
+// What a relocation prepares before it takes the mutex (and, in the processes mode, before the publication lock): the private copies of the pages with the references to the new pages
+// renumbered for the end of the file as it is now.
+typedef struct {
+    uint32_t cur0, delta0; uint64_t e_merge;
+    int ncf; int *cf;                              // the interior pages that somebody else also wrote (merged three-way under the mutex)
+    uint8_t **nim; uint32_t *npg;                  // the private copies and their final page numbers (filled under the mutex)
+    rctx c; int *slot_of_new; uint8_t *mbuf; int made;
+    int n; uint32_t snap_dbsize, ws_dbsize, growth; int i1, reserved; uint8_t snap1[100];
+} rprep;
+static void rprep_free (rprep *P) {
+    for (int i = 0; i < P->made; i++) free(P->nim[i]);
+    free(P->nim); free(P->npg); free(P->c.kind); free(P->c.refs); free(P->c.queue); free(P->slot_of_new); free(P->c.rec); free(P->cf); free(P->mbuf);
+    memset(P, 0, sizeof *P);
+}
+
+// Phase 1: everything that does not depend on the exact end of the file. Returns SQLITE_OK (P is filled and owns what it allocated), or the final result of the relocation (MW_RELOC_NA, an error).
+static int reloc_phase1 (mw_lane *lane, const uint32_t *pgnos, const uint8_t *const *imgs, int n, uint32_t ws_dbsize, uint32_t snap_dbsize, rprep *P) {
+    mw_db *db = lane->db; (void)db;
+    mw_store *st = lane->db->store;
     int pgsz = st->pgsz;
+    memset(P, 0, sizeof *P);
     if (lane->own_n != 0 || ws_dbsize <= snap_dbsize) return NA(1);
     uint32_t growth = ws_dbsize - snap_dbsize;
     int i1 = -1, nnew = 0;
     for (int i = 0; i < n; i++) { if (pgnos[i] == 1) i1 = i; if (pgnos[i] > snap_dbsize) nnew++; }
     if (i1 < 0 || (uint32_t)nnew != growth) return NA(2);          // page 1 must be written, and the new pages must be the whole range
     // page 1 may differ from the snapshot's only in the change counter, the in-header size and version-valid-for
-    uint8_t snap1[100];
+    uint8_t *snap1 = P->snap1;
     if (!mw_store_read(st, 1, lane->tx.snapshot_epoch, 0, 100, snap1)) {           // (page 1 never written since the file was created: the real file's)
         mw_file *f = lane->file;
         if (!f || f->real->pMethods->xRead(f->real, snap1, 100, 0) != SQLITE_OK) return NA(3);
@@ -174,57 +187,98 @@ int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgno
         if (snap1[b] != our1[b]) return NA(4);
     }
     int reserved = our1[20];
-    uint32_t pending = (uint32_t)(1073741824u / (uint32_t)pgsz) + 1;
     uint8_t *latest = malloc((size_t)pgsz);
     if (!latest) return SQLITE_NOMEM;
+    int result = SQLITE_OK;
+    uint64_t e_merge = 0;
+    if (!mw_store_head_image(st, 1, latest, &e_merge)) { free(latest); return NA(5); }
+    uint32_t cur0 = rd32(latest + 28), ctr0 = rd32(latest + 24);
+    if (rd32(latest + 92) != ctr0 || cur0 < snap_dbsize || memcmp(latest + 40, snap1 + 40, 4) != 0 || memcmp(latest + 16, snap1 + 16, 6) != 0) { free(latest); return NA(6); }
+    if (cur0 == snap_dbsize) { free(latest); return NA(7); }               // nobody extended the file: the conflict is somewhere else
+    free(latest);
+    // Pages that existed in the snapshot and have a newer committed version. An interior *table* page (typically the parent of leaves both transactions split)
+    // is merged three-way under the mutex; anything else is a real conflict, which is not resolved here.
+    int ncf = 0;
+    bool real_conflict = false;
+    int *cf = malloc((size_t)n * sizeof(int));                          // (one pass, capacity for every page: heads may change between two passes)
+    if (!cf) return SQLITE_NOMEM;
+    for (int i = 0; i < n && !real_conflict; i++)
+        if (pgnos[i] != 1 && pgnos[i] <= snap_dbsize && mw_store_head_epoch(st, pgnos[i]) > lane->tx.snapshot_epoch) { if (imgs[i][0] == 0x05 && !lane->nomerge) cf[ncf++] = i; else real_conflict = true; }
+    if (real_conflict) { free(cf); return NA(9); }
+    uint32_t delta0 = cur0 - snap_dbsize;
+    P->cf = cf; P->ncf = ncf; P->cur0 = cur0; P->delta0 = delta0; P->e_merge = e_merge;
+    P->nim = malloc((size_t)n * sizeof(uint8_t *));
+    P->npg = malloc((size_t)n * sizeof(uint32_t));
+    P->c = (rctx){ .lo = snap_dbsize, .hi = ws_dbsize, .delta = delta0, .pgsz = pgsz, .usable = pgsz - reserved, .ok = true, .qcap = (int)growth };
+    rctx *c = &P->c;
+    c->kind = calloc(growth, 1); c->refs = calloc(growth, sizeof(uint32_t)); c->queue = malloc((size_t)growth * sizeof(uint32_t));
+    P->slot_of_new = malloc((size_t)growth * sizeof(int));                 // index in the write set of each new page
+    bool fail = !P->nim || !P->npg || !c->kind || !c->refs || !c->queue || !P->slot_of_new;
+    for (int i = 0; i < n && !fail; i++, P->made++) {                            // private copies, one allocation each: the store adopts them (no second copy under the mutex)
+        P->nim[i] = malloc((size_t)pgsz);
+        if (!P->nim[i]) { fail = true; break; }
+        memcpy(P->nim[i], imgs[i], (size_t)pgsz);
+        if (pgnos[i] > snap_dbsize) P->slot_of_new[pgnos[i] - snap_dbsize - 1] = i;
+    }
+    if (!fail) {
+        uint8_t **nim = P->nim;
+        for (int i = 0; i < n && c->ok; i++) if (pgnos[i] != 1 && pgnos[i] <= snap_dbsize) { c->cur_base = nim[i]; c->cur_slot = i; patch_btree_page(c, nim[i]); }
+        for (int qi = 0; qi < c->qn && c->ok; qi++) {                           // the new pages, in reference order
+            uint32_t pq = c->queue[qi];
+            int slot = P->slot_of_new[pq - snap_dbsize - 1];
+            c->cur_base = nim[slot]; c->cur_slot = slot;
+            if (c->kind[pq - snap_dbsize - 1] == K_BTREE) patch_btree_page(c, nim[slot]);
+            else patch(c, nim[slot], K_OVERFLOW);                            // overflow page: its first 4 bytes point to the next one
+        }
+        for (uint32_t k = 0; k < growth && c->ok; k++) if (c->refs[k] != 1) c->ok = false;      // each new page referenced exactly once
+    }
+    if (fail) result = SQLITE_NOMEM; else if (!c->ok) result = NA(30);
+    if (result == SQLITE_OK && ncf) { P->mbuf = malloc(3 * (size_t)pgsz); if (!P->mbuf) result = SQLITE_NOMEM; }          // (3 page buffers for the merges: theirs, base, result)
+    if (result != SQLITE_OK) { rprep_free(P); return result; }
+    P->n = n; P->snap_dbsize = snap_dbsize; P->ws_dbsize = ws_dbsize; P->growth = growth; P->i1 = i1; P->reserved = reserved;
+    return SQLITE_OK;
+}
+
+// Before the publication lock (processes mode): phase 1 of the relocation that the commit will most likely need. mw_lane_relocate takes it if it still fits.
+typedef struct { rprep p; } rprep_box;
+void mw_lane_reloc_prepare (mw_lane *lane, const uint32_t *pgnos, const uint8_t *const *imgs, int n, uint32_t ws_dbsize, uint32_t snap_dbsize) {
+    mw_lane_reloc_discard(lane);
+    if (lane->noreloc || lane->own_n != 0 || ws_dbsize <= snap_dbsize) return;
+    rprep_box *b = malloc(sizeof *b); if (!b) return;
+    if (reloc_phase1(lane, pgnos, imgs, n, ws_dbsize, snap_dbsize, &b->p) != SQLITE_OK) { free(b); return; }
+    lane->rprep = b;
+}
+void mw_lane_reloc_discard (mw_lane *lane) {
+    rprep_box *b = lane->rprep; if (!b) return;
+    lane->rprep = NULL; rprep_free(&b->p); free(b);
+}
+
+// Publishes the transaction again with its new pages moved above the current end of the file. Returns SQLITE_OK if it committed,
+// MW_RELOC_NA if the conflict is not a growth-only one (or a check failed), MW_CONFLICT if the attempts were beaten by other extensions,
+// or another code for a real error.
+int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgnos, const uint8_t *const *imgs, int n,
+                      uint32_t ws_dbsize, uint32_t snap_dbsize, int sync, uint64_t *out_epoch) {
+    mw_db *db = lane->db;
+    mw_store *st = db->store;
+    int pgsz = st->pgsz;
+    uint8_t *latest = malloc((size_t)pgsz);
+    if (!latest) { mw_lane_reloc_discard(lane); return SQLITE_NOMEM; }
     int result = MW_CONFLICT;
     for (int attempt = 0; attempt < 4; attempt++) {
-        // ---- 1. Outside the mutex: everything that does not depend on the exact end of the file. Page 1 is read (without the mutex) to learn roughly where
-        //         the file ends, real conflicts on existing pages are detected here (they would only occupy the queue), and the private copies are built and parsed.
-        uint64_t e_merge = 0;
-        if (!mw_store_head_image(st, 1, latest, &e_merge)) { result = NA(5); break; }
-        uint32_t cur0 = rd32(latest + 28), ctr0 = rd32(latest + 24);
-        if (rd32(latest + 92) != ctr0 || cur0 < snap_dbsize || memcmp(latest + 40, snap1 + 40, 4) != 0 || memcmp(latest + 16, snap1 + 16, 6) != 0) { result = NA(6); break; }
-        if (cur0 == snap_dbsize) { result = NA(7); break; }               // nobody extended the file: the conflict is somewhere else
-        // Pages that existed in the snapshot and have a newer committed version. An interior *table* page (typically the parent of leaves both transactions split)
-        // is merged three-way under the mutex; anything else is a real conflict, which is not resolved here.
-        int ncf = 0;
-        bool real_conflict = false;
-        int *cf = malloc((size_t)n * sizeof(int));                          // (one pass, capacity for every page: heads may change between two passes)
-        if (!cf) { result = SQLITE_NOMEM; break; }
-        for (int i = 0; i < n && !real_conflict; i++)
-            if (pgnos[i] != 1 && pgnos[i] <= snap_dbsize && mw_store_head_epoch(st, pgnos[i]) > lane->tx.snapshot_epoch) { if (imgs[i][0] == 0x05 && !lane->nomerge) cf[ncf++] = i; else real_conflict = true; }
-        if (real_conflict) { free(cf); result = NA(9); break; }
-        uint32_t delta0 = cur0 - snap_dbsize;
-        uint8_t **nim = malloc((size_t)n * sizeof(uint8_t *));
-        uint32_t *npg = malloc((size_t)n * sizeof(uint32_t));
-        rctx c = { .lo = snap_dbsize, .hi = ws_dbsize, .delta = delta0, .pgsz = pgsz, .usable = pgsz - reserved, .ok = true, .qcap = (int)growth };
-        c.kind = calloc(growth, 1); c.refs = calloc(growth, sizeof(uint32_t)); c.queue = malloc((size_t)growth * sizeof(uint32_t));
-        int *slot_of_new = malloc((size_t)growth * sizeof(int));                 // index in the write set of each new page
-        int made = 0;
-        bool fail = !nim || !npg || !c.kind || !c.refs || !c.queue || !slot_of_new;
-        for (int i = 0; i < n && !fail; i++, made++) {                            // private copies, one allocation each: the store adopts them (no second copy under the mutex)
-            nim[i] = malloc((size_t)pgsz);
-            if (!nim[i]) { fail = true; break; }
-            memcpy(nim[i], imgs[i], (size_t)pgsz);
-            if (pgnos[i] > snap_dbsize) slot_of_new[pgnos[i] - snap_dbsize - 1] = i;
-        }
-        if (!fail) {
-            for (int i = 0; i < n && c.ok; i++) if (pgnos[i] != 1 && pgnos[i] <= snap_dbsize) { c.cur_base = nim[i]; c.cur_slot = i; patch_btree_page(&c, nim[i]); }
-            for (int qi = 0; qi < c.qn && c.ok; qi++) {                           // the new pages, in reference order
-                uint32_t p = c.queue[qi];
-                int slot = slot_of_new[p - snap_dbsize - 1];
-                c.cur_base = nim[slot]; c.cur_slot = slot;
-                if (c.kind[p - snap_dbsize - 1] == K_BTREE) patch_btree_page(&c, nim[slot]);
-                else patch(&c, nim[slot], K_OVERFLOW);                            // overflow page: its first 4 bytes point to the next one
-            }
-            for (uint32_t k = 0; k < growth && c.ok; k++) if (c.refs[k] != 1) c.ok = false;      // each new page referenced exactly once
-        }
-        int rc = fail ? SQLITE_NOMEM : c.ok ? SQLITE_OK : NA(30);
-        uint8_t *mbuf = NULL;                                             // (3 page buffers for the merges: theirs, base, result)
-        if (rc == SQLITE_OK && ncf) { mbuf = malloc(3 * (size_t)pgsz); if (!mbuf) rc = SQLITE_NOMEM; }
+        rprep P0, *P = &P0;
+        rprep_box *pre = attempt == 0 ? lane->rprep : NULL;
+        if (pre && pre->p.n == n && pre->p.ws_dbsize == ws_dbsize && pre->p.snap_dbsize == snap_dbsize) { P0 = pre->p; free(pre); lane->rprep = NULL; }      // (prepared before the lock: the copies and the references renumbered for the end of the file as it was then)
+        else { mw_lane_reloc_discard(lane); int prc = reloc_phase1(lane, pgnos, imgs, n, ws_dbsize, snap_dbsize, P); if (prc != SQLITE_OK) { result = prc; break; } }
+        const uint32_t growth = P->growth; (void)growth;
+        const int i1 = P->i1, ncf = P->ncf, reserved = P->reserved;
+        const uint32_t delta0 = P->delta0, snap_dbsize_ = snap_dbsize; (void)snap_dbsize_;
+        const uint8_t *snap1 = P->snap1;
+        uint8_t **nim = P->nim; uint32_t *npg = P->npg; int *cf = P->cf; uint8_t *mbuf = P->mbuf; rctx c = P->c;
+        uint64_t e_merge = P->e_merge;
+        int rc = SQLITE_OK;
+        uint32_t pending = (uint32_t)(1073741824u / (uint32_t)pgsz) + 1;
         // ---- 2. Under the mutex: the exact end of the file, the references rewritten with the final delta, page 1 merged, then the publication up to the install.
-        if (rc == SQLITE_OK) {
+        {
             uint64_t trl0 = MW_T0();
             mw_spinlock(&db->reloc_mu);                                // one relocation at a time: they would only beat each other
             MW_T1(MW_ST_RELOCLOCK, trl0);
@@ -241,7 +295,7 @@ int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgno
             uint64_t thp0 = MW_T0();
             uint32_t cur = 0, ctr = 0, new_size = 0;
             if (rc == SQLITE_OK) {
-                cur = rd32(latest + 28); ctr = rd32(latest + 24); new_size = cur + growth;
+                cur = rd32(latest + 28); ctr = rd32(latest + 24); new_size = cur + (ws_dbsize - snap_dbsize);
                 if (rd32(latest + 92) != ctr || cur < snap_dbsize || memcmp(latest + 40, snap1 + 40, 4) != 0 || memcmp(latest + 16, snap1 + 16, 6) != 0) rc = NA(6);
                 else if (cur == snap_dbsize) rc = NA(7);
                 else if ((snap_dbsize < pending && ws_dbsize >= pending) || (cur < pending && new_size >= pending)) rc = NA(8);
@@ -290,14 +344,13 @@ int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgno
                     }
                     rc = mw_db_publish(db, lane, &v, npg, (const uint8_t *const *)nim, n, new_size, cur, sync, out_epoch);
                     lane->pre_use = NULL; free(rch);
-                    made = 0;                                                   // (ownership went to the publisher whatever the outcome)
+                    P->made = 0;                                                // (ownership went to the publisher whatever the outcome)
                     if (rc == SQLITE_OK) { atomic_fetch_add(&db->n_relocations, 1); if (nmerged) atomic_fetch_add(&db->n_merges, (uint64_t)nmerged); }
                 }
             }
             RELOC_UNLOCK;
         }
-        for (int i = 0; i < made; i++) free(nim[i]);
-        free(nim); free(npg); free(c.kind); free(c.refs); free(c.queue); free(slot_of_new); free(c.rec); free(cf); free(mbuf);
+        rprep_free(P);
         if (rc != MW_CONFLICT) { result = rc; break; }                        // committed, not applicable, or a real error
         // MW_CONFLICT: another commit extended the file (or changed page 1) since we read it: read the latest again
     }

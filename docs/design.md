@@ -452,3 +452,11 @@ data, index and integrity_check agree in all three runs, with 89-118 prepared ph
 | 16 | 16070 | 8550 | 0 | 8722 | 166282 | 0 |
 | 32 | 15489 | 10679 | 0 | 8437 | 211192 | 0 |
 | 64 | 13921 | 11956 | 0 | 8222 | 295934 | 0 |
+
+## The randomised serializability test (`test/mw_serial.c`)
+
+8 threads run random transactions (insert, update, delete, a change of a UNIQUE column, growth of a payload that splits and frees pages, a counter that really writes a page) on 12, 200 and 3000 keys; each transaction records what it read and did, the epoch it read from and the epoch it committed at.
+Afterwards the committed transactions are replayed on a model in the order of their commit epochs: (1) every read-write transaction must have seen exactly the model's state just before it (every key it reads it also writes, so first-committer-wins must make this exact: lost
+updates, a write over a row deleted meanwhile, two rows with one UNIQUE value would show), (2) every read-only transaction must have seen the state after the commits up to its snapshot epoch, (3) the final table is the model's, the UNIQUE column has no duplicate (table scan), integrity_check is ok.
+Write skew is not generated (snapshot isolation allows it). Result on the engine as it is: 0 violations in 80-240 thousand committed transactions per scenario (also with `MW_TEST_MP=1`, ASan, Linux). Checked that it can fail: ignoring one write-write conflict in 50 gives dozens of reads that differ from the serial order and
+broken UNIQUE values; ignoring the read conflicts gives hundreds of inconsistent reads, duplicate UNIQUE values and a failing integrity_check. It is the condition that a logical replay (rebase) of the commits that conflict only on a page would have to keep passing.

@@ -81,6 +81,7 @@ static int replay_cb (void *ctx, uint64_t epoch, uint32_t dbsize, int n, const u
     return SQLITE_OK;
 }
 
+static void gc_crash_point (void) { mw_fault_hit(MW_CRASH_SHARED_GC); }
 int mw_shared_open (mw_db *db) {
     char *ixp = mw_sidecar_path(db->path, "mwidx");
     if (!ixp) return SQLITE_NOMEM;
@@ -88,6 +89,7 @@ int mw_shared_open (mw_db *db) {
     shidx_params p = { 24, 4u << 20, MW_MP_SLOTS, 0, (uint32_t)mw_file_mode(db->path) };
     const char *e = getenv("MW_IDX_ENTRIES");
     if (e && atoi(e) > 1000) p.max_entries = (uint32_t)atoi(e);
+    shidx_gc_hook = gc_crash_point;
     db->ix = shidx_open(ixp, &p);
     sqlite3_free(ixp);
     if (!db->ix) return SQLITE_CANTOPEN;

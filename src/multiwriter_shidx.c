@@ -366,6 +366,7 @@ void shidx_scan (shidx *ix, uint64_t base, uint64_t upto, shidx_scan_fn cb, void
     }
 }
 
+void (*shidx_gc_hook)(void);
 static uint64_t gc_run (shidx *ix, uint64_t f, uint64_t base) {
     hdr *h = ix->h;
     uint64_t freed = 0;
@@ -375,6 +376,7 @@ static uint64_t gc_run (shidx *ix, uint64_t f, uint64_t base) {
         h->st_gc_full++;
         h->cand_overflow = 0; h->cand_n = 0;
         for (uint32_t b = 0; b < h->dir_n; b++) {
+            if (shidx_gc_hook && b == h->dir_n / 2) shidx_gc_hook();
             uint32_t bi = atomic_load_explicit(&ix->dir[b], memory_order_relaxed);
             if (!bi) continue;
             for (uint32_t k = 0; k < BLOCK_PAGES; k++) {
@@ -395,6 +397,7 @@ static uint64_t gc_run (shidx *ix, uint64_t f, uint64_t base) {
     h->cand_n = 0;
     uint32_t keep = 0;
     for (uint32_t i = 0; i < n; i++) {                              // (pages pushed back by this run are appended behind the unread ones: copy forward)
+        if (shidx_gc_hook && i == n / 2) shidx_gc_hook();
         uint32_t pgno = ix->cand[i] - 1;
         bool more;
         freed += chain_gc(ix, pgno, f, base, &more);

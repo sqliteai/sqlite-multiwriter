@@ -70,6 +70,7 @@ void     shidx_publish (shidx *ix, uint64_t epoch);             // makes everyth
 uint64_t shidx_head_epoch (shidx *ix, uint32_t pgno);           // newest version's epoch, 0 if none (commit validation)
 // Frees what no snapshot can see. `base`: state <= base is in the real file, a chain whose only version is <= base is dropped altogether (and so is page `pgno`'s
 // entry in the index). Returns the number of versions freed.
+extern void (*shidx_gc_hook)(void);                  // called in the middle of a collection (tests: a crash point)
 uint64_t shidx_gc (shidx *ix, uint64_t base);
 // The same, with the floor decided by the caller (it runs its own registry of snapshots and guarantees that none below `floor` exists or can be taken).
 uint64_t shidx_gc_floor (shidx *ix, uint64_t floor, uint64_t base);

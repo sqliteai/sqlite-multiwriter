@@ -48,7 +48,7 @@ static uint64_t snap_epoch (sqlite3 *db) { mw_tx_info ti; memset(&ti, 0, sizeof 
 static uint64_t commit_epoch (sqlite3 *db) { mw_tx_info ti; memset(&ti, 0, sizeof ti); sqlite3_file_control(db, "main", MW_FCNTL_TXINFO, &ti); return ti.commit_epoch; }
 
 // ---- the record file of a process (one write() per record: a kill never leaves half of one in the middle) ----
-enum { REC_INTENT = 1, REC_COMMIT, REC_RO, REC_RESOLVE, REC_ABORT };
+enum { REC_INTENT = 1, REC_COMMIT, REC_RO, REC_RESOLVE, REC_ABORT, REC_FULL };
 typedef struct { uint32_t type, slot; uint64_t seq, epoch; } rhdr;
 static void put_rec (int fd, uint32_t type, int slot, uint64_t seq, uint64_t epoch, const void *pl, size_t n) {
     if (fd < 0) return;
@@ -89,14 +89,14 @@ static void run_rw (ctx_t *c, rw_t *out, int *got) {
         else if (r < 9) { o->kind = 5; o->a = (int)(rnd(&c->rng) % 600); snprintf(sql, sizeof sql, "UPDATE t SET p = zeroblob(%d) WHERE id = %d", o->a, o->key); }
         else { o->kind = 0; snprintf(sql, sizeof sql, "UPDATE t SET w = w + 1 WHERE id = %d", o->key); }
         int rc = mw_exec(db, sql);
-        if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_CONSTRAINT) R->constraint++; else if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else { R->other++; if (getenv("MW_VERBOSE")) printf("  other rc %d on: %s\n", rc, sql); } }
+        if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_FULL) put_rec(c->fd, REC_FULL, c->slot, 0, 0, NULL, 0); if ((rc & 0xff) == SQLITE_CONSTRAINT) R->constraint++; else if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else { R->other++; if (getenv("MW_VERBOSE")) printf("  other rc %d on: %s\n", rc, sql); } }
     }
     if (ok && c->slot >= 0) { snprintf(sql, sizeof sql, "UPDATE txlog SET seq = %llu WHERE slot = %d", (unsigned long long)tx.seq, c->slot); int rc = mw_exec(db, sql); if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else R->other++; } }
     if (ok) {
         tx.snap = snap_epoch(db);
         put_rec(c->fd, REC_INTENT, c->slot, tx.seq, 0, &tx, sizeof tx);                              // (before COMMIT: a kill from here on leaves the transaction in doubt)
         int rc = mw_exec(db, "COMMIT");
-        if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else { R->other++; if (getenv("MW_VERBOSE")) printf("  commit rc %d\n", rc); } }
+        if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_FULL) put_rec(c->fd, REC_FULL, c->slot, 0, 0, NULL, 0); if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else { R->other++; if (getenv("MW_VERBOSE")) printf("  commit rc %d\n", rc); } }
         else tx.commit = commit_epoch(db);
     }
     if (!ok) { mw_exec(db, "ROLLBACK"); put_rec(c->fd, REC_ABORT, c->slot, tx.seq, 0, NULL, 0); return; }
@@ -133,7 +133,7 @@ static void child_main (int slot, int generation) {
     c.seq = (uint64_t)sqlite3_column_int64(q, 0); sqlite3_finalize(q);
     put_rec(fd, REC_RESOLVE, slot, c.seq, 0, NULL, 0);
     if (rnd(&c.rng) % 3 != 0) {                                                                      // most incarnations also die on their own at a point of the publication (inside the lock, mid-record, just after it): the repair of a dead publisher
-        static const mw_fault_t pts[] = { MW_CRASH_MID_LOG, MW_CRASH_BEFORE_LOG, MW_CRASH_SHARED_APPENDED, MW_CRASH_SHARED_INSTALLED, MW_CRASH_AFTER_LOG, MW_CRASH_AFTER_VISIBLE };
+        static const mw_fault_t pts[] = { MW_CRASH_MID_LOG, MW_CRASH_BEFORE_LOG, MW_CRASH_SHARED_APPENDED, MW_CRASH_SHARED_INSTALLED, MW_CRASH_AFTER_LOG, MW_CRASH_AFTER_VISIBLE, MW_CRASH_SHARED_GC, MW_CRASH_SHARED_GC };       // (twice: the collection runs every 16 commits, and a dead holder in it is a case of its own)
         mw_fault_arm(pts[rnd(&c.rng) % (sizeof pts / sizeof *pts)], 20 + (int)(rnd(&c.rng) % 800));
     }
     for (;;) {
@@ -251,7 +251,8 @@ static void run_threads (const char *name, int keys, int threads, double secs) {
 }
 
 // ---- real processes killed with SIGKILL ----
-static void run_procs (const char *name, int keys, int nprocs, double secs, int kill_ms) {
+static void run_procs (const char *name, int keys, int nprocs, double secs, int kill_ms, const char *idx_entries) {
+    if (idx_entries) setenv("MW_IDX_ENTRIES", idx_entries, 1); else unsetenv("MW_IDX_ENTRIES");
     char path[256]; mw_tmpdb(path, sizeof path, "serialp"); g_procs_mode = 1; make_db(path, nprocs);
     g_path = path; g_keys = keys; g_secs = secs;
     pid_t pid[32]; int gen[32]; struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -278,7 +279,7 @@ static void run_procs (const char *name, int keys, int nprocs, double secs, int 
     sqlite3_close(chk);
     // the record files
     txset S = {0}; size_t cap_k = 1 << 16, cap_d = 1 << 12, cap_r = 1 << 16; S.known = malloc(cap_k * sizeof *S.known); S.doubt = malloc(cap_d * sizeof *S.doubt); S.ro = malloc(cap_r * sizeof *S.ro);
-    long committed = 0, in_doubt = 0, in_doubt_committed = 0;
+    long committed = 0, in_doubt = 0, in_doubt_committed = 0, full_errors = 0;
     for (int slot = 0; slot < nprocs; slot++) {
         char fn[300]; snprintf(fn, sizeof fn, "%s.rec%d", path, slot); FILE *f = fopen(fn, "rb"); if (!f) continue;
         rw_t *pending = NULL; rhdr h;
@@ -287,6 +288,7 @@ static void run_procs (const char *name, int keys, int nprocs, double secs, int 
             else if (h.type == REC_RO) { ro_t *r = malloc(sizeof *r); if (fread(r, sizeof *r, 1, f) != 1) { free(r); break; } if (S.nro == cap_r) { cap_r *= 2; S.ro = realloc(S.ro, cap_r * sizeof *S.ro); } S.ro[S.nro++] = r; }
             else if (h.type == REC_COMMIT) { if (pending && pending->seq == h.seq) { pending->commit = h.epoch; if (S.nknown == cap_k) { cap_k *= 2; S.known = realloc(S.known, cap_k * sizeof *S.known); } S.known[S.nknown++] = pending; pending = NULL; committed++; } }
             else if (h.type == REC_ABORT) { free(pending); pending = NULL; }
+            else if (h.type == REC_FULL) full_errors++;
             else if (h.type == REC_RESOLVE) {
                 if (pending) { in_doubt++; if (pending->seq <= h.seq) { if (S.ndoubt == cap_d) { cap_d *= 2; S.doubt = realloc(S.doubt, cap_d * sizeof *S.doubt); } S.doubt[S.ndoubt++] = pending; in_doubt_committed++; } else free(pending); pending = NULL; }
             }
@@ -298,11 +300,11 @@ static void run_procs (const char *name, int keys, int nprocs, double secs, int 
     long rows, model_rows, bad_final, dup; int integ; final_check(path, &M, &rows, &model_rows, &bad_final, &dup, &integ);
     // the sequence numbers: what the database says each process committed last is what the records say
     long bad_seq = 0; for (int slot = 0; slot < nprocs; slot++) { uint64_t mx = 0; for (size_t i = 0; i < S.nknown; i++) if (S.known[i]->slot == slot && S.known[i]->seq > mx) mx = S.known[i]->seq; for (size_t i = 0; i < S.ndoubt; i++) if (S.doubt[i]->slot == slot && S.doubt[i]->seq > mx) mx = S.doubt[i]->seq; if (mx != final_seq[slot]) REPORT(bad_seq, "process %d: the database's last sequence number is %llu, the records' %llu", slot, (unsigned long long)final_seq[slot], (unsigned long long)mx); }
-    printf("%s: %d keys, %d processes, %d kills and %d crashes at a publication point: %ld transactions acknowledged, %ld read-only; %ld in doubt after a kill, %ld of them committed; table %ld rows (model %ld)\n", name, keys, nprocs, kills, crashes, committed, (long)S.nro, in_doubt, in_doubt_committed, rows, model_rows);
+    printf("%s: %d keys, %d processes, %d kills and %d crashes at a publication point: %ld transactions acknowledged, %ld read-only; %ld in doubt after a kill, %ld of them committed; table %ld rows (model %ld); commits refused with SQLITE_FULL (the index of versions had no room): %ld\n", name, keys, nprocs, kills, crashes, committed, (long)S.nro, in_doubt, in_doubt_committed, rows, model_rows, full_errors);
     printf("   reads that differ from the serial order %ld, UNIQUE broken %ld, read-only inconsistent %ld, duplicate epochs %ld, epochs with nobody to account for them %ld, in doubt that fit no epoch %ld, final differs %ld, duplicate u %ld, sequence numbers %ld, integrity %s\n",
            V.bad_read, V.bad_unique, V.bad_ro, V.bad_dup_epoch, V.bad_gap, V.bad_tail, bad_final, dup, bad_seq, integ ? "ok" : "BAD");
     CHECK(V.bad_read == 0); CHECK(V.bad_unique == 0); CHECK(V.bad_ro == 0); CHECK(V.bad_dup_epoch == 0); CHECK(V.bad_gap == 0); CHECK(V.bad_tail == 0); CHECK(bad_final == 0); CHECK(dup == 0); CHECK(bad_seq == 0); CHECK(integ); CHECK(rows == model_rows);
-    CHECK(committed >= 500); CHECK(kills + crashes >= 10);
+    CHECK(committed >= 500); CHECK(kills + crashes >= 10); CHECK(full_errors == 0);                       // (the index of versions is collected: a holder that died in a collection must not leave pages that nobody collects)
     free(S.known); free(S.doubt); free(S.ro); free(M.m); free(M.owner);
     mw_rmdb(path);
 }
@@ -312,8 +314,9 @@ int main (void) {
     run_threads("hot (few keys, many conflicts)", 12, 8, 3.0);
     run_threads("medium", 200, 8, 3.0);
     run_threads("wide (many pages, pages freed and reused)", 3000, 8, 4.0);
-    run_procs("processes, hot", 12, 6, 6.0, 250);
-    run_procs("processes, medium", 300, 6, 6.0, 250);
-    run_procs("processes, wide", 3000, 6, 6.0, 250);
+    run_procs("processes, hot", 12, 6, 6.0, 250, NULL);
+    run_procs("processes, medium", 300, 6, 6.0, 250, NULL);
+    run_procs("processes, wide", 3000, 6, 6.0, 250, NULL);
+    run_procs("processes, small index of versions", 300, 6, 10.0, 250, "3000");
     MW_DONE();
 }

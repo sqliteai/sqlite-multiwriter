@@ -111,6 +111,7 @@ typedef enum {
     MW_CRASH_LOG_RENAME,        // log rewrite: new log file renamed into place, header (log_pos) not yet updated
     MW_CRASH_SHARED_APPENDED,   // shared mode: the record is in the segment, nothing installed yet
     MW_CRASH_SHARED_INSTALLED,  // shared mode: pages (and metadata) installed, the commit not yet visible
+    MW_CRASH_SHARED_GC,         // shared mode: in the middle of a collection of the index (the candidate list is half rebuilt)
     MW_FAULT_COUNT
 } mw_fault_t;
 void mw_fault_arm (mw_fault_t f, int nth);

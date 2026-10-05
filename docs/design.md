@@ -397,3 +397,16 @@ the list is missing; the others (FTS with MVCC, index merging, hash joins, subqu
 throughput there (at 64 threads: the groups of the log are smaller, 9.7 records against 13.2, and a commit waits 1.5 ms against 1.2 ms), and Turso keeps no such metadata. That gap is the price of the capture, not a missing optimization; a closer match would need less work per
 commit in the capture/apply path, which earlier sections already squeezed. Caveats: the post's own numbers are on another machine (12-core Ryzen, NVMe, Linux: 9.5k tx/s at 64 connections); on this Mac `fsync` does not flush the drive cache (F_FULLFSYNC does), for all the engines compared here.
 Not measured here: the latency (Poisson) shape of the post and the processes mode.
+
+## The cost of the capture above 16 threads, and the multi-process publication lock: what was tried (2026-10-05)
+
+After the fix of the GC the tracked throughput no longer drops above 16 threads; it sits at about 72% of the untracked one at every thread count from 8 to 64 (35k against 49k at 16 threads). Ablations (experiments build, 32 threads): skipping the
+insertion of the commit's cells into the memory table gives 50k tx/s (as untracked); skipping only the write of the metadata file changes nothing, nor does a flush every two seconds, one builder thread, a run limit of 6, 24 or 100 groups, 8 or 256
+stripes instead of 64, another spin time of the stripe locks, or taking the stripes from a start that differs per commit with a second pass for the busy ones (all within the noise, 34-37k). Measured per commit at 32 threads: the insertion takes
+60 us (33 us waiting for the 64 stripes, 0.34 us held per stripe), back-pressure from the runs 37 us on average, the capture about 25 us: together about the 130 us that a tracked commit takes more than an untracked one (the closed loop
+runs at N / latency). Nothing found that removes it without removing the metadata; the insertion cannot move after the log sync because the group leader publishes the epochs of the whole written prefix.
+`test/mw_applyvis.c` (12 writers on 8 hot rows, synchronous=FULL, `cv == 1 + 2n` for every row) guards the invariant that a commit's cells are in the store before the next commit of the same row computes its versions; it passes, also with an
+artificial delay of the apply (`MW_EXP_APPLY_DELAY_US`, experiments build): epochs become visible before their apply only rarely (8 of 23000 commits with 300 us of delay, in the bench of the experiments build), and no row disagreed. The leader
+of the staged log does publish epochs whose cells may not have been applied yet (`sync_staged`, `leader_vis`): not proven harmful, not proven safe.
+Processes (8 processes, tracked, 16.8k tx/s): the publication lock is held 44.6 us per commit (log append 20 us, `mm_install` 7.5 us, the rest of the shared publish ~4 us) and waited for 159 us: utilisation of the lock about 79%, a ceiling of ~22k tx/s.
+The merger's own commits go through the same lock. Candidates not done: build the body checksum and copy the record outside the lock (reserve the offset under it), a cheaper checksum, taking the metadata store's commits out of the lock.

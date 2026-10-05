@@ -280,6 +280,8 @@ struct mw_lane {
     int         own_n, own_cap;
     uint64_t    own_epoch;           // epoch of its latest commit
     uint64_t   *own_ep;              // (parallel to own_pg) the epoch of the latest commit of this snapshot that wrote each page: a page is validated against the commit that wrote it, not against the latest commit of the lane
+    uint64_t   *pre_ch;              // multi-process: the hashes of the pages of the commit, made before the publication lock (parallel to the write set; freed at the end of the commit)
+    const uint64_t *pre_use;         // the ones the next shared publication uses (set for one publication: the relocation clears the entries of the pages it changes)
     bool        poisoned;            // a commit of this snapshot was relocated (its pages went to other numbers): the lane's private WAL still has the old ones, so the snapshot takes no more commits
     int        *ws_frame;       // frame index of the last image of each page (parallel to ws_pgnos)
     // passthrough-mode commit detection (wal-index header watch)

@@ -72,7 +72,20 @@ static uint64_t fnv64 (uint64_t h, const void *p, size_t n) {
     return h;
 }
 static uint64_t hdr_cksum (const seg_hdr *h) { seg_hdr c = *h; c.cksum = 0; return fnv64(1469598103934665603ull, &c, sizeof c); }
-static uint64_t rec_cksum (uint64_t salt, const rec_hdr *h, const void *body, size_t n) { rec_hdr c = *h; c.cksum = 0; return fnv64(fnv64(salt ^ 1469598103934665603ull, &c, sizeof c), body, n); }
+// The checksum of a record: the header (with the salt), and a hash of the body made of one hash per page (its content, not its number: a page that a relocation renumbers keeps its hash) folded in order with the page number, then the
+// extension. The hashes of the pages can be made before the publication lock is taken (mw_seglog_content_hash); only the ones of pages that the relocation changed are made inside it.
+uint64_t mw_seglog_content_hash (const void *img, size_t pgsz) { return fnv64(0xA24BAED4963EE407ull, img, pgsz) | 1; }
+static inline uint64_t bh_fold (uint64_t b, uint32_t pgno, uint64_t ch) { b = (b ^ ch ^ ((uint64_t)pgno * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull; return b ^ (b >> 29); }
+#define BH_SEED 0x2545F4914F6CDD1Dull
+#define BH_EXT_PGNO 0xFFFFFFFFu
+static uint64_t body_hash_bytes (const uint8_t *body, uint32_t n, size_t pgsz, uint32_t ext_len) {
+    uint64_t b = BH_SEED; const uint8_t *p = body;
+    for (uint32_t k = 0; k < n; k++, p += 4 + pgsz) { uint32_t pg; memcpy(&pg, p, 4); b = bh_fold(b, pg, mw_seglog_content_hash(p + 4, pgsz)); }
+    if (ext_len) b = bh_fold(b, BH_EXT_PGNO, fnv64(0x9FB21C651E98DF25ull, p, ext_len));
+    return b;
+}
+static uint64_t rec_cksum_h (uint64_t salt, const rec_hdr *h, uint64_t body_hash) { rec_hdr c = *h; c.cksum = 0; return fnv64(fnv64(salt ^ 1469598103934665603ull, &c, sizeof c), &body_hash, sizeof body_hash); }
+static uint64_t rec_cksum (uint64_t salt, const rec_hdr *h, const void *body, size_t n) { (void)n; return rec_cksum_h(salt, h, body_hash_bytes(body, h->npages, h->pgsz, h->ext_len)); }
 
 static int pwrite_all (int fd, const void *buf, size_t n, off_t off) {
     const char *p = buf;
@@ -399,7 +412,7 @@ static int seg_roll (mw_db *db, mw_seglog *sl, uint32_t cur, uint64_t need, uint
     return SQLITE_OK;
 }
 
-int mw_seglog_append (mw_db *db, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, const uint8_t *ext, uint32_t ext_len, uint64_t *locs, uint64_t *ext_loc, uint32_t *seg_out, uint64_t *end_out) {
+int mw_seglog_append (mw_db *db, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, const uint8_t *ext, uint32_t ext_len, const uint64_t *ch, uint64_t *locs, uint64_t *ext_loc, uint32_t *seg_out, uint64_t *end_out) {
     mw_seglog *sl = db->sl;
     mw_shm *sh = db->shm;
     if (mw_fault_hit(MW_FAULT_LOG_WRITE_ERR)) return SQLITE_IOERR_WRITE;
@@ -421,16 +434,18 @@ int mw_seglog_append (mw_db *db, uint64_t epoch, uint32_t dbsize, int n, const u
     atomic_store_explicit(&sh->pend_epoch, epoch, memory_order_release);                 // (a publisher that dies from here until it has published is finished or undone by whoever takes the lock after it)
     size_t pgsz = sl->pgsz;
     uint8_t *p = m->base + off + REC_HDR_SIZE;
+    uint64_t bh = BH_SEED;
     for (int i = 0; i < n; i++) {                                                  // body first, header (with the magic) last: an unfinished record does not validate
         memcpy(p, &pgnos[i], 4); memcpy(p + 4, images[i], pgsz);
+        bh = bh_fold(bh, pgnos[i], ch && ch[i] ? ch[i] : mw_seglog_content_hash(images[i], pgsz));
         locs[i] = MW_LOC(seg, (uint64_t)(p - m->base) + 4);
         p += 4 + pgsz;
     }
-    if (ext_len) memcpy(p, ext, ext_len);
+    if (ext_len) { memcpy(p, ext, ext_len); bh = bh_fold(bh, BH_EXT_PGNO, fnv64(0x9FB21C651E98DF25ull, ext, ext_len)); }
     if (ext_loc) *ext_loc = MW_LOC(seg, (uint64_t)(p - m->base));
     if (mw_fault_hit(MW_CRASH_MID_LOG)) _exit(9);                                  // body written, header not: a torn record
     rec_hdr r = { .magic = REC_MAGIC, .npages = (uint32_t)n, .epoch = epoch, .dbsize = dbsize, .pgsz = (uint32_t)pgsz, .ext_len = ext_len, .cksum = 0 };
-    r.cksum = rec_cksum(sl->salt, &r, m->base + off + REC_HDR_SIZE, (size_t)n * (4 + pgsz) + ext_len);
+    r.cksum = rec_cksum_h(sl->salt, &r, bh);
     memcpy(m->base + off, &r, sizeof r);
     map_release(m);
     atomic_store_explicit(&sh->sl_end, off + size, memory_order_release);          // the cursor moves when the record is complete

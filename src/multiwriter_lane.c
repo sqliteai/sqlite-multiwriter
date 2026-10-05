@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include "multiwriter_io.h"
 #include "multiwriter_internal.h"
+#include "multiwriter_seglog.h"
 
 #define MW_HOT_CREDIT 16     // serialised transactions after a conflict, decaying by one per successful commit
 
@@ -175,6 +176,10 @@ static int lane_publish_inner (mw_lane *lane) {
     // lock is long, somebody commits meanwhile and the prepared relocation would be refused again (3.7 lock rounds per commit at 128 processes, 335 us of lock per commit).
     // The rebase (tracked tables) replays SQL and runs without the lock.
     bool mp_hold = db->mp && !(lane->rs_overflow && lane->readcheck);
+    if (mp_hold) {                                                // (what does not depend on the state of the others is made before the lock: the hashes of the pages of the record)
+        lane->pre_ch = malloc((size_t)lane->ws_n * sizeof(uint64_t)); lane->pre_use = NULL;
+        if (lane->pre_ch) { for (int i = 0; i < lane->ws_n; i++) lane->pre_ch[i] = mw_seglog_content_hash(imgs[i], (size_t)w->pgsz); lane->pre_use = lane->pre_ch; }
+    }
     if (mp_hold) { uint64_t tw0 = MW_T0(); mw_gate_enter(db, lane); mw_mp_lock(db); MW_T1(MW_ST_MP_WAIT, tw0); lane->mp_held = true; lane->mp_t0 = MW_T0(); }
     int rc = lane->rs_overflow && lane->readcheck ? MW_CONFLICT_READ
            : mw_db_publish(db, lane, &v, lane->ws_pgnos, imgs, lane->ws_n, lane->ws_dbsize, snap_size, lane->sync_level >= 2, &epoch);
@@ -217,6 +222,7 @@ static int lane_publish_inner (mw_lane *lane) {
     }
     free(imgs);
     free(ro);                                                    // (the read set is used again by the relocation above: freed only now)
+    free(lane->pre_ch); lane->pre_ch = NULL; lane->pre_use = NULL;
     MW_T1(MW_ST_PUBLISH, tp0);
     if (rc == MW_CONFLICT || rc == MW_CONFLICT_SCHEMA || rc == MW_CONFLICT_READ) {
         // Not rebasable (or the rebase gave up): the transaction is rolled back, the caller retries.

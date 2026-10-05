@@ -40,7 +40,8 @@ void mw_seglog_close (mw_db *db);
 // ---- the writer (publication lock held) ----
 // Appends one commit record (the pages, then the metadata extension), rolling to a new segment when it does not fit. locs[i] = where the image of page i is; *ext_loc = where the extension is. *seg / *end: where the record ends (for mw_seglog_sync).
 // The writer cursor in the shared header moves only when the record is complete.
-int  mw_seglog_append (mw_db *db, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, const uint8_t *ext, uint32_t ext_len, uint64_t *locs, uint64_t *ext_loc, uint32_t *seg, uint64_t *end);
+int  mw_seglog_append (mw_db *db, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images, const uint8_t *ext, uint32_t ext_len, const uint64_t *ch, uint64_t *locs, uint64_t *ext_loc, uint32_t *seg, uint64_t *end);
+uint64_t mw_seglog_content_hash (const void *img, size_t pgsz);      // the hash of a page that the record's checksum is made of (never 0): can be made before the publication lock
 // Group commit: returns when everything up to (seg, end) is durable (one leader per process syncs the active segment for everybody waiting).
 int  mw_seglog_sync (mw_db *db, uint32_t seg, uint64_t end);
 // Called outside the publication lock after a commit: keeps the next segment prepared. Cheap when there is nothing to do.

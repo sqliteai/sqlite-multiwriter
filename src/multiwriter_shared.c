@@ -303,7 +303,8 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     uint64_t ta0 = MW_T0();
     uint32_t seg = 0; uint64_t end = 0;
     uint64_t ext_loc = 0;
-    rc = mw_seglog_append(db, epoch, new_dbsize, n, pgnos, images, lane ? lane->cdc_ext : NULL, lane ? lane->cdc_ext_len : 0, locs, &ext_loc, &seg, &end);
+    const uint64_t *ch = lane ? lane->pre_use : NULL; if (lane) lane->pre_use = NULL;          // (the hashes of the pages made before the lock: for this publication only, the images of the next one may be others)
+    rc = mw_seglog_append(db, epoch, new_dbsize, n, pgnos, images, lane ? lane->cdc_ext : NULL, lane ? lane->cdc_ext_len : 0, ch, locs, &ext_loc, &seg, &end);
     mw_fault_hit(MW_CRASH_SHARED_APPENDED);                                           // (the record is complete, nothing is installed)
     MW_T1(MW_ST_APPEND, ta0);
     if (rc != SQLITE_OK) { if (n > 16) free(locs); ADOPT_FREE(); return rc; }          // (the append failed before it touched anything the others can see: this commit fails, the database does not)

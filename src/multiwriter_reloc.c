@@ -281,7 +281,15 @@ int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgno
                 v.adopt_images = true;                                          // the store keeps our private copies (and frees them on failure)
                 if (rc == SQLITE_OK) {
                     if (db->cdc) mw_cdc_relocated(lane);
+                    uint64_t *rch = NULL;                                       // (multi-process: the hashes made before the lock hold for the pages that the relocation did not change; the others are made by the append)
+                    if (db->mp && lane->pre_ch && n == lane->ws_n && (rch = malloc((size_t)n * sizeof(uint64_t)))) {
+                        memcpy(rch, lane->pre_ch, (size_t)n * sizeof(uint64_t)); rch[i1] = 0;
+                        for (int k = 0; k < c.nrec; k++) rch[c.rec[k].slot] = 0;
+                        for (int k = 0; k < nown; k++) for (int j = 0; j < n; j++) if (pgnos[j] == own_pg[k]) rch[j] = 0;
+                        lane->pre_use = rch;
+                    }
                     rc = mw_db_publish(db, lane, &v, npg, (const uint8_t *const *)nim, n, new_size, cur, sync, out_epoch);
+                    lane->pre_use = NULL; free(rch);
                     made = 0;                                                   // (ownership went to the publisher whatever the outcome)
                     if (rc == SQLITE_OK) { atomic_fetch_add(&db->n_relocations, 1); if (nmerged) atomic_fetch_add(&db->n_merges, (uint64_t)nmerged); }
                 }

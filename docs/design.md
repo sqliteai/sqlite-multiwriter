@@ -410,3 +410,11 @@ artificial delay of the apply (`MW_EXP_APPLY_DELAY_US`, experiments build): epoc
 of the staged log does publish epochs whose cells may not have been applied yet (`sync_staged`, `leader_vis`): not proven harmful, not proven safe.
 Processes (8 processes, tracked, 16.8k tx/s): the publication lock is held 44.6 us per commit (log append 20 us, `mm_install` 7.5 us, the rest of the shared publish ~4 us) and waited for 159 us: utilisation of the lock about 79%, a ceiling of ~22k tx/s.
 The merger's own commits go through the same lock. Candidates not done: build the body checksum and copy the record outside the lock (reserve the offset under it), a cheaper checksum, taking the metadata store's commits out of the lock.
+
+## The checksum of the shared log record outside the publication lock (measured 2026-10-05)
+
+In the processes mode the append of a record took 21 us inside the publication lock: 12.5 us to copy the pages into the mapped segment and 8.7 us for the checksum. The checksum is now made of one hash per page (of its content, not of its number: a page that the relocation
+renumbers keeps it), folded in order with the page numbers, then the extension, then the header; the hashes of the pages are made before the lock is taken (`lane->pre_ch`), the relocation clears those of the pages it changes (page 1, the ones with a patched reference,
+the merged ones: they are made in the lock), and the readers (replay, peek, the recovery of a dead publisher) compute the same value from the bytes of the record. The copy of the pages stays in the lock (the offset is only known there). 8 processes, tracked, alternating runs:
+16.1-17.1k tx/s before, 18.0-18.2k after (+9%); 4 processes 16.4k -> 17.2k, 16 processes 14.8k -> 15.7k, 32 processes 14.6k -> 15.1k. Tests: suite, test-mp, test-stress, ASan and Linux on the multi-process tests (including SIGKILL at every step of the publication).
+Next in the lock: the private copies of the pages that the relocation makes (it runs inside the same hold in this mode) and the 12.5 us of the copy into the segment.

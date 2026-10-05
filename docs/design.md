@@ -377,3 +377,23 @@ stripe is held (`trylock`). Result: gc_ms 1.9 s at 32 threads, 35.5k tx/s at 32,
 | 16 | 34582 | 927 | 0 | 8668 | 171344 | 0 |
 | 32 | 37174 | 2046 | 0 | 8643 | 230186 | 0 |
 | 64 | 34699 | 5132 | 0 | 8268 | 337060 | 0 |
+
+## Against Turso 0.8.1 (measured 2026-10-05, this Mac, 18 cores, synchronous=FULL, 100-row transactions on disjoint keys, 10 s, one run per point)
+
+Turso through its Rust crate (`bench/turso_rs`: BEGIN CONCURRENT, `journal_mode=mvcc`, built from the cached 0.8.1 crates), SQLite stock WAL with the application retrying, and this engine tracked (CRDT capture of every table) and untracked. tx/s:
+
+| threads | SQLite | Multi-Writer tracked | Multi-Writer untracked | Turso 0.8.1 | tracked / Turso | untracked / Turso |
+|---|---|---|---|---|---|---|
+| 1 | 14173 | 10971 | 15974 | 5616 | 1.95x | 2.84x |
+| 2 | 9950 | 15784 | 22241 | 8376 | 1.88x | 2.66x |
+| 4 | 9338 | 23585 | 35343 | 17075 | 1.38x | 2.07x |
+| 8 | 9065 | 30046 | 40333 | 28800 | 1.04x | 1.40x |
+| 16 | 8668 | 34582 | 49314 | 31571 | 1.10x | 1.56x |
+| 32 | 8643 | 37174 | 54384 | 42987 | 0.86x | 1.27x |
+| 64 | 8268 | 34699 | 47308 | 43120 | 0.80x | 1.10x |
+
+What the post lists as the optimizations of 0.8 for writes (BEGIN CONCURRENT, MVCC with independent transaction starts, group commit) this engine already has (page versions with snapshot isolation, the group commit of the log with leader/followers). Nothing in
+the list is missing; the others (FTS with MVCC, index merging, hash joins, subquery unnesting) are not about the write path. Untracked it is ahead of Turso at every point. Tracked it is behind above 16 threads: the capture of the changes costs 20-27% of the
+throughput there (at 64 threads: the groups of the log are smaller, 9.7 records against 13.2, and a commit waits 1.5 ms against 1.2 ms), and Turso keeps no such metadata. That gap is the price of the capture, not a missing optimization; a closer match would need less work per
+commit in the capture/apply path, which earlier sections already squeezed. Caveats: the post's own numbers are on another machine (12-core Ryzen, NVMe, Linux: 9.5k tx/s at 64 connections); on this Mac `fsync` does not flush the drive cache (F_FULLFSYNC does), for all the engines compared here.
+Not measured here: the latency (Poisson) shape of the post and the processes mode.

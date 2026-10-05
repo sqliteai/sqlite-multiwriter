@@ -360,3 +360,20 @@ database `broken`; `mm_head`/`read_group` propagate I/O errors instead of report
 `O_NOFOLLOW` (and `O_EXCL` for the CDC map). Removed: the vstore/vsshared prototypes and their benchmarks, `test/pending`. `mw_norebase`/the rebase path remain (still reachable from `lane_can_rebase`).
 Tested: the whole suite, test-mp, test-io, test-stress, oracle-test, `mw_mpmeta` x3, ASan on the touched tests, Linux (gcc 14) on the same. Not proven by a dedicated test: pid reuse, GC death repair, the
 `broken` flag, ticket stall, file modes. TSan reported one warning in one `mw_mpmeta` run that did not recur in three more (not analysed); `mw_syfail` cannot run under TSan (fork). No A/B perf run for this group.
+
+## The drop above 16 threads with everything tracked (measured 2026-10-05, SQLite 3.53.4, 18 cores)
+
+Bulk, 100 rows per transaction, tracked: 34.7k tx/s at 16 threads, 25.5k at 32, 24.4k at 64 (untracked: 53k at 32). The time was in the garbage collection that the committing thread runs every 64 publishes (`mw_db_gc`):
+`gc_ms` 1.7 s at 16 threads against 69 s at 32 (22% of the thread time), `compaction` runs 286 -> 36. The profile put it in `__psynch_mutexwait` inside `mw_db_gc`: the collector took `list_mu` (a blocking mutex that every
+committer also takes to queue its pages) once per surviving chain, and waited for every stripe a committer held. Now it keeps the survivors on a local list given back with one lock, and skips (and keeps for the next run) a chain whose
+stripe is held (`trylock`). Result: gc_ms 1.9 s at 32 threads, 35.5k tx/s at 32, 33.5k at 64 (the profile runs; the comparison below: 37.2k and 34.7k). Tests: the whole suite, test-stress, ASan and TSan on the metadata tests; no dedicated test of the skipped chains.
+
+| threads | mw tx/s | mw retries | mw failed | SQLite tx/s | SQLite retries | SQLite failed |
+|---|---|---|---|---|---|---|
+| 1 | 10971 | 21 | 0 | 14173 | 0 | 0 |
+| 2 | 15784 | 74 | 0 | 9950 | 114735 | 0 |
+| 4 | 23585 | 248 | 0 | 9338 | 126582 | 0 |
+| 8 | 30046 | 474 | 0 | 9065 | 142154 | 0 |
+| 16 | 34582 | 927 | 0 | 8668 | 171344 | 0 |
+| 32 | 37174 | 2046 | 0 | 8643 | 230186 | 0 |
+| 64 | 34699 | 5132 | 0 | 8268 | 337060 | 0 |

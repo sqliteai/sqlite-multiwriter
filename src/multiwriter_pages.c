@@ -767,11 +767,16 @@ uint64_t mw_db_gc (mw_db *db) {
     st->cand_head = 0;
     pthread_mutex_unlock(&st->list_mu);
 
+    uint32_t def_head = 0; mw_chain *def_tail = NULL;               // (chains whose stripe a committer holds right now: not waited for, they are looked at by the next collection)
     while (head) {
         uint32_t pgno = head - 1;
         mw_chain *c = chain_get(st, pgno, false);
         pthread_mutex_t *mu = stripe_of(st, pgno);
-        mw_spinlock(mu);
+        if (pthread_mutex_trylock(mu) != 0) {
+            head = c->cand_next;                                    // (the chain is queued, so the list link is ours alone while we hold the detached list)
+            c->cand_next = def_head; def_head = pgno + 1; if (!def_tail) def_tail = c;
+            continue;
+        }
         head = c->cand_next;
         int i = chain_find(c, oldest);                           // newest version visible to the oldest snapshot
         int drop = i > 0 ? i : 0;                                // versions [0, drop) are invisible to everyone
@@ -784,10 +789,11 @@ uint64_t mw_db_gc (mw_db *db) {
             reclaimed++;
         }
         if (drop) { memmove(c->v, c->v + drop, (size_t)(c->n - drop) * sizeof(mw_pv)); c->n -= drop; }
-        if (c->n > 0) LIST_PUSH(st, cand_head, cand_next, pgno, c);    // still pinned by an old snapshot, or not yet materialised in the real file: stay a candidate
+        if (c->n > 0) { c->cand_next = def_head; def_head = pgno + 1; if (!def_tail) def_tail = c; }    // (kept on the local list, given back with one lock at the end) still pinned by an old snapshot, or not yet materialised in the real file: stay a candidate
         else { c->queued = 0; free(c->v); c->v = NULL; c->cap = 0; }   // (a page with no version in memory keeps no array of them: a database of millions of pages that were each written once held 150-200 MB of them)
         pthread_mutex_unlock(mu);
     }
+    if (def_head) { mw_spinlock(&st->list_mu); def_tail->cand_next = st->cand_head; st->cand_head = def_head; pthread_mutex_unlock(&st->list_mu); }
     // size records: keep the newest one visible to `oldest` and everything after it
     mw_spinlock(&st->seq_mu);
     int si = -1;

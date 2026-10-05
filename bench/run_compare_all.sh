@@ -1,5 +1,5 @@
 #!/bin/zsh
-# The comparison asked for: from a clean database every time, stock SQLite (WAL, synchronous=FULL; busy_timeout 60 s: "sqlite", busy_timeout 0 with the application retrying: "sqlite0")
+# The comparison asked for: from a clean database every time, stock SQLite (WAL, synchronous=FULL; busy_timeout 60 s: "sqlite", busy_timeout 0 with the application retrying: "sqlite0": now "sqlite")
 # against the multi-writer engine with the CRDT capture on ("mw") and off ("mw0"); threads up to 64, processes up to 1000. Bulk insert, 100 rows per transaction.
 #   bench/run_compare_all.sh [duration_threads] [duration_procs]       (from the repository root, after `make bench`)
 cd "$(dirname "$0")/.." || exit 1

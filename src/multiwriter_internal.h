@@ -183,6 +183,8 @@ struct mw_lane {
     int         rs_n, rs_cap;
     bool        norebase;       // this connection is itself a rebase helper: never rebase recursively
     bool        rebase_on;      // URI mw_rebase=1: a commit that conflicts on pages only is replayed at the latest snapshot (multiwriter_rebase.c)
+    bool        rb_nobackoff;   // URI mw_rebase_backoff=0 (tests): replay every conflict, whatever happened to the last ones
+    int         rb_streak, rb_skip;  // refused replays in a row, and conflicts to refuse without trying (a hot row: the replay would fail again at the cost of decoding the pages)
     sqlite3    *rb_db;          // the helper connection that replays (opened at the first rebase)
     void       *rb_state;       // what the helper caches: catalog, statements (multiwriter_rebase.c)
     int         consec_aborts;   // refusals since this lane last committed (a starving lane is granted a turn even when its transactions are untracked)

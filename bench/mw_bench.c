@@ -19,6 +19,7 @@
 //   crdtinsert    F    unique-key inserts into the table ct         
 //   mixed         G    read-pct% reads / rest writes on own rows
 //   longtx        H    several reads, then one write
+//   groups              each agent its own row, four groups of agents whose rows share a page (four contended pages)
 //   hot           I    4 hot rows of the table ct (true conflicts: UPDATE ct SET a=a+1)
 //   bulk          -    100-row INSERT per transaction on disjoint keys (the Turso 0.8 benchmark shape); --poisson-tps N: open-loop arrivals
 //   longreader    J    independent writers + one reader pinning an old snapshot
@@ -48,8 +49,8 @@
 
 
 typedef enum { M_STOCK, M_STOCK_WAL, M_MW } bmode_t;
-enum { W_INDEPENDENT, W_READONLY, W_SAMEPAGE, W_COLS, W_SAMECOL, W_CRDTINSERT, W_MIXED, W_LONGTX, W_HOT, W_LONGREADER, W_INS_UUID, W_INS_INT, W_INS_AUTO, W_BULK, W_SLOWTX, W_SLOWHOT, W_SLOWPAGE, W_COUNT };
-static const char *wl_name[W_COUNT] = { "independent", "readonly", "samepage", "cols", "samecol", "crdtinsert", "mixed", "longtx", "hot", "longreader", "insert-uuid", "insert-int", "insert-autoinc", "bulk", "slowtx", "slowhot", "slowpage" };
+enum { W_INDEPENDENT, W_READONLY, W_SAMEPAGE, W_COLS, W_SAMECOL, W_CRDTINSERT, W_MIXED, W_LONGTX, W_HOT, W_LONGREADER, W_INS_UUID, W_INS_INT, W_INS_AUTO, W_BULK, W_SLOWTX, W_SLOWHOT, W_SLOWPAGE, W_GROUPS, W_COUNT };
+static const char *wl_name[W_COUNT] = { "independent", "readonly", "samepage", "cols", "samecol", "crdtinsert", "mixed", "longtx", "hot", "longreader", "insert-uuid", "insert-int", "insert-autoinc", "bulk", "slowtx", "slowhot", "slowpage", "groups" };
 static const char *mode_name[] = { "stock", "stock-wal", "multiwriter" };
 
 static struct {
@@ -136,6 +137,8 @@ static int do_txn (agent_t *a) {
             snprintf(sql, sizeof sql, "UPDATE t SET v=v+1 WHERE id=%d", 1 + a->id); break;
         case W_SAMEPAGE:
             snprintf(sql, sizeof sql, "UPDATE ct SET a=a+1 WHERE id='r%d'", a->id); break;
+        case W_GROUPS:      // each agent its own row; the agents are in four groups, the rows of a group share a page and the groups are 200 rows apart: four pages that agents contend for
+            snprintf(sql, sizeof sql, "UPDATE ct SET a=a+1 WHERE id='r%d'", (a->id % 4) * 200 + a->id / 4); break;
         case W_COLS: {
             static const char *col[4] = { "a", "b", "c", "d" };
             a->last_value = (int64_t)a->commits + 1;
@@ -347,6 +350,7 @@ int main (int argc, char **argv) {
     if (cfg.threads <= 0) cfg.threads = cfg.agents < 2 * cores ? cfg.agents : (int)(2 * cores);
     if (cfg.rows < cfg.agents + 1) cfg.rows = cfg.agents + 1;
     if (cfg.rows < 8) cfg.rows = 8;
+    if (cfg.wl == W_GROUPS && cfg.rows < 1100) cfg.rows = 1100;
 
     char path[300]; if (!cfg.path) { snprintf(path, sizeof path, "/tmp/mw_bench_%d.db", (int)getpid()); cfg.path = path; } else snprintf(path, sizeof path, "%s", cfg.path);
     bool shared_db = cfg.no_setup || cfg.setup_only || cfg.verify_sum >= 0;
@@ -383,7 +387,7 @@ int main (int argc, char **argv) {
         if (open_agent(&v) != SQLITE_OK) die("verify open");
         long long want = cfg.verify_sum;
         if (cfg.wl == W_BULK) want = cfg.verify_sum * 100;                 // (bulk: 100 rows per committed transaction, counted)
-        int64_t sum = cfg.wl == W_BULK ? scalar_(v.db, "SELECT count(*) FROM bk") : scalar_(v.db, (cfg.wl == W_HOT || cfg.wl == W_SLOWHOT || cfg.wl == W_SLOWPAGE || cfg.wl == W_SAMEPAGE) ? "SELECT sum(a) FROM ct" : "SELECT sum(v) FROM t");
+        int64_t sum = cfg.wl == W_BULK ? scalar_(v.db, "SELECT count(*) FROM bk") : scalar_(v.db, (cfg.wl == W_HOT || cfg.wl == W_SLOWHOT || cfg.wl == W_SLOWPAGE || cfg.wl == W_SAMEPAGE || cfg.wl == W_GROUPS) ? "SELECT sum(a) FROM ct" : "SELECT sum(v) FROM t");
         char icv[64]; snprintf(icv, sizeof icv, "%s", text_(v.db, "PRAGMA integrity_check"));
         bool okv = sum == want && !strcmp(icv, "ok");
         printf("   verify: sum(v)=%lld expected=%lld integrity_check=%s -> %s\n", (long long)sum, want, icv, okv ? "VALID" : "INVALID");
@@ -481,7 +485,7 @@ int main (int argc, char **argv) {
             if ((uint64_t)sum != expect) { valid = 0; snprintf(why, sizeof why, "sum(t.v)=%lld != committed %llu", (long long)sum, (unsigned long long)expect); }
             break;
         }
-        case W_SAMEPAGE: case W_HOT: case W_SLOWHOT: case W_SLOWPAGE: {
+        case W_SAMEPAGE: case W_HOT: case W_SLOWHOT: case W_SLOWPAGE: case W_GROUPS: {
             int64_t sum = scalar_(v, "SELECT sum(a) FROM ct");
             if ((uint64_t)sum != expect) { valid = 0; snprintf(why, sizeof why, "sum(ct.a)=%lld != committed %llu", (long long)sum, (unsigned long long)expect); }
             break;

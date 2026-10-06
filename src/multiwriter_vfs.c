@@ -247,6 +247,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         if (small && !sqlite3_uri_parameter(name, "mw_log_max_mb")) db->log_max_bytes = 16ull << 20;
         lane->norebase = sqlite3_uri_boolean(name, "mw_norebase", 0) != 0;
         lane->rebase_on = sqlite3_uri_boolean(name, "mw_rebase", 0) != 0 && !lane->norebase;
+        lane->rb_nobackoff = !sqlite3_uri_boolean(name, "mw_rebase_backoff", 1);
         lane->noreloc = sqlite3_uri_boolean(name, "mw_noreloc", 0) != 0;
         lane->noroute = sqlite3_uri_boolean(name, "mw_noroute", 0) != 0;
         lane->nomerge = sqlite3_uri_boolean(name, "mw_nomerge", 0) != 0;

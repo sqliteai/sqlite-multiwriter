@@ -100,6 +100,7 @@ static uint32_t lane_schema_cookie (mw_lane *lane) {
 static bool lane_can_rebase (mw_lane *lane, const uint8_t *pg1, uint32_t snapshot_cookie) {
     if (lane->norebase || !lane->rebase_on) return false;
     if (lane->commit_base > 0) return false;
+    if (lane->rb_skip > 0) { lane->rb_skip--; return false; }
     if (pg1) {
         uint32_t c = ((uint32_t)pg1[40] << 24) | ((uint32_t)pg1[41] << 16) | ((uint32_t)pg1[42] << 8) | pg1[43];
         if (c != snapshot_cookie) return false;                  // DDL in this transaction
@@ -207,8 +208,8 @@ static int lane_publish_inner (mw_lane *lane) {
         else if (rr != MW_RELOC_NA) rc = rr;
         else if (lane_can_rebase(lane, pg1, cookie)) {
             // 2. Physical conflict only on pages that it wrote (mw_rebase=1): discard its pages and replay its row changes at the latest snapshot; stock SQLite regenerates the pages.
-            if (!long_tx) lane->retry_credit = lane->hot_credit;      // a physical conflict: run the next transactions serialised, on the fast path (not the long ones, see above)
             rc = mw_lane_rebase(lane, imgs, cookie, &epoch);
+            if (rc == SQLITE_OK) lane->rb_streak = 0; else if (!lane->rb_nobackoff) { if (lane->rb_streak < 5) lane->rb_streak++; lane->rb_skip = (1 << lane->rb_streak) - 1; }      // (refused: the next conflicts of this connection are probably true ones too: they are not replayed, 1, 3, 7... in a row)
             if (rc == SQLITE_OK) { lane->tx.state = MW_TX_COMMITTED; lane->consec_aborts = 0; }   // commit_epoch was set by the rebase (the credit granted above is spent by the next commits)
             else if (rc != MW_CONFLICT) { lane->tx.state = MW_TX_ABORTED; atomic_fetch_add(&db->n_aborts, 1); }   // (any other failure also rolls the transaction back)
         }
@@ -219,7 +220,7 @@ static int lane_publish_inner (mw_lane *lane) {
     MW_T1(MW_ST_PUBLISH, tp0);
     if (rc == MW_CONFLICT || rc == MW_CONFLICT_SCHEMA || rc == MW_CONFLICT_READ) {
         // Not rebasable (or the rebase gave up): the transaction is rolled back, the caller retries.
-        if (rc == MW_CONFLICT && !lane->norebase) atomic_fetch_add(&db->n_unrebasable, 1);
+        if (rc == MW_CONFLICT && lane->rebase_on) atomic_fetch_add(&db->n_unrebasable, 1);
         lane->tx.state = MW_TX_ABORTED;
         atomic_fetch_add(&db->n_aborts, 1);
         // A write-write conflict on the same pages repeats, so the next transactions run serialised. A schema change is not a hot spot, and neither is a
@@ -228,7 +229,7 @@ static int lane_publish_inner (mw_lane *lane) {
         // its statement again, and waiting for a turn costs more than the occasional retry (measured: 8-32 concurrent bulk / append writers, 1.3-1.5x faster without).
         lane->consec_aborts++;
         const bool starving = lane->consec_aborts >= (long_tx ? long_starve() : 16);          // (a long transaction that lost twice in a row takes the turn and keeps it for hot_credit*16 transactions: FIFO queue, bounded tail)
-        if (!lane->norebase && rc != MW_CONFLICT_SCHEMA && rc != MW_CONFLICT_READ && ((lane->rebase_on && !long_tx) || starving)) {
+        if (!lane->norebase && rc != MW_CONFLICT_SCHEMA && rc != MW_CONFLICT_READ && (starving)) {
             lane->retry_credit = long_tx ? lane->hot_credit * 16 : lane->hot_credit;
             if (mw_timing_on) { extern _Atomic uint64_t mw_grants[2]; atomic_fetch_add(&mw_grants[lane->rebase_on ? 0 : 1], 1); }
         }

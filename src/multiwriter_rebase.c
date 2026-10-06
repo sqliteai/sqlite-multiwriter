@@ -25,15 +25,16 @@
 #include "multiwriter_internal.h"
 
 #define MW_REBASE_MAX_ATTEMPTS 200
-#define MW_REBASE_GATE_AFTER   3      // lost attempts before the publication gate is closed for the next one
+#define MW_REBASE_GATE_AFTER   32     // lost attempts before the publication gate is closed for the next one (measured 20-60% faster than closing it after 3: the gate stops every committer; a replay that is still losing after 32 is starving)
 
-typedef struct { sqlite3_stmt *sel, *ins, *upd, *del; bool ready; } tstmt;
+typedef struct { uint64_t mask; sqlite3_stmt *st; } ucache;
+typedef struct { sqlite3_stmt *sel, *ins, *del; ucache upd[8]; int nupd, next_upd; bool ready; } tstmt;      // upd: UPDATE statements by the set of columns they change (few: a transaction changes the same columns again and again)
 typedef struct { mw_cat *cat; tstmt *ts; int nts; uint32_t cookie; int sync; } rb_state;
 
 static uint64_t now_ns (void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 
 static void state_reset_stmts (rb_state *r) {
-    for (int i = 0; i < r->nts; i++) { sqlite3_finalize(r->ts[i].sel); sqlite3_finalize(r->ts[i].ins); sqlite3_finalize(r->ts[i].upd); sqlite3_finalize(r->ts[i].del); }
+    for (int i = 0; i < r->nts; i++) { sqlite3_finalize(r->ts[i].sel); sqlite3_finalize(r->ts[i].ins); sqlite3_finalize(r->ts[i].del); for (int k = 0; k < r->ts[i].nupd; k++) sqlite3_finalize(r->ts[i].upd[k].st); }
     free(r->ts); r->ts = NULL; r->nts = 0;
 }
 void mw_lane_rebase_free (mw_lane *lane) {
@@ -110,40 +111,71 @@ static int tstmt_prepare (sqlite3 *h, const mw_tab *t, tstmt *s) {
     const char *rid = NULL; static const char *cand[] = { "rowid", "_rowid_", "oid" };
     for (int c = 0; c < 3 && !rid; c++) { bool used = false; for (int i = 0; i < t->nrec; i++) if (t->rec_name[i] && name_is(t->rec_name[i], cand[c])) used = true; if (!used) rid = cand[c]; }
     if (!rid) return SQLITE_MISUSE;
-    char *cols = sqlite3_mprintf(""), *marks = sqlite3_mprintf(""), *sets = sqlite3_mprintf(""), *conds = sqlite3_mprintf(""); int k = 1;
+    char *cols = sqlite3_mprintf(""), *marks = sqlite3_mprintf(""), *conds = sqlite3_mprintf(""); int k = 1;
     for (int i = 0; i < t->nrec; i++) {
         if (!t->rec_name[i] || i == t->alias_rec) continue;
         k++;
         char *a = sqlite3_mprintf("%s,\"%w\"", cols, t->rec_name[i]); sqlite3_free(cols); cols = a;
         a = sqlite3_mprintf("%s,?%d", marks, k); sqlite3_free(marks); marks = a;
-        a = sqlite3_mprintf("%s%s\"%w\"=?%d", sets, *sets ? "," : "", t->rec_name[i], k); sqlite3_free(sets); sets = a;
         a = sqlite3_mprintf("%s AND \"%w\" COLLATE BINARY IS ?%d", conds, t->rec_name[i], k); sqlite3_free(conds); conds = a;
     }
-    char *q[4] = { sqlite3_mprintf("SELECT 1 FROM \"%w\" WHERE %s=?1%s", t->name, rid, conds),
+    char *q[3] = { sqlite3_mprintf("SELECT 1 FROM \"%w\" WHERE %s=?1%s", t->name, rid, conds),
                    sqlite3_mprintf("INSERT INTO \"%w\"(%s%s) VALUES(?1%s)", t->name, rid, cols, marks),
-                   *sets ? sqlite3_mprintf("UPDATE \"%w\" SET %s WHERE %s=?1", t->name, sets, rid) : NULL,
                    sqlite3_mprintf("DELETE FROM \"%w\" WHERE %s=?1", t->name, rid) };
     int rc = SQLITE_OK;
     if (q[0] && sqlite3_prepare_v2(h, q[0], -1, &s->sel, NULL) != SQLITE_OK) rc = SQLITE_ERROR;
     if (rc == SQLITE_OK && q[1] && sqlite3_prepare_v2(h, q[1], -1, &s->ins, NULL) != SQLITE_OK) rc = SQLITE_ERROR;
-    if (rc == SQLITE_OK && q[2] && sqlite3_prepare_v2(h, q[2], -1, &s->upd, NULL) != SQLITE_OK) rc = SQLITE_ERROR;
-    if (rc == SQLITE_OK && q[3] && sqlite3_prepare_v2(h, q[3], -1, &s->del, NULL) != SQLITE_OK) rc = SQLITE_ERROR;
-    for (int i = 0; i < 4; i++) sqlite3_free(q[i]);
-    sqlite3_free(cols); sqlite3_free(marks); sqlite3_free(sets); sqlite3_free(conds);
+    if (rc == SQLITE_OK && q[2] && sqlite3_prepare_v2(h, q[2], -1, &s->del, NULL) != SQLITE_OK) rc = SQLITE_ERROR;
+    for (int i = 0; i < 3; i++) sqlite3_free(q[i]);
+    sqlite3_free(cols); sqlite3_free(marks); sqlite3_free(conds);
     s->ready = rc == SQLITE_OK;
     return rc;
 }
 
-static int bind_row (sqlite3_stmt *st, const mw_tab *t, int64_t rowid, const rec_t *r) {
+static int bind_row (sqlite3_stmt *st, const mw_tab *t, int64_t rowid, const rec_t *r, bool use_mask, uint64_t only) {      // use_mask: bind just the columns of `only` (an UPDATE)
     sqlite3_reset(st); sqlite3_clear_bindings(st);
     sqlite3_bind_int64(st, 1, rowid);
-    int k = 1;
+    int k = 1, bit = 0;
     for (int i = 0; i < t->nrec; i++) {
         if (!t->rec_name[i] || i == t->alias_rec) continue;
+        bool take = !use_mask || (bit < 64 && (only >> bit & 1));
+        bit++;
+        if (!take) continue;
         k++;
         if (r && bind_col(st, k, r, i) != SQLITE_OK) return SQLITE_ERROR;
     }
     return SQLITE_OK;
+}
+
+// The columns of the record that an update changes, as a bit set over the writable columns (in order); false if the table has too many of them. An UPDATE that names a column that has not changed (an indexed one
+// especially) writes the pages of its index: other transactions that only read those pages would be refused for it.
+static bool changed_mask (const mw_tab *t, const rec_t *o, const rec_t *n, uint64_t *mask) {
+    int bit = 0; *mask = 0;
+    for (int i = 0; i < t->nrec; i++) {
+        if (!t->rec_name[i] || i == t->alias_rec) continue;
+        if (bit >= 64) return false;
+        if (o->ty[i] != n->ty[i] || o->len[i] != n->len[i] || (o->len[i] && memcmp(o->rec + o->off[i], n->rec + n->off[i], o->len[i]) != 0)) *mask |= 1ull << bit;
+        bit++;
+    }
+    return true;
+}
+static sqlite3_stmt *update_stmt (sqlite3 *h, const mw_tab *t, tstmt *ts, uint64_t mask) {
+    for (int k = 0; k < ts->nupd; k++) if (ts->upd[k].mask == mask) return ts->upd[k].st;
+    const char *rid = "rowid"; static const char *cand[] = { "rowid", "_rowid_", "oid" };
+    for (int c = 0; c < 3; c++) { bool used = false; for (int i = 0; i < t->nrec; i++) if (t->rec_name[i] && name_is(t->rec_name[i], cand[c])) used = true; if (!used) { rid = cand[c]; break; } }
+    char *sets = sqlite3_mprintf(""); int bit = 0, k = 1;
+    for (int i = 0; i < t->nrec; i++) {
+        if (!t->rec_name[i] || i == t->alias_rec) continue;
+        if (mask >> bit & 1) { k++; char *a = sqlite3_mprintf("%s%s\"%w\"=?%d", sets, *sets ? "," : "", t->rec_name[i], k); sqlite3_free(sets); sets = a; }
+        bit++;
+    }
+    char *q = sqlite3_mprintf("UPDATE \"%w\" SET %s WHERE %s=?1", t->name, sets, rid); sqlite3_free(sets);
+    sqlite3_stmt *st = NULL; int rc = q ? sqlite3_prepare_v2(h, q, -1, &st, NULL) : SQLITE_NOMEM; sqlite3_free(q);
+    if (rc != SQLITE_OK) return NULL;
+    int slot;
+    if (ts->nupd < 8) slot = ts->nupd++; else { slot = ts->next_upd++ & 7; sqlite3_finalize(ts->upd[slot].st); }
+    ts->upd[slot] = (ucache){ mask, st };
+    return st;
 }
 
 // One replay at the snapshot that the helper has now. SQLITE_OK: committed. MW_CONFLICT: a true conflict (the row changed, a constraint, the schema): refuse. SQLITE_BUSY: lost the race: again.
@@ -165,14 +197,20 @@ static int replay_once (mw_lane *lane, rb_state *R, const mw_rd_result *res, uin
             if ((c->old_rec && oldr.n < c->tab->nrec) || (c->new_rec && newr.n < c->tab->nrec)) goto out;      // (a row written before an ALTER TABLE ADD COLUMN: its missing columns are defaults)
             int src;
             if (c->old_rec) {                                                  // it is the row that the transaction saw
-                if (bind_row(ts->sel, c->tab, c->rowid, &oldr) != SQLITE_OK) goto out;
+                if (bind_row(ts->sel, c->tab, c->rowid, &oldr, false, 0) != SQLITE_OK) goto out;
                 src = sqlite3_step(ts->sel); sqlite3_reset(ts->sel);
                 if (src == SQLITE_BUSY || (src & 0xff) == SQLITE_BUSY) { rc = SQLITE_BUSY; goto out; }
                 if (src != SQLITE_ROW) goto out;
             }
-            if (c->kind == 3) { if (bind_row(ts->del, c->tab, c->rowid, NULL) != SQLITE_OK) goto out; src = sqlite3_step(ts->del); sqlite3_reset(ts->del); }
-            else if (c->kind == 2) { if (!ts->upd) goto out; if (bind_row(ts->upd, c->tab, c->rowid, &newr) != SQLITE_OK) goto out; src = sqlite3_step(ts->upd); sqlite3_reset(ts->upd); }
-            else { if (bind_row(ts->ins, c->tab, c->rowid, &newr) != SQLITE_OK) goto out; src = sqlite3_step(ts->ins); sqlite3_reset(ts->ins); }
+            if (c->kind == 3) { if (bind_row(ts->del, c->tab, c->rowid, NULL, false, 0) != SQLITE_OK) goto out; src = sqlite3_step(ts->del); sqlite3_reset(ts->del); }
+            else if (c->kind == 2) {
+                uint64_t mask; if (!changed_mask(c->tab, &oldr, &newr, &mask)) goto out;
+                if (mask == 0) continue;                                                                // (only a derived column changed)
+                sqlite3_stmt *us = update_stmt(h, c->tab, ts, mask); if (!us) goto out;
+                if (bind_row(us, c->tab, c->rowid, &newr, true, mask) != SQLITE_OK) goto out;
+                src = sqlite3_step(us); sqlite3_reset(us);
+            }
+            else { if (bind_row(ts->ins, c->tab, c->rowid, &newr, false, 0) != SQLITE_OK) goto out; src = sqlite3_step(ts->ins); sqlite3_reset(ts->ins); }
             if (src != SQLITE_DONE) { if ((src & 0xff) == SQLITE_BUSY) rc = SQLITE_BUSY; goto out; }
         }
     }
@@ -208,7 +246,7 @@ int mw_lane_rebase (mw_lane *lane, const uint8_t *const *imgs, uint32_t cookie, 
     }
     if (R->sync != lane->sync_level) { char q[40]; snprintf(q, sizeof q, "PRAGMA synchronous=%d", lane->sync_level); sqlite3_exec(lane->rb_db, q, NULL, NULL, NULL); R->sync = lane->sync_level; }
     mw_lane *hl = NULL; { void *lp = NULL; if (sqlite3_file_control(lane->rb_db, "main", MW_FCNTL_LANE_PTR, &lp) == SQLITE_OK) hl = lp; }
-    pthread_mutex_lock(&db->rebase_mu);                                         // (one rebase at a time: two of them would only beat each other)
+    pthread_mutex_lock(&db->rebase_mu);                                         // (one replay at a time: replays that run together lose races against each other and against the ordinary commits, measured 20-40% slower; the decoding above is parallel)
     int rc = MW_CONFLICT, attempt = 0; bool closed = false; uint64_t epoch = 0;
     for (; attempt < MW_REBASE_MAX_ATTEMPTS; attempt++) {
         if (attempt == MW_REBASE_GATE_AFTER && hl) { mw_gate_close(db, hl); closed = true; }      // (the next attempt runs against a frozen state)

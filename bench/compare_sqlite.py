@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Multi-Writer vs stock SQLite (WAL, synchronous=FULL), bulk inserts of 100 rows per transaction, every run on a fresh database.
 usage: compare_sqlite.py threads|procs <out.jsonl> [duration] [points...]
-Variants: mw (Multi-Writer with the CRDT capture on: every table tracked; the engine of one process for threads, the shared multi-process mode for processes), mw0 (the same engine without the capture), sqlite (stock WAL, busy_timeout 0: the application retries a refused transaction with jittered backoff, retries are counted), sqlite60 (busy_timeout 60 s: the library waits inside the call, the application sees no
+Variants: mw (Multi-Writer, a commit that conflicts on pages is refused and the application retries it; the engine of one process for threads, the shared multi-process mode for processes), mwr (the same engine with the rebase: URI mw_rebase=1), sqlite (stock WAL, busy_timeout 0: the application retries a refused transaction with jittered backoff, retries are counted), sqlite60 (busy_timeout 60 s: the library waits inside the call, the application sees no
 retry).
 Measures per run: tx/s, retries, transactions that gave up, the time a transaction waits before its write may start (first attempt -> BEGIN IMMEDIATE + first
 read done: for SQLite that is the write lock, for Multi-Writer the admission), latency, memory (per-process RSS; for processes also the system-wide growth of
@@ -12,7 +12,7 @@ BIN = os.environ.get("BIN", "dist/mw_bench")
 kind, out = sys.argv[1], sys.argv[2]
 DUR = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 points = [int(x) for x in sys.argv[4:]] or ([1, 2, 4, 8, 16, 32, 64] if kind == "threads" else [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000])
-VARIANTS = {"mw": ("multiwriter", ["--tracked", "1"]), "mw0": ("multiwriter", ["--tracked", "0"]), "sqlite": ("stock-wal", ["--busy-ms", "0"]), "sqlite60": ("stock-wal", [])}
+VARIANTS = {"mw": ("multiwriter", ["--rebase", "0"]), "mwr": ("multiwriter", ["--rebase", "1"]), "sqlite": ("stock-wal", ["--busy-ms", "0"]), "sqlite60": ("stock-wal", [])}
 ONLY = os.environ.get("VARIANTS", "mw,sqlite").split(",")
 
 def vm():

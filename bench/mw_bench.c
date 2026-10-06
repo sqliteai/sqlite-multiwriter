@@ -5,21 +5,21 @@
 //
 //   mw_bench --mode stock|stock-wal|multiwriter --workload W --agents N --duration S
 //            [--warmup S] [--seed K] [--rows R] [--threads T] [--sync off|normal|full] [--read-pct P]
-//            [--tracked 0|1] [--csv file] [--think-us U]
+//            [--rebase 0|1] [--csv file] [--think-us U]
 //
 // An "agent" is one independent SQLite connection. Agents are multiplexed over T OS threads (default
 // min(agents, 2*cores)): each thread round-robins its agents, one transaction per turn. With 1000 agents,
 // one OS thread per agent would measure the scheduler instead of SQLite; 1000 connection states are kept
 // alive regardless. Workloads (see docs/multiwriter.md, "Benchmarks"):
-//   independent   A/B  own row per agent, one row per page             (untracked)
+//   independent   A/B  own row per agent, one row per page             
 //   readonly      A    random primary-key reads
-//   samepage      C    own row per agent, rows share pages             (sqlite-sync tracked)
-//   cols          D    agents update different columns of shared rows  (tracked)
-//   samecol       E    all agents update one column of one row         (tracked)
-//   crdtinsert    F    unique-key inserts into a tracked table         (tracked)
+//   samepage      C    own row per agent, rows share pages             
+//   cols          D    agents update different columns of shared rows  
+//   samecol       E    all agents update one column of one row         
+//   crdtinsert    F    unique-key inserts into the table ct         
 //   mixed         G    read-pct% reads / rest writes on own rows
 //   longtx        H    several reads, then one write
-//   hot           I    4 hot rows of a tracked table (true conflicts: UPDATE ct SET a=a+1)
+//   hot           I    4 hot rows of the table ct (true conflicts: UPDATE ct SET a=a+1)
 //   bulk          -    100-row INSERT per transaction on disjoint keys (the Turso 0.8 benchmark shape); --poisson-tps N: open-loop arrivals
 //   longreader    J    independent writers + one reader pinning an old snapshot
 //   insert-uuid / insert-int / insert-autoinc   K   concurrent INSERT with different key strategies
@@ -54,7 +54,7 @@ static const char *mode_name[] = { "stock", "stock-wal", "multiwriter" };
 
 static struct {
     bmode_t mode; int wl;
-    int agents, threads, rows, read_pct, warmup, duration, seed, tracked, think_us, busy_ms, begin_wait, mp, setup_only, no_setup, agent_base;
+    int agents, threads, rows, read_pct, warmup, duration, seed, rebase, think_us, busy_ms, begin_wait, mp, setup_only, no_setup, agent_base;
     long long verify_sum;
     const char *sync, *path, *csv;
 } cfg = { M_MW, W_INDEPENDENT, 10, 0, 0, 80, 1, 5, 1, -1, 0, -1, 0, 0, 0, 0, 0, -1, "off", NULL, NULL };
@@ -91,7 +91,7 @@ static char *text_ (sqlite3 *db, const char *sql) {
 static int open_agent (agent_t *a) {
     int rc;
     if (cfg.mode == M_MW) {
-        char uri[600]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=64&mw_mp=%d%s%s", cfg.path, cfg.mp, cfg.tracked ? "&mw_cdc=1" : "", getenv("MW_BENCH_URI_EXTRA") ? getenv("MW_BENCH_URI_EXTRA") : "");
+        char uri[600]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=64&mw_mp=%d%s%s", cfg.path, cfg.mp, cfg.rebase ? "&mw_rebase=1" : "", getenv("MW_BENCH_URI_EXTRA") ? getenv("MW_BENCH_URI_EXTRA") : "");
         rc = sqlite3_open_v2(uri, &a->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX, NULL);
     } else {
         rc = sqlite3_open_v2(cfg.path, &a->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX, "unix");   // no wrapper in the baselines
@@ -308,36 +308,6 @@ static void on_segv (int sig) { void *bt[40]; int n = backtrace(bt, 40); backtra
 #include <signal.h>
 static void crash_bt (int sig) { void *bt[40]; int n = backtrace(bt, 40); fprintf(stderr, "CRASH signal %d\n", sig); backtrace_symbols_fd(bt, n, 2); _exit(139); }
 
-// MW_BENCH_ROWDIFF=2: also keep a per-cell version map (what the persistent version store would hold in memory before it is flushed): one entry per (row, column) changed,
-// open addressing, 16 bytes per slot, under a mutex (the real one would sit behind the publication order). Measures the CPU of the update and the memory it needs.
-static pthread_mutex_t vm_mu = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t *vm_keys; static uint32_t *vm_vals; static size_t vm_cap, vm_n; static uint64_t vm_ns; static uint32_t vm_ver; static int vm_cols = 5;
-static void vm_put (uint64_t key) {
-    if ((vm_n + 1) * 2 > vm_cap) {
-        size_t nc = vm_cap ? vm_cap * 2 : 1 << 16; uint64_t *nk = calloc(nc, sizeof *nk); uint32_t *nv = calloc(nc, sizeof *nv);
-        for (size_t i = 0; i < vm_cap; i++) if (vm_keys[i]) { size_t h = (size_t)(vm_keys[i] * 0x9E3779B97F4A7C15ull >> 20) & (nc - 1); while (nk[h]) h = (h + 1) & (nc - 1); nk[h] = vm_keys[i]; nv[h] = vm_vals[i]; }
-        free(vm_keys); free(vm_vals); vm_keys = nk; vm_vals = nv; vm_cap = nc;
-    }
-    size_t h = (size_t)(key * 0x9E3779B97F4A7C15ull >> 20) & (vm_cap - 1);
-    while (vm_keys[h] && vm_keys[h] != key) h = (h + 1) & (vm_cap - 1);
-    if (!vm_keys[h]) { vm_keys[h] = key; vm_n++; vm_vals[h] = 1; } else vm_vals[h]++;
-}
-static _Atomic uint64_t rd_commits, rd_rows, rd_ns, rd_pages, rd_opaque, rd_maxns;
-static void rd_sink (void *arg, const mw_rowchg *c, int n, const mw_rowdiff_info *info) {      // MW_BENCH_ROWDIFF=1: what the row-level decoding of every commit would cost (docs §51)
-    (void)arg; (void)c;
-    atomic_fetch_add(&rd_commits, 1); atomic_fetch_add(&rd_rows, (uint64_t)n); atomic_fetch_add(&rd_ns, info->ns); atomic_fetch_add(&rd_pages, (uint64_t)info->pages); atomic_fetch_add(&rd_opaque, (uint64_t)info->opaque);
-    uint64_t m = atomic_load(&rd_maxns); while (info->ns > m && !atomic_compare_exchange_weak(&rd_maxns, &m, info->ns)) {}
-    if (getenv("MW_BENCH_ROWDIFF") && getenv("MW_BENCH_ROWDIFF")[0] == '2') {
-        uint64_t t0 = now_ns();
-        pthread_mutex_lock(&vm_mu);
-        for (int i = 0; i < n; i++) {
-            if (c[i].kind == 3) { vm_put(((uint64_t)c[i].rowid << 6) | 63); continue; }                                                // (a tombstone)
-            for (int col = 0; col < vm_cols; col++) if (c[i].kind == 1 || (c[i].changed >> col & 1)) vm_put(((uint64_t)c[i].rowid << 6) | (uint64_t)col);
-        }
-        pthread_mutex_unlock(&vm_mu);
-        vm_ns += now_ns() - t0;
-    }
-}
 int main (int argc, char **argv) {
     if (getenv("MW_BENCH_BT")) { signal(SIGBUS, crash_bt); signal(SIGSEGV, crash_bt); }
     if (getenv("MW_BT")) { signal(SIGSEGV, on_segv); signal(SIGBUS, on_segv); }
@@ -352,7 +322,7 @@ int main (int argc, char **argv) {
         else if ARG("--seed") cfg.seed = atoi(argv[++i]);
         else if ARG("--rows") cfg.rows = atoi(argv[++i]);
         else if ARG("--read-pct") cfg.read_pct = atoi(argv[++i]);
-        else if ARG("--tracked") cfg.tracked = atoi(argv[++i]);
+        else if ARG("--rebase") cfg.rebase = atoi(argv[++i]);
         else if ARG("--mp") cfg.mp = atoi(argv[++i]);
         else if ARG("--path") cfg.path = argv[++i];
         else if (!strcmp(argv[i], "--setup-only")) cfg.setup_only = 1;
@@ -373,9 +343,6 @@ int main (int argc, char **argv) {
             if (cfg.wl < 0) die("unknown workload");
         } else die("unknown argument");
     }
-    bool tracked_wl = cfg.wl == W_SAMEPAGE || cfg.wl == W_HOT || cfg.wl == W_COLS || cfg.wl == W_SAMECOL || cfg.wl == W_CRDTINSERT || cfg.wl == W_SLOWHOT || cfg.wl == W_SLOWPAGE;
-    if (cfg.tracked < 0) cfg.tracked = tracked_wl ? 1 : 0;
-    if (tracked_wl && !cfg.tracked) die("this workload needs --tracked 1");
     long cores = sysconf(_SC_NPROCESSORS_ONLN);
     if (cfg.threads <= 0) cfg.threads = cfg.agents < 2 * cores ? cfg.agents : (int)(2 * cores);
     if (cfg.rows < cfg.agents + 1) cfg.rows = cfg.agents + 1;
@@ -388,7 +355,7 @@ int main (int argc, char **argv) {
     int64_t ct_rows0 = 0;
     char sql[700];
     if (!cfg.no_setup && cfg.verify_sum < 0) {
-    // ---- setup with a stock connection. Untracked: t = one row per page (3000-byte pad). Tracked: ct with 4 int columns, small rows.
+    // ---- setup with a stock connection. t = one row per page (3000-byte pad); ct = 4 int columns, small rows.
     sqlite3 *s;
     if (sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix") != SQLITE_OK) die("setup open");
     exec_(s, cfg.mode == M_STOCK ? "PRAGMA journal_mode=DELETE" : "PRAGMA journal_mode=WAL");
@@ -398,14 +365,14 @@ int main (int argc, char **argv) {
     exec_(s, (getenv("MW_BENCH_TRACK_BK") || getenv("MW_BENCH_BK_TEXT")) ? "CREATE TABLE bk(id TEXT PRIMARY KEY NOT NULL, v TEXT)" : "CREATE TABLE bk(id INTEGER PRIMARY KEY, v TEXT)");
     exec_(s, "CREATE TABLE bkw(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, d INTEGER, v TEXT)");
     exec_(s, "CREATE TABLE tu(id TEXT PRIMARY KEY, v INTEGER); CREATE TABLE ti(id INTEGER PRIMARY KEY, v INTEGER); CREATE TABLE ta(id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)");
-    if (cfg.tracked) {
+    {
         exec_(s, "CREATE TABLE ct(id TEXT PRIMARY KEY NOT NULL, a INTEGER, b INTEGER, c INTEGER, d INTEGER, pad TEXT)");
         snprintf(sql, sizeof sql, "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<%d) INSERT INTO ct SELECT 'r'||i, 0, 0, 0, 0, 'p' FROM n", cfg.rows);
         exec_(s, sql);
     }
     if (cfg.wl == W_LONGREADER) { /* t has cfg.rows rows */ }
     int64_t seed_rows = scalar_(s, "SELECT count(*) FROM tu") + scalar_(s, "SELECT count(*) FROM ti") + scalar_(s, "SELECT count(*) FROM ta");
-    ct_rows0 = cfg.tracked ? scalar_(s, "SELECT count(*) FROM ct") : 0;
+    ct_rows0 = scalar_(s, "SELECT count(*) FROM ct");
     sqlite3_close(s);
     (void)seed_rows;
     if (cfg.setup_only) { printf("setup done: %s rows=%d\n", path, cfg.rows); return 0; }
@@ -432,13 +399,12 @@ int main (int argc, char **argv) {
         { int orc = open_agent(&agents[i]); if (orc != SQLITE_OK) { fprintf(stderr, "agent open rc=%d %s\n", orc, agents[i].db ? sqlite3_errmsg(agents[i].db) : ""); die("agent open"); } }
     }
     static const char *pragmas[] = { "journal_mode", "synchronous", "page_size", "cache_size", "mmap_size", "locking_mode", "wal_autocheckpoint", "busy_timeout", "auto_vacuum", "temp_store" };
-    printf("== mw_bench: mode=%s workload=%s agents=%d threads=%d duration=%ds warmup=%ds seed=%d rows=%d tracked=%d read_pct=%d\n",
-           mode_name[cfg.mode], wl_name[cfg.wl], cfg.agents, cfg.threads, cfg.duration, cfg.warmup, cfg.seed, cfg.rows, cfg.tracked, cfg.read_pct);
+    printf("== mw_bench: mode=%s workload=%s agents=%d threads=%d duration=%ds warmup=%ds seed=%d rows=%d rebase=%d read_pct=%d\n",
+           mode_name[cfg.mode], wl_name[cfg.wl], cfg.agents, cfg.threads, cfg.duration, cfg.warmup, cfg.seed, cfg.rows, cfg.rebase, cfg.read_pct);
     printf("   sqlite %s cores=%ld  PRAGMAs (as read back from an agent connection):", sqlite3_libversion(), cores);
     for (unsigned i = 0; i < sizeof pragmas / sizeof pragmas[0]; i++) { char q[64]; snprintf(q, sizeof q, "PRAGMA %s", pragmas[i]); printf(" %s=%s", pragmas[i], text_(agents[0].db, q)); }
     printf("%s\n", cfg.mode == M_MW ? "\n   (Multi-Writer: durable commit log fsynced per commit batch when synchronous>=FULL; mmap forced off; cold page cache per transaction)" : "");
 
-    if (getenv("MW_BENCH_ROWDIFF")) { mw_rowdiff_set_sink(rd_sink, NULL); if (getenv("MW_BENCH_ROWDIFF_COLS")) vm_cols = atoi(getenv("MW_BENCH_ROWDIFF_COLS")); }
     thread_t *th = calloc((size_t)cfg.threads, sizeof(thread_t));
     for (int i = 0; i < cfg.threads; i++) th[i].agents = calloc((size_t)(cfg.agents / cfg.threads + 2), sizeof(agent_t));
     for (int i = 0; i < cfg.agents; i++) { thread_t *t = &th[i % cfg.threads]; t->agents[t->n++] = agents[i]; }
@@ -566,22 +532,20 @@ int main (int argc, char **argv) {
     { extern void mw_reloc_dump(void); if (getenv("MW_DEBUG") || getenv("MW_TIMING")) mw_reloc_dump(); }
     uint64_t dcommits = m1.commits - m0.commits;
     if (cfg.mode == M_MW) {
-        printf("   mw: commits=%llu fast=%llu page_conflicts=%llu read_conflicts=%llu rebases=%llu rebase_retries=%llu max_rebase_attempts=%llu pk_collisions=%llu relocations=%llu reads_saved=%llu merges=%llu\n",
+        printf("   mw: commits=%llu fast=%llu page_conflicts=%llu read_conflicts=%llu rebases=%llu rebase_retries=%llu max_rebase_attempts=%llu relocations=%llu reads_saved=%llu merges=%llu\n",
                (unsigned long long)dcommits, (unsigned long long)(m1.fast_commits - m0.fast_commits), (unsigned long long)(m1.page_conflicts - m0.page_conflicts),
                (unsigned long long)(m1.read_conflicts - m0.read_conflicts), (unsigned long long)(m1.rebases - m0.rebases), (unsigned long long)(m1.rebase_retries - m0.rebase_retries),
-               (unsigned long long)m1.rebase_max_attempts, (unsigned long long)(m1.pk_collisions - m0.pk_collisions), (unsigned long long)(m1.relocations - m0.relocations), (unsigned long long)(m1.reads_saved - m0.reads_saved), (unsigned long long)(m1.merges - m0.merges));
+               (unsigned long long)m1.rebase_max_attempts, (unsigned long long)(m1.relocations - m0.relocations), (unsigned long long)(m1.reads_saved - m0.reads_saved), (unsigned long long)(m1.merges - m0.merges));
         printf("   mw: compaction: %llu runs, %.0f ms busy, %llu pages written (%.1f per commit), log now %.1f MB\n", (unsigned long long)(m1.compactions - m0.compactions), (double)(m1.compaction_ns - m0.compaction_ns) / 1e6, (unsigned long long)(m1.compacted_pages - m0.compacted_pages), dcommits ? (double)(m1.compacted_pages - m0.compacted_pages) / (double)dcommits : 0.0, (double)m1.log_bytes / 1048576.0);
         printf("   mw: pages/commit=%.2f fsync_ms=%.1f rebase_ms=%.1f  versions=%llu retained=%.1f MB reclaimed=%llu gc_runs=%llu gc_ms=%.2f oldest_snapshot=%llu epoch=%llu backlog=%llu\n",
                dcommits ? (double)(m1.pages_published - m0.pages_published) / (double)dcommits : 0.0, (double)(m1.log_sync_ns - m0.log_sync_ns) / 1e6, (double)(m1.rebase_ns - m0.rebase_ns) / 1e6,
                (unsigned long long)m1.page_versions, (double)m1.bytes_retained / 1048576.0, (unsigned long long)(m1.versions_reclaimed - m0.versions_reclaimed),
                (unsigned long long)(m1.gc_runs - m0.gc_runs), (double)(m1.gc_ns - m0.gc_ns) / 1e6, (unsigned long long)m1.oldest_active_snapshot, (unsigned long long)m1.epoch, (unsigned long long)m1.compaction_backlog);
     }
-    if (getenv("MW_BENCH_ROWDIFF") && getenv("MW_BENCH_ROWDIFF")[0] == '2' && rd_commits) printf("   version map: %zu cells, %.1f MB (%.0f bytes per cell), update %.2f us per commit\n", vm_n, (double)vm_cap * 12.0 / 1048576.0, vm_n ? (double)vm_cap * 12.0 / (double)vm_n : 0.0, (double)vm_ns / (double)rd_commits / 1000.0);
-    if (getenv("MW_BENCH_ROWDIFF") && rd_commits) printf("   rowdiff: %llu commits, %.1f pages and %.1f rows per commit, decoding %.1f us per commit (max %.0f us), commits with overflow/freelist pages %llu\n", (unsigned long long)rd_commits, (double)rd_pages / (double)rd_commits, (double)rd_rows / (double)rd_commits, (double)rd_ns / (double)rd_commits / 1000.0, (double)rd_maxns / 1000.0, (unsigned long long)rd_opaque);
-    printf("JSON {\"mode\":\"%s\",\"workload\":\"%s\",\"agents\":%d,\"threads\":%d,\"duration\":%.2f,\"sync\":\"%s\",\"tracked\":%d,\"seed\":%d,\"valid\":%d,\"tx_per_s\":%.1f,\"writes_per_s\":%.1f,\"reads_per_s\":%.1f,"
+    printf("JSON {\"mode\":\"%s\",\"workload\":\"%s\",\"agents\":%d,\"threads\":%d,\"duration\":%.2f,\"sync\":\"%s\",\"rebase\":%d,\"seed\":%d,\"valid\":%d,\"tx_per_s\":%.1f,\"writes_per_s\":%.1f,\"reads_per_s\":%.1f,"
            "\"busy\":%llu,\"errors\":%llu,\"p50_us\":%.1f,\"p95_us\":%.1f,\"p99_us\":%.1f,\"p999_us\":%.1f,\"max_us\":%.1f,\"cpu_s\":%.2f,\"rss_mb\":%.0f,\"db_mb\":%.2f,\"wal_mb\":%.2f,\"log_mb\":%.2f,"
            "\"wait_mean_us\":%.1f,\"wait_p50_us\":%.1f,\"wait_p99_us\":%.1f,\"wait_max_us\":%.1f,\"mw_fast\":%llu,\"mw_page_conflicts\":%llu,\"mw_read_conflicts\":%llu,\"mw_rebases\":%llu,\"mw_rebase_retries\":%llu,\"mw_versions\":%llu,\"mw_retained_mb\":%.2f,\"mw_reclaimed\":%llu,\"mw_gc_ms\":%.2f,\"mw_pages_per_commit\":%.2f,\"committed\":%llu}\n",
-           mode_name[cfg.mode], wl_name[cfg.wl], cfg.agents, cfg.threads, secs, cfg.sync, cfg.tracked, cfg.seed, valid, (double)(reads + writes) / secs, (double)writes / secs, (double)reads / secs,
+           mode_name[cfg.mode], wl_name[cfg.wl], cfg.agents, cfg.threads, secs, cfg.sync, cfg.rebase, cfg.seed, valid, (double)(reads + writes) / secs, (double)writes / secs, (double)reads / secs,
            (unsigned long long)busy, (unsigned long long)errors, PCT(0.50), PCT(0.95), PCT(0.99), PCT(0.999), total ? all[total - 1] / 1000.0 : 0.0, cpu, rss_mb,
            (double)db_bytes / 1048576.0, (double)wal_size / 1048576.0, (double)log_size / 1048576.0,
            w_mean, w_p50, w_p99, w_max, (unsigned long long)(m1.fast_commits - m0.fast_commits), (unsigned long long)(m1.page_conflicts - m0.page_conflicts), (unsigned long long)(m1.read_conflicts - m0.read_conflicts),
@@ -591,9 +555,9 @@ int main (int argc, char **argv) {
         bool fresh = access(cfg.csv, F_OK) != 0;
         FILE *f = fopen(cfg.csv, "a");
         if (f) {
-            if (fresh) fprintf(f, "mode,workload,agents,threads,sync,tracked,seed,valid,tx_per_s,writes_per_s,reads_per_s,busy,errors,p50_us,p95_us,p99_us,max_us,cpu_s,rss_mb,db_mb,wal_mb,log_mb,mw_fast,mw_page_conflicts,mw_read_conflicts,mw_rebases,mw_rebase_retries,mw_versions,mw_retained_mb,mw_reclaimed,mw_gc_ms,mw_pages_per_commit\n");
+            if (fresh) fprintf(f, "mode,workload,agents,threads,sync,rebase,seed,valid,tx_per_s,writes_per_s,reads_per_s,busy,errors,p50_us,p95_us,p99_us,max_us,cpu_s,rss_mb,db_mb,wal_mb,log_mb,mw_fast,mw_page_conflicts,mw_read_conflicts,mw_rebases,mw_rebase_retries,mw_versions,mw_retained_mb,mw_reclaimed,mw_gc_ms,mw_pages_per_commit\n");
             fprintf(f, "%s,%s,%d,%d,%s,%d,%d,%d,%.1f,%.1f,%.1f,%llu,%llu,%.1f,%.1f,%.1f,%.1f,%.2f,%.0f,%.2f,%.2f,%.2f,%llu,%llu,%llu,%llu,%llu,%llu,%.2f,%llu,%.2f,%.2f\n",
-                    mode_name[cfg.mode], wl_name[cfg.wl], cfg.agents, cfg.threads, cfg.sync, cfg.tracked, cfg.seed, valid, (double)(reads + writes) / secs, (double)writes / secs, (double)reads / secs,
+                    mode_name[cfg.mode], wl_name[cfg.wl], cfg.agents, cfg.threads, cfg.sync, cfg.rebase, cfg.seed, valid, (double)(reads + writes) / secs, (double)writes / secs, (double)reads / secs,
                     (unsigned long long)busy, (unsigned long long)errors, PCT(0.50), PCT(0.95), PCT(0.99), total ? all[total - 1] / 1000.0 : 0.0, cpu, rss_mb,
                     (double)db_bytes / 1048576.0, (double)wal_size / 1048576.0, (double)log_size / 1048576.0,
                     (unsigned long long)(m1.fast_commits - m0.fast_commits), (unsigned long long)(m1.page_conflicts - m0.page_conflicts), (unsigned long long)(m1.read_conflicts - m0.read_conflicts),

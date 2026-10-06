@@ -119,10 +119,9 @@ static int lane_publish (mw_lane *lane) {
         atomic_fetch_add(&db->inflight, 1);
         if (!atomic_load(&db->recovering)) break;
         atomic_fetch_sub(&db->inflight, 1);                                  // (a recovery is running: it stops the threads of the metadata store, so those must not wait for it)
-        if (lane->sys) return SQLITE_IOERR;                                 // (an error, not a busy: the loops of the store retry a busy for ever, and the recovery waits for them to stop)
         for (int i = 0; i < 5000 && atomic_load(&db->recovering); i++) usleep(1000);
     }
-    if (atomic_load(&db->failed) && !db->mp && !lane->sys) (void)mw_db_recover(db);
+    if (atomic_load(&db->failed) && !db->mp) (void)mw_db_recover(db);
     int rc = lane_publish_inner(lane);
     atomic_fetch_sub(&db->inflight, 1);
     return rc;
@@ -169,7 +168,7 @@ static int lane_publish_inner (mw_lane *lane) {
     // Multi-process: ONE round of the publication lock per commit. The plain attempt, and the relocation if it is refused because other commits extended the file, both run
     // inside the same hold (the relocation is prepared against the state it publishes on), instead of queueing again for the relocation: with N processes every wait for the
     // lock is long, somebody commits meanwhile and the prepared relocation would be refused again (3.7 lock rounds per commit at 128 processes, 335 us of lock per commit).
-    // The rebase (tracked tables) replays SQL and runs without the lock.
+    // The rebase replays the row changes of the transaction and runs without the lock.
     bool mp_hold = db->mp && !(lane->rs_overflow && lane->readcheck);
     if (mp_hold) { mw_lane_reloc_prepare(lane, lane->ws_pgnos, imgs, lane->ws_n, lane->ws_dbsize, snap_size); if (lane->prep_delay_us > 0 && lane->rprep) usleep((useconds_t)lane->prep_delay_us); }       // (the private copies of the relocation that the commit most likely needs: made before the lock)
     if (mp_hold) {                                                // (what does not depend on the state of the others is made before the lock: the hashes of the pages of the record)
@@ -207,8 +206,7 @@ static int lane_publish_inner (mw_lane *lane) {
         }
         else if (rr != MW_RELOC_NA) rc = rr;
         else if (lane_can_rebase(lane, pg1, cookie)) {
-            // 2. Physical conflict, but the transaction is fully described by sqlite-sync changes:
-            // discard its pages and replay them at the latest snapshot; stock SQLite regenerates the pages.
+            // 2. Physical conflict only on pages that it wrote (mw_rebase=1): discard its pages and replay its row changes at the latest snapshot; stock SQLite regenerates the pages.
             if (!long_tx) lane->retry_credit = lane->hot_credit;      // a physical conflict: run the next transactions serialised, on the fast path (not the long ones, see above)
             rc = mw_lane_rebase(lane, imgs, cookie, &epoch);
             if (rc == SQLITE_OK) { lane->tx.state = MW_TX_COMMITTED; lane->consec_aborts = 0; }   // commit_epoch was set by the rebase (the credit granted above is spent by the next commits)

@@ -86,10 +86,9 @@ static int mw_close (sqlite3_file *pf) {
     if (f->lane) {
         mw_lane_snapshot_end(f->lane);
         mw_db *db = f->lane->db;
-        bool sys = f->lane->sys;
         mw_lane_free(f->lane);
         f->lane = NULL;
-        mw_db_release_ex(db, sys);
+        mw_db_release(db);
     }
     int rc = f->real->pMethods ? f->real->pMethods->xClose(f->real) : SQLITE_OK;
     f->base.pMethods = NULL;
@@ -230,11 +229,10 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         if (mpmode == 1) mpmode = getenv("MW_MP_PRIVATE") ? 3 : 2;       // shared version index + segmented log is the default; MW_MP_PRIVATE=1 selects the private-store mode (docs §44)
         if (mpmode == 3) mpmode = 1;
         if (mpmode < 0 || mpmode > 2) mpmode = mpmode ? 1 : 0;
-        const bool want_sys = sqlite3_uri_boolean(name, "mw_sys", 0) && mode >= 2;
-        mw_db *db = mw_db_acquire(name, mode, mpmode, want_sys);
+        mw_db *db = mw_db_acquire(name, mode, mpmode);
         mw_lane *lane = db ? sqlite3_malloc(sizeof(mw_lane)) : NULL;
         if (!lane) {
-            mw_db_release_ex(db, want_sys);
+            mw_db_release(db);
             f->real->pMethods->xClose(f->real);
             f->base.pMethods = NULL;
             return SQLITE_NOMEM;
@@ -249,7 +247,6 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         if (small && !sqlite3_uri_parameter(name, "mw_log_max_mb")) db->log_max_bytes = 16ull << 20;
         lane->norebase = sqlite3_uri_boolean(name, "mw_norebase", 0) != 0;
         lane->rebase_on = sqlite3_uri_boolean(name, "mw_rebase", 0) != 0 && !lane->norebase;
-        if (want_sys) lane->sys = true;
         lane->noreloc = sqlite3_uri_boolean(name, "mw_noreloc", 0) != 0;
         lane->noroute = sqlite3_uri_boolean(name, "mw_noroute", 0) != 0;
         lane->nomerge = sqlite3_uri_boolean(name, "mw_nomerge", 0) != 0;
@@ -276,7 +273,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
             if (rc != SQLITE_OK) {
                 f->lane = NULL;
                 mw_lane_free(lane);
-                mw_db_release_ex(db, want_sys);
+                mw_db_release(db);
                 f->real->pMethods->xClose(f->real);
                 f->base.pMethods = NULL;
                 return rc;

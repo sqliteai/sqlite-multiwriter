@@ -1,5 +1,5 @@
 // Phase 8: fast commit + page-level conflict detection. A conflicting commit is refused with a
-// retryable SQLITE_BUSY_SNAPSHOT (CRDT rebase replaces this in phase 10).
+// retryable SQLITE_BUSY_SNAPSHOT (the rebase, mw_rebase=1, saves some of them).
 #include <pthread.h>
 #include "mw_test.h"
 #include "multiwriter.h"

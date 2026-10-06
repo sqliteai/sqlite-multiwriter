@@ -2,12 +2,12 @@
 //  multiwriter.h
 //  sqlite-multiwriter
 //
-//  Experimental Multi-Writer mode for SQLite (compile-time: CLOUDSYNC_MULTIWRITER).
+//  Multi-Writer SQLite as a wrapper VFS.
 //  See docs/multiwriter.md. Not part of the normal SQLite/PostgreSQL builds.
 //
 
-#ifndef __CLOUDSYNC_MULTIWRITER__
-#define __CLOUDSYNC_MULTIWRITER__
+#ifndef MW_H
+#define MW_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -36,7 +36,7 @@ typedef enum { MW_TX_NONE = 0, MW_TX_ACTIVE, MW_TX_PREPARED, MW_TX_COMMITTED, MW
 
 typedef struct {
     uint64_t    tx_id;              // unique per transaction, per database, per process run
-    uint64_t    writer_id;          // the connection's lane; distinct from the sqlite-sync site_id
+    uint64_t    writer_id;          // the connection's lane
     uint64_t    snapshot_epoch;     // committed epoch this transaction reads from
     uint64_t    commit_epoch;       // epoch assigned at publication (0 while unpublished / read-only)
     uint32_t    schema_generation;

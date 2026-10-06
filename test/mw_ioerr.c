@@ -18,7 +18,7 @@
 #include "mw_test.h"
 #include "multiwriter.h"
 
-static int open_cdc (const char *path, sqlite3 **db, bool shared) {
+static int open_db (const char *path, sqlite3 **db, bool shared) {
     char uri[400]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_log_max_mb=1%s", path, shared ? "&mw_mp=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
@@ -36,7 +36,7 @@ static void make_db (const char *path) {
     sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, s TEXT)"), SQLITE_OK);
     sqlite3_close(s);
-    sqlite3 *db; CHECK_RC(open_cdc(path, &db, false), SQLITE_OK);
+    sqlite3 *db; CHECK_RC(open_db(path, &db, false), SQLITE_OK);
     CHECK_RC(mw_exec(db, "BEGIN"), SQLITE_OK);
     for (int i = 1; i <= NROWS; i++) { char q[100]; snprintf(q, sizeof q, "INSERT INTO t VALUES(%d, 0, NULL)", i); mw_exec(db, q); }
     CHECK_RC(mw_exec(db, "COMMIT"), SQLITE_OK);
@@ -60,7 +60,7 @@ static void child_run (const char *path, bool shared, const scenario *sc, long n
     setenv("MW_ENOSPC_WAIT_MS", sc->recover == 3 ? "2000" : "0", 1);                              // (no waiting for room: the scenarios look at what a failed write does)
     mw_io_fault_arm(sc->kinds, nth, sc->err, sc->sticky, sc->shortw);
     sqlite3 *db = NULL;
-    if (open_cdc(path, &db, shared) == SQLITE_OK) {
+    if (open_db(path, &db, shared) == SQLITE_OK) {
         unsigned rng = 99u;
         for (int i = 1; i <= NTXN && (failures < 25 || sc->recover); i++) {
             char sql[200]; rng = rng * 1103515245u + 12345u; int a = 1 + (int)(rng >> 16) % NROWS; rng = rng * 1103515245u + 12345u; int b = 1 + (int)(rng >> 16) % NROWS; if (a == b) continue;
@@ -93,7 +93,7 @@ static long run_once (const char *path, bool shared, const scenario *sc, long nt
 
 // the parent's check, with no fault armed
 static void verify (const char *path, bool shared, int acked, const char *what, long nth) {
-    sqlite3 *r; int rc = open_cdc(path, &r, shared);
+    sqlite3 *r; int rc = open_db(path, &r, shared);
     if (rc != SQLITE_OK) { printf("FAIL %s n=%ld: cannot open the database again (%d)\n", what, nth, rc); mw_failures++; return; }
     int64_t sum; int rows; int bad = check_rows(r, &sum, &rows);
     if (bad != 0 || rows != NROWS || (sum & 1) || sum < 2 * acked) {

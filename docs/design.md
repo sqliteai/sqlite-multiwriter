@@ -200,18 +200,18 @@ capture any more. The throughput of the processes mode is bounded by the publica
 
 | workload | no rebase | rebase | SQLite |
 |---|---|---|---|
-| hot rows, thread 16 | 33644 (50164 retries) | 28836 (25180 retries) | 14991 (26891 retries) |
-| hot rows, thread 64 | 30317 (246581 retries) | 13759 (11346 retries) | 15572 (120178 retries) |
-| hot rows, processes 16 | 42457 (404154 retries) | 34454 (333477 retries) | 14457 (26745 retries) |
-| same page, thread 16 | 31896 (48736 retries) | 28502 (23809 retries) | 15672 (27181 retries) |
-| same page, thread 64 | 31335 (249893 retries) | 13589 (11901 retries) | 15655 (120550 retries) |
-| same page, processes 16 | 42346 (400847 retries) | 16609 (185875 retries) | 15253 (28209 retries) |
-| columns, thread 16 | 27863 (44063 retries) | 29012 (24855 retries) | 15478 (28386 retries) |
-| columns, thread 64 | 30503 (243482 retries) | 13610 (11747 retries) | 15003 (119473 retries) |
-| columns, processes 16 | 42209 (391700 retries) | 34415 (290255 retries) | 14157 (26351 retries) |
-| unique inserts, thread 16 | 30032 (43936 retries) | 25811 (53564 retries) | 20611 (150207 retries) |
-| unique inserts, thread 64 | 26870 (245742 retries) | 12825 (12985 retries) | 5497 (144230 retries) |
-| unique inserts, processes 16 | 36221 (302440 retries) | 33669 (347782 retries) | 5128 (50297 retries) |
+| hot rows, 16 threads | 33644 (50164 retries) | 28836 (25180 retries) | 14991 (26891 retries) |
+| hot rows, 64 threads | 30317 (246581 retries) | 13759 (11346 retries) | 15572 (120178 retries) |
+| hot rows, 16 processes | 42457 (404154 retries) | 34454 (333477 retries) | 14457 (26745 retries) |
+| same page, 16 threads | 31896 (48736 retries) | 28502 (23809 retries) | 15672 (27181 retries) |
+| same page, 64 threads | 31335 (249893 retries) | 13589 (11901 retries) | 15655 (120550 retries) |
+| same page, 16 processes | 42346 (400847 retries) | 16609 (185875 retries) | 15253 (28209 retries) |
+| columns, 16 threads | 27863 (44063 retries) | 29012 (24855 retries) | 15478 (28386 retries) |
+| columns, 64 threads | 30503 (243482 retries) | 13610 (11747 retries) | 15003 (119473 retries) |
+| columns, 16 processes | 42209 (391700 retries) | 34415 (290255 retries) | 14157 (26351 retries) |
+| unique inserts, 16 threads | 30032 (43936 retries) | 25811 (53564 retries) | 20611 (150207 retries) |
+| unique inserts, 64 threads | 26870 (245742 retries) | 12825 (12985 retries) | 5497 (144230 retries) |
+| unique inserts, 16 processes | 36221 (302440 retries) | 33669 (347782 retries) | 5128 (50297 retries) |
 
 What the rebase does and does not do, measured: it removes most of the retries that the application sees (hot rows, 64 threads: 246 thousand refused commits against 11 thousand; same page, 4 processes: 215 thousand against 18 thousand), because the commits
 that conflicted only on pages are saved. It does **not** raise the throughput: with 16 threads it is 0-15% below the engine without it, and with 64 threads (or 16 processes on the same page) it is 2-3 times below, because the replays are serialised per database

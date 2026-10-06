@@ -78,7 +78,7 @@ static void ballast_fill (long leave) {
     if (getenv("MW_VERBOSE")) { char cmd[400]; snprintf(cmd, sizeof cmd, "df -k '%s' | tail -1 >&2", mnt); (void)system(cmd); }
 }
 
-static int open_cdc (const char *path, sqlite3 **db, bool shared) {
+static int open_db (const char *path, sqlite3 **db, bool shared) {
     char uri[600]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_log_max_mb=1%s", path, shared ? "&mw_mp=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
@@ -96,7 +96,7 @@ static void make_db (const char *path) {
     sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, s TEXT); CREATE TABLE big(id INTEGER PRIMARY KEY, v BLOB)"), SQLITE_OK);
     sqlite3_close(s);
-    sqlite3 *db; CHECK_RC(open_cdc(path, &db, false), SQLITE_OK);
+    sqlite3 *db; CHECK_RC(open_db(path, &db, false), SQLITE_OK);
     CHECK_RC(mw_exec(db, "BEGIN"), SQLITE_OK);
     for (int i = 1; i <= NROWS; i++) { char q[100]; snprintf(q, sizeof q, "INSERT INTO t VALUES(%d, 0, NULL)", i); mw_exec(db, q); }
     CHECK_RC(mw_exec(db, "COMMIT"), SQLITE_OK);
@@ -114,7 +114,7 @@ static int check_rows (sqlite3 *db, int64_t *sum, int *rows) {                  
 static void child_run (const char *path, bool shared, int ackfd, int ms_after_fail, int max_txn, const char *gate) {
     alarm(120);
     sqlite3 *db = NULL; int failures = 0, after = 0; bool failed_once = false; struct timespec t_fail = {0};
-    int orc = open_cdc(path, &db, shared);
+    int orc = open_db(path, &db, shared);
     if (orc != SQLITE_OK && getenv("MW_VERBOSE")) fprintf(stderr, "child: open failed: %d %s (errno %d)\n", orc, db ? sqlite3_errmsg(db) : "", db ? sqlite3_system_errno(db) : 0);
     if (orc == SQLITE_OK) {
         if (gate) {                                                       // the parent fills the volume now, with the database open and its maps in place
@@ -143,7 +143,7 @@ static void child_run (const char *path, bool shared, int ackfd, int ms_after_fa
 }
 static void verify (const char *path, bool shared, int acked, const char *what) {
     if (getenv("MW_DF_KEEP")) { char cmd[600]; snprintf(cmd, sizeof cmd, "rm -rf /tmp/dfdump; mkdir -p /tmp/dfdump && cp %s* /tmp/dfdump/ 2>/dev/null; ls -la /tmp/dfdump >&2", path); (void)system(cmd); }
-    sqlite3 *r; int rc = open_cdc(path, &r, shared);
+    sqlite3 *r; int rc = open_db(path, &r, shared);
     if (rc != SQLITE_OK) { printf("FAIL %s: cannot open the database again (%d)\n", what, rc); mw_failures++; return; }
     int64_t sum; int rows; int bad = check_rows(r, &sum, &rows); int64_t nbig = mw_scalar(r, "SELECT count(*) FROM big");
     if (bad != 0 || rows != NROWS || (sum & 1) || sum < 2 * acked || sum != 2 * nbig) {

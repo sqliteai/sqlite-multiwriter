@@ -483,8 +483,7 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     // (e.g. a long-lived reader pins the compaction target)
     if (db->log_max_bytes && log_end > mw_log_limit(db)) {
         mw_db_compactor_kick(db);
-        const bool sys_lane = lane && lane->sys;                                                  // (the connections of the metadata store are what lets the log shrink: they never wait for it)
-        if (log_end > db->log_max_bytes * 16 && !sys_lane) {
+        if (log_end > db->log_max_bytes * 16) {
             // in proportion to the overshoot (a fixed half millisecond does not slow eight writers at all): ratio 1 = 0.5 ms, 2 = 4 ms, 3 = 13 ms, at most 50 ms; the mapping of the
             // log is 1 GB and the compaction can be held back by the metadata flush, so the writers must not outrun it
             atomic_fetch_add(&db->n_backpressure, 1);
@@ -493,9 +492,8 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
             struct timespec ts = { 0, (long)(us * 1000.0) };
             nanosleep(&ts, NULL);
         }
-        // the mapping of the log is 1 GB and the code that reads the log through it does not know of records beyond: past 768 MB a commit waits until the compaction has made room (the compactor and,
-        // with change capture, the flush of the metadata are asked every time round); a compaction that cannot run for 20 s lets the commit through (the writers must not wait for ever)
-        if (log_end > MW_LOG_HARD_BYTES && !sys_lane) {
+        // the mapping of the log is 1 GB and the code that reads the log through it does not know of records beyond: past 768 MB a commit waits until the compaction has made room (the compactor is asked every time round); a compaction that cannot run for 20 s lets the commit through (the writers must not wait for ever)
+        if (log_end > MW_LOG_HARD_BYTES) {
             for (int w = 0; w < 10000; w++) {
                 mw_db_compactor_kick(db);
                 struct timespec ts = { 0, 2000000 }; nanosleep(&ts, NULL);

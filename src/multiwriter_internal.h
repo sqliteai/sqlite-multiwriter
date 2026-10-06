@@ -8,8 +8,8 @@
 //    - epoch / counters are C11 atomics; epoch is only *advanced* under the publication lock.
 //
 
-#ifndef __CLOUDSYNC_MULTIWRITER_INTERNAL__
-#define __CLOUDSYNC_MULTIWRITER_INTERNAL__
+#ifndef MW_INTERNAL_H
+#define MW_INTERNAL_H
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -93,7 +93,6 @@ typedef struct mw_shm {
     _Atomic uint64_t  compact_req_ns;     // shared mode: a process has claimed the next compaction at this time (0 = none; a claim older than 2 s is void)
     _Atomic uint64_t  compact_end_ns;     // when the last compaction ended (periodic compactions of all processes share one interval)
     _Atomic uint64_t  compact_busy_T;     // a compaction is reading versions <= this: the index GC must not free them (0 = none)
-    // the CRDT metadata in shared mode (multiwriter_mmeta.c)
     mw_mp_proc        procs[MW_MP_PROCS];
     mw_mp_slot        slots[MW_MP_SLOTS];
 } mw_shm;
@@ -182,7 +181,6 @@ struct mw_lane {
     size_t      rs_bits_cap;
     uint32_t   *rs_list;
     int         rs_n, rs_cap;
-    bool        sys;            // URI mw_sys=1: a connection of the metadata store itself (not counted as a user of the database)
     bool        norebase;       // this connection is itself a rebase helper: never rebase recursively
     bool        rebase_on;      // URI mw_rebase=1: a commit that conflicts on pages only is replayed at the latest snapshot (multiwriter_rebase.c)
     sqlite3    *rb_db;          // the helper connection that replays (opened at the first rebase)
@@ -257,7 +255,6 @@ struct mw_db {
     char             *path;
     int               mode;             // 1 = lane tracking on the stock WAL, 2 = private lanes
     int               refs;             // protected by the global registry mutex
-    _Atomic int       sys_refs;         // of which connections of the metadata store (flusher, readers)
     mw_db            *next;             // global registry list
     sqlite3_mutex    *mu;               // snapshot registry + lane list
     mw_lane          *active;           // lanes holding a snapshot
@@ -331,7 +328,6 @@ struct mw_db {
     _Atomic int       hot_parked;
     _Atomic int       hot_spinners;
     _Atomic uint64_t  n_hot_serialised;
-    void             *cdc;                 // the per-cell version capture (mw_cdc.c), NULL unless mw_cdc=1
     pthread_mutex_t   rebase_mu;           // one rebase at a time per database (they would only conflict with each other)
     _Atomic uint64_t  n_gate_closures, n_backpressure;
     struct mw_vis_slot *vis;               // visibility ordering: epoch E becomes visible only after E-1; waiters are woken one by one
@@ -342,13 +338,12 @@ struct mw_db {
     _Atomic int       inflight;            // commits inside lane_publish (the recovery of a failed log waits for them to leave)
     _Atomic int       recovering;          // a recovery in place is running
     mw_store         *retired[8]; int nretired;   // stores replaced by a recovery: readers that were inside them may still look (freed with the database)
-    _Atomic bool      open_done;           // the first connection finished opening (a database whose open failed has nothing to flush: no connection of the metadata store is opened for it)
+    _Atomic bool      open_done;           // the first connection finished opening (a database whose open failed has nothing to flush)
     _Atomic int       mp_nprocs;           // processes registered on this database, as last counted by the admission control
     bool              compact_claimed;     // this process holds the compaction claim (shared mode)
     bool              shared;              // multi-process in shared mode (mw_mp=2): shared version index + segmented log, no private store
     struct mw_seglog *sl;                  // the segmented log (shared mode)
     shidx            *ix;                  // the shared version index (shared mode)
-    shidx            *rx;                  // the shared index of the CRDT metadata (row buckets -> where their newest state is in the log; mw_cdc=1)
     bool              mp_stale_owner;      // the header said that the publication lock was held by our own pid when we registered: a process that died with it (repaired once the database is open)
     bool              mp_lazy;             // multi-process catch-up installs lazy versions (set once the database is open; MW_MP_LAZY enables, off by default)
     bool              mp_first;            // this process initialised the shared state
@@ -477,7 +472,6 @@ int       mw_recovered_ext_add (mw_db *db, uint64_t epoch, const uint8_t *ext, u
 int       mw_log_sync (mw_db *db, uint64_t epoch, uint64_t my_end);   // my_end: file offset where this commit's record ends (staged mode)
 int       mw_log_set_base (mw_db *db, uint64_t base_epoch);
 char     *mw_sidecar_path (const char *dbpath, const char *suffix);        // where the files the processes of the shared mode map together live (sqlite3_free the result)
-void      mw_cdc_reset (mw_db *db);                                   // the metadata store forgets its memory table (recovery in place)
 int       mw_db_recover (mw_db *db);                                 // a failed log (single process, staged): roll back to the last durable commit and go on, without a reopen
 int       mw_log_ensure_room (mw_db *db, uint64_t record_size);      // staged log: reserve the disk for the next records before an offset is assigned (SQLITE_FULL when there is no room: nothing was assigned yet)
 void      mw_log_reserve_space (mw_db *db);                          // caller holds store->seq_mu: grow the file ahead of log_off
@@ -536,8 +530,7 @@ void      mw_log_remap_ro (mw_db *db, uint64_t need_end);            // remap wi
 int       mw_log_apply_at (mw_db *db, uint64_t off, uint64_t *out_size, uint64_t *out_epoch);   // install the record at `off` (checksummed)
 
 // registry
-void    mw_db_release_ex (mw_db *db, bool sys);
-mw_db  *mw_db_acquire (const char *path, int mode, int mpmode, bool sys);   // mpmode: 0 single process, 1 multi-process (private stores), 2 multi-process shared mode   // NULL on OOM or if the file is already open in another mode
+mw_db  *mw_db_acquire (const char *path, int mode, int mpmode);   // mpmode: 0 single process, 1 multi-process (private stores), 2 multi-process shared mode   // NULL on OOM or if the file is already open in another mode
 void    mw_db_release (mw_db *db);
 
 // snapshots (multiwriter_tx.c)

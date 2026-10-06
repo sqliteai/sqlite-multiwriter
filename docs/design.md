@@ -112,8 +112,8 @@ WAL cannot be checkpointed) but lets the WAL grow without slowing down. Removing
 
 ## Tests
 
-`make test` (about 40 programs: the page store, lanes, relocation, merge, read dependencies, DDL, savepoints, the log and its recovery, compaction, garbage collection, the shared mode, crashes at every point of the publication, I/O errors,
-the relocation prepared before the lock, the serializability test), `make test-mp` (the transaction tests with `mw_mp=1`), `make test-io` (minutes), `test/sanitize.sh asan|ubsan|tsan [tests]`, a Linux container for all of it
+`make test` (about 35 programs: the page store, lanes, relocation, merge, read dependencies, DDL, savepoints, the log and its recovery, compaction, garbage collection, the shared mode, crashes at every point of the publication, I/O errors,
+the relocation prepared before the lock, the rebase (`mw_rebase`: what is replayed, what is refused and what is never rebased, case by case), the serializability test), `make test-mp` (the transaction tests with `mw_mp=1`), `make test-io` (minutes), `test/sanitize.sh asan|ubsan|tsan [tests]`, a Linux container for all of it
 (`docker run --rm -v "$PWD":/src gcc:14 ...`, `--privileged` for the size-limited tmpfs of `mw_diskfull`), and `test/power/` (loss of power).
 
 - **`mw_serial`: a randomised serializability test.** Eight threads run random transactions (insert, update, delete, a change of a UNIQUE column, growth of a payload that splits and frees pages, a counter) on 12, 200 and 3000 keys; each one
@@ -163,3 +163,57 @@ that reorders writes around a flush. Platforms: macOS and Linux (arm64 tested); 
 ## Third party and license
 
 The code is under `LICENSE.md` (Elastic License 2.0, modified). `third_party/sqlite` is SQLite 3.53.4 (public domain), unchanged. The measurements are in `bench/results/`.
+
+## Measurements (2026-10-06, this Mac, 18 cores, SQLite 3.53.4, `synchronous=FULL`, one run per point of 8-10 s; `bench/results/rebase_*_2026-10-06.jsonl`)
+
+`bench/compare_sqlite.py`: "no rebase" and "rebase" are this engine without and with `mw_rebase=1`; "SQLite" is stock WAL with `busy_timeout 0` and the application retrying a refused transaction (the retries are counted). No transaction failed
+(gave up) in any run. Retries for this engine are refused commits that the application ran again.
+
+**Bulk inserts of 100 rows on disjoint keys, threads**
+
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 1 | 14701 | 0 | 14736 | 0 | 13129 | 0 |
+| 2 | 20574 | 13 | 20969 | 12 | 9813 | 92416 |
+| 4 | 31487 | 65 | 31735 | 54 | 8728 | 113235 |
+| 8 | 38681 | 199 | 38984 | 202 | 8721 | 128246 |
+| 16 | 47474 | 637 | 47602 | 734 | 8443 | 165153 |
+| 32 | 50357 | 1793 | 49927 | 1321 | 8286 | 223580 |
+| 64 | 41610 | 5363 | 40069 | 2578 | 8090 | 342174 |
+
+**The same, processes (`mw_mp=1`)**
+
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 1 | 14379 | 0 | 14321 | 0 | 13188 | 0 |
+| 2 | 20106 | 8 | 20138 | 7 | 9106 | 112889 |
+| 4 | 28380 | 30 | 28525 | 25 | 8839 | 118419 |
+| 8 | 26741 | 89 | 26547 | 102 | 8571 | 131169 |
+| 16 | 24837 | 350 | 24756 | 200 | 8380 | 158287 |
+| 32 | 23008 | 786 | 22704 | 638 | 8042 | 197076 |
+| 64 | 20743 | 903 | 20457 | 433 | 7913 | 285497 |
+
+The rebase changes nothing here (the conflicts are few: the pages are shared by growth of the file, which the relocation saves). With one writer the engine is above SQLite (14.4-14.7k against 13.1k): there is no metadata to
+capture any more. The throughput of the processes mode is bounded by the publication lock (held about 40 us per commit).
+
+**Contended workloads (updates on 4 hot rows; rows that share pages; different columns of shared rows; unique-key inserts into one table), 16 threads / 64 threads / 16 processes**
+
+| workload | no rebase | rebase | SQLite |
+|---|---|---|---|
+| hot rows, thread 16 | 33644 (50164 retries) | 28836 (25180 retries) | 14991 (26891 retries) |
+| hot rows, thread 64 | 30317 (246581 retries) | 13759 (11346 retries) | 15572 (120178 retries) |
+| hot rows, processes 16 | 42457 (404154 retries) | 34454 (333477 retries) | 14457 (26745 retries) |
+| same page, thread 16 | 31896 (48736 retries) | 28502 (23809 retries) | 15672 (27181 retries) |
+| same page, thread 64 | 31335 (249893 retries) | 13589 (11901 retries) | 15655 (120550 retries) |
+| same page, processes 16 | 42346 (400847 retries) | 16609 (185875 retries) | 15253 (28209 retries) |
+| columns, thread 16 | 27863 (44063 retries) | 29012 (24855 retries) | 15478 (28386 retries) |
+| columns, thread 64 | 30503 (243482 retries) | 13610 (11747 retries) | 15003 (119473 retries) |
+| columns, processes 16 | 42209 (391700 retries) | 34415 (290255 retries) | 14157 (26351 retries) |
+| unique inserts, thread 16 | 30032 (43936 retries) | 25811 (53564 retries) | 20611 (150207 retries) |
+| unique inserts, thread 64 | 26870 (245742 retries) | 12825 (12985 retries) | 5497 (144230 retries) |
+| unique inserts, processes 16 | 36221 (302440 retries) | 33669 (347782 retries) | 5128 (50297 retries) |
+
+What the rebase does and does not do, measured: it removes most of the retries that the application sees (hot rows, 64 threads: 246 thousand refused commits against 11 thousand; same page, 4 processes: 215 thousand against 18 thousand), because the commits
+that conflicted only on pages are saved. It does **not** raise the throughput: with 16 threads it is 0-15% below the engine without it, and with 64 threads (or 16 processes on the same page) it is 2-3 times below, because the replays are serialised per database
+(`rebase_mu`) and each one decodes the pages and runs a transaction on a helper connection, which costs more than refusing the commit and running the transaction again at the application's pace. It is for an application that cannot retry, or whose
+retries are costly (a transaction that does a lot before it writes); a faster rebase would need the replays to run in parallel (the conflict checks are per row, the commit of the helper is where they meet).

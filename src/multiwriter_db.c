@@ -60,7 +60,7 @@ mw_db *mw_db_acquire (const char *path, int mode, int mpmode) {
             db->fd_real = -1;
             pthread_mutex_init(&db->log_mu, NULL);
             pthread_mutex_init(&db->compact_mu, NULL);
-            pthread_mutex_init(&db->rebase_mu, NULL);
+            pthread_mutex_init(&db->rb_qmu, NULL); pthread_cond_init(&db->rb_qcv, NULL);
             pthread_mutex_init(&db->hot_mu, NULL);
             pthread_mutex_init(&db->reloc_mu, NULL);
             pthread_cond_init(&db->hot_cv, NULL);
@@ -156,7 +156,7 @@ void mw_db_release (mw_db *db) {
             pthread_mutex_destroy(&db->mp_mu);
         }
         pthread_mutex_destroy(&db->compact_mu);
-        pthread_mutex_destroy(&db->rebase_mu);
+        pthread_mutex_destroy(&db->rb_qmu); pthread_cond_destroy(&db->rb_qcv);
         pthread_mutex_destroy(&db->hot_mu);
         pthread_mutex_destroy(&db->reloc_mu);
         pthread_cond_destroy(&db->hot_cv);

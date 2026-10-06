@@ -1,6 +1,7 @@
 // The rebase (mw_rebase=1): a commit that lost only on pages that it wrote is replayed row by row at the latest snapshot; a true conflict is refused. Two connections of one process, the second commits while
 // the first one is open: deterministic cases of what is replayed, what is refused and what is never rebased. The randomised check that the result is serializable is mw_serial.
 #include <stdbool.h>
+#include <pthread.h>
 #include "mw_test.h"
 #include "multiwriter.h"
 
@@ -35,8 +36,38 @@ static int race (sqlite3 *a, sqlite3 *b, const char *sa, const char *sb) {
     return rc;
 }
 
+// 9. the group replay: threads, each with its own rows on one page, run at once; the replays that queue together commit as one: nothing is lost, and the commits of one epoch have distinct places in it
+static const char *g_path9; enum { T9 = 8, N9 = 150 };
+typedef struct { int id; int ok; uint64_t ep[N9]; uint32_t ord[N9]; } w9_t;
+static void *worker9 (void *arg) {
+    w9_t *w = arg; sqlite3 *db; if (open_mw(g_path9, &db, 1) != SQLITE_OK) { mw_failures++; return NULL; }
+    for (int i = 0; i < N9; i++) {
+        char sql[100]; snprintf(sql, sizeof sql, "UPDATE t SET a = a + 1 WHERE id = %d", 1 + w->id);
+        for (;;) { int rc = mw_exec(db, sql); if (rc == SQLITE_OK) break; if (!is_conflict(rc)) { mw_failures++; sqlite3_close(db); return NULL; } }
+        mw_tx_info ti; memset(&ti, 0, sizeof ti); sqlite3_file_control(db, "main", MW_FCNTL_TXINFO, &ti); w->ep[w->ok] = ti.commit_epoch; w->ord[w->ok++] = ti.commit_order;
+    }
+    sqlite3_close(db); return NULL;
+}
+static int cmp9 (const void *a, const void *b) { const uint64_t *x = a, *y = b; return x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : x[1] < y[1] ? -1 : x[1] > y[1]; }
+
 int main (void) {
     char path[256];
+
+    {
+        mw_tmpdb(path, sizeof path, "rebase9"); make(path, TBL); g_path9 = path;
+        sqlite3 *obs; CHECK_RC(open_mw(path, &obs, 1), SQLITE_OK);
+        pthread_t th[T9]; static w9_t w[T9]; memset(w, 0, sizeof w);
+        for (int i = 0; i < T9; i++) { w[i].id = i; pthread_create(&th[i], NULL, worker9, &w[i]); }
+        for (int i = 0; i < T9; i++) pthread_join(th[i], NULL);
+        mw_db_stats st = stats(obs);
+        int64_t sum = mw_scalar(obs, "SELECT sum(a) FROM t WHERE id <= 8") - 36;
+        static uint64_t keys[T9 * N9][2]; int nk = 0, dup = 0; for (int i = 0; i < T9; i++) for (int k = 0; k < w[i].ok; k++) { keys[nk][0] = w[i].ep[k]; keys[nk][1] = w[i].ord[k]; nk++; }
+        qsort(keys, (size_t)nk, sizeof keys[0], cmp9); for (int i = 1; i < nk; i++) if (keys[i][0] == keys[i - 1][0] && keys[i][1] == keys[i - 1][1] && keys[i][0]) dup++;
+        printf("9. %d threads x %d increments of own rows on one page: sum %lld, rebases %llu of which in groups %llu, lost races %llu, commits with the same epoch and place %d\n", T9, N9, (long long)sum, (unsigned long long)st.rebases, (unsigned long long)st.rebases_grouped, (unsigned long long)st.rebase_retries, dup);
+        CHECK(sum == T9 * N9); CHECK(dup == 0); CHECK(st.rebases > 0); CHECK(st.rebases_grouped > 0); CHECK(integrity_ok(obs));
+        sqlite3_close(obs); mw_rmdb(path);
+    }
+
 
     // 1. different rows of one page: without the rebase the second commit is refused, with it it is replayed and both changes are there
     for (int rebase = 0; rebase <= 1; rebase++) {

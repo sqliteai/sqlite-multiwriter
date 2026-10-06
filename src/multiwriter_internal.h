@@ -273,7 +273,7 @@ struct mw_db {
     _Atomic(mw_lane *) ddl_owner;      //   (written under ddl_mu; read without it by the lanes that start a write: only an optimisation of when they start)
     _Atomic uint64_t  n_commits, n_aborts, n_snapshots;
     int64_t           dbv_counter;      // highest db_version ever reserved (protected by mu)
-    _Atomic uint64_t  n_rebases, n_rebase_retries, n_rebase_max_attempts, n_rebase_ns, n_unrebasable;
+    _Atomic uint64_t  n_rebases, n_rebase_grouped, n_rebase_retries, n_rebase_max_attempts, n_rebase_ns, n_unrebasable;
     uint8_t          *p1_cache;            // the page 1 image the last relocation installed and its epoch: the next one starts from it (reloc_mu)
     uint64_t          p1_cache_epoch;
     pthread_mutex_t   reloc_mu;            // serialises page relocations (they all chase the same end of the file); not held across the log fsync
@@ -330,7 +330,10 @@ struct mw_db {
     _Atomic int       hot_parked;
     _Atomic int       hot_spinners;
     _Atomic uint64_t  n_hot_serialised;
-    pthread_mutex_t   rebase_mu;           // one rebase at a time per database (they would only conflict with each other)
+    pthread_mutex_t   rb_qmu;              // the queue of the rebase (multiwriter_rebase.c): requests waiting for a leader, the leader flag
+    pthread_cond_t    rb_qcv;
+    void             *rb_qhead, *rb_qtail;
+    bool              rb_leader;
     _Atomic uint64_t  n_gate_closures, n_backpressure;
     struct mw_vis_slot *vis;               // visibility ordering: epoch E becomes visible only after E-1; waiters are woken one by one
 

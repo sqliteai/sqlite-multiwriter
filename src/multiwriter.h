@@ -40,6 +40,7 @@ typedef struct {
     uint64_t    snapshot_epoch;     // committed epoch this transaction reads from
     uint64_t    commit_epoch;       // epoch assigned at publication (0 while unpublished / read-only)
     uint32_t    schema_generation;
+    uint32_t    commit_order;       // among the commits that share one epoch (a group replay of the rebase), the place of this one: they are equivalent to a serial execution in this order (0 for any other commit)
     mw_tx_state state;
     int         is_writer;
     uint32_t    ws_pages;           // distinct pages in the physical write set (set at the commit frame)
@@ -68,7 +69,7 @@ typedef struct {
     uint64_t compaction_backlog;    // commits not yet materialised (epoch - base_epoch)
     uint64_t pages_published, log_sync_ns, gate_closures, backpressure_stalls, hot_serialised;
     uint64_t log_bytes, compactions, compaction_ns, compacted_pages, log_syncs;
-    uint64_t rebases, rebase_retries, rebase_max_attempts, rebase_ns, unrebasable, read_conflicts;   // rebases: commits saved by replaying their row changes at the latest snapshot
+    uint64_t rebases, rebases_grouped, rebase_retries, rebase_max_attempts, rebase_ns, unrebasable, read_conflicts;   // rebases: commits saved by replaying their row changes at the latest snapshot
     uint64_t reloc_prep_used, reloc_prep_dropped, reloc_prep_rewrote;   // processes mode: phase 1 of a relocation made before the publication lock: used / thrown away (the plain publication succeeded, or it did not fit) / used with the references rewritten because the end of the file moved meanwhile
     uint64_t relocations;           // commits saved by renumbering their new pages after other commits extended the file
     uint64_t merges;                // interior b-tree pages rewritten by two transactions that were merged instead of refusing the second

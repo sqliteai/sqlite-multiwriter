@@ -178,91 +178,137 @@ static sqlite3_stmt *update_stmt (sqlite3 *h, const mw_tab *t, tstmt *ts, uint64
     return st;
 }
 
-// One replay at the snapshot that the helper has now. SQLITE_OK: committed. MW_CONFLICT: a true conflict (the row changed, a constraint, the schema): refuse. SQLITE_BUSY: lost the race: again.
-static int replay_once (mw_lane *lane, rb_state *R, const mw_rd_result *res, uint32_t cookie, uint64_t *epoch) {
-    sqlite3 *h = lane->rb_db;
-    if (sqlite3_exec(h, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) return SQLITE_BUSY;
-    int rc = MW_CONFLICT;
-    sqlite3_stmt *sv = NULL;
-    if (sqlite3_prepare_v2(h, "PRAGMA schema_version", -1, &sv, NULL) != SQLITE_OK) goto out;
-    if (sqlite3_step(sv) != SQLITE_ROW || (uint32_t)sqlite3_column_int64(sv, 0) != cookie) { sqlite3_finalize(sv); sv = NULL; goto out; }     // (the schema changed meanwhile)
-    sqlite3_finalize(sv); sv = NULL;
+// ---- the group replay ----
+// The replays are serialised, and what is serialised is batched: the connections whose commit conflicted queue a request (their decoded row changes); the first of them becomes the leader, takes everything that is queued
+// (up to MW_REBASE_BATCH), and replays all of it in ONE transaction of its helper connection at the latest snapshot, a savepoint for each request, so that a request that is a true conflict is rolled back alone, and
+// the others commit together at one epoch. The requests are replayed in the order they queued, each one checked against the rows as the ones before it left them: the result is a serial execution in that order
+// (mw_tx_info.commit_order says which, among the commits of one epoch). One commit, one install of the pages, one epoch for all, instead of a lost race and a commit for each.
+#define MW_REBASE_BATCH 64
+typedef struct rb_req { mw_lane *lane; const mw_rd_result *res; uint32_t cookie; int state; bool done; uint64_t epoch; uint32_t order; struct rb_req *next; } rb_req;      // state: 0 waiting, 1 committed, 2 refused (the leader's, provisional until done)
+
+// One request in the open transaction of the helper `h` of the leader: SQLITE_OK replayed, MW_CONFLICT a true conflict (the row changed, a constraint), SQLITE_BUSY lost a race.
+static int replay_req (sqlite3 *h, rb_state *R, const rb_req *rq) {
+    const mw_rd_result *res = rq->res;
+    const mw_tab *lt_prev = NULL, *lt = NULL; const mw_tab *rt_prev = NULL;
     for (int phase = 3; phase >= 1; phase--) {                                  // deletes, then updates, then inserts: a key that one frees and another takes
         for (int i = 0; i < res->n; i++) {
             const mw_chg *c = &res->chg[i]; if (c->kind != phase) continue;
-            int ti = (int)(c->tab - R->cat->tabs); tstmt *ts = &R->ts[ti];
+            if (c->tab != rt_prev) { lt = mw_cat_by_name(R->cat, c->tab->name); rt_prev = c->tab; lt_prev = lt; } else lt = lt_prev;      // (the leader's own catalog: the same schema, the same cookie)
+            if (!lt || !lt->ok) return MW_CONFLICT;
+            tstmt *ts = &R->ts[lt - R->cat->tabs];
+            if (!ts->ready && tstmt_prepare(h, lt, ts) != SQLITE_OK) return MW_CONFLICT;
             rec_t oldr, newr;
-            if (c->old_rec && !rec_parse(&oldr, c->old_rec, c->old_len)) goto out;
-            if (c->new_rec && !rec_parse(&newr, c->new_rec, c->new_len)) goto out;
-            if ((c->old_rec && oldr.n < c->tab->nrec) || (c->new_rec && newr.n < c->tab->nrec)) goto out;      // (a row written before an ALTER TABLE ADD COLUMN: its missing columns are defaults)
+            if (c->old_rec && !rec_parse(&oldr, c->old_rec, c->old_len)) return MW_CONFLICT;
+            if (c->new_rec && !rec_parse(&newr, c->new_rec, c->new_len)) return MW_CONFLICT;
+            if ((c->old_rec && oldr.n < lt->nrec) || (c->new_rec && newr.n < lt->nrec)) return MW_CONFLICT;      // (a row written before an ALTER TABLE ADD COLUMN: its missing columns are defaults)
             int src;
             if (c->old_rec) {                                                  // it is the row that the transaction saw
-                if (bind_row(ts->sel, c->tab, c->rowid, &oldr, false, 0) != SQLITE_OK) goto out;
+                if (bind_row(ts->sel, lt, c->rowid, &oldr, false, 0) != SQLITE_OK) return MW_CONFLICT;
                 src = sqlite3_step(ts->sel); sqlite3_reset(ts->sel);
-                if (src == SQLITE_BUSY || (src & 0xff) == SQLITE_BUSY) { rc = SQLITE_BUSY; goto out; }
-                if (src != SQLITE_ROW) goto out;
+                if ((src & 0xff) == SQLITE_BUSY) return SQLITE_BUSY;
+                if (src != SQLITE_ROW) return MW_CONFLICT;
             }
-            if (c->kind == 3) { if (bind_row(ts->del, c->tab, c->rowid, NULL, false, 0) != SQLITE_OK) goto out; src = sqlite3_step(ts->del); sqlite3_reset(ts->del); }
+            if (c->kind == 3) { if (bind_row(ts->del, lt, c->rowid, NULL, false, 0) != SQLITE_OK) return MW_CONFLICT; src = sqlite3_step(ts->del); sqlite3_reset(ts->del); }
             else if (c->kind == 2) {
-                uint64_t mask; if (!changed_mask(c->tab, &oldr, &newr, &mask)) goto out;
+                uint64_t mask; if (!changed_mask(lt, &oldr, &newr, &mask)) return MW_CONFLICT;
                 if (mask == 0) continue;                                                                // (only a derived column changed)
-                sqlite3_stmt *us = update_stmt(h, c->tab, ts, mask); if (!us) goto out;
-                if (bind_row(us, c->tab, c->rowid, &newr, true, mask) != SQLITE_OK) goto out;
+                sqlite3_stmt *us = update_stmt(h, lt, ts, mask); if (!us) return MW_CONFLICT;
+                if (bind_row(us, lt, c->rowid, &newr, true, mask) != SQLITE_OK) return MW_CONFLICT;
                 src = sqlite3_step(us); sqlite3_reset(us);
             }
-            else { if (bind_row(ts->ins, c->tab, c->rowid, &newr, false, 0) != SQLITE_OK) goto out; src = sqlite3_step(ts->ins); sqlite3_reset(ts->ins); }
-            if (src != SQLITE_DONE) { if ((src & 0xff) == SQLITE_BUSY) rc = SQLITE_BUSY; goto out; }
+            else { if (bind_row(ts->ins, lt, c->rowid, &newr, false, 0) != SQLITE_OK) return MW_CONFLICT; src = sqlite3_step(ts->ins); sqlite3_reset(ts->ins); }
+            if (src != SQLITE_DONE) return (src & 0xff) == SQLITE_BUSY ? SQLITE_BUSY : MW_CONFLICT;
         }
     }
-    {
-        int crc = sqlite3_exec(h, "COMMIT", NULL, NULL, NULL);
-        if (crc == SQLITE_OK) {
-            mw_tx_info ti; memset(&ti, 0, sizeof ti); sqlite3_file_control(h, "main", MW_FCNTL_TXINFO, &ti);
-            if (getenv("MW_REBASE_DEBUG")) { fprintf(stderr, "REBASE ok: tx snapshot %llu, helper snapshot %llu, commit %llu, changes:", (unsigned long long)lane->tx.snapshot_epoch, (unsigned long long)ti.snapshot_epoch, (unsigned long long)ti.commit_epoch); for (int i = 0; i < res->n; i++) fprintf(stderr, " k%d r%lld", res->chg[i].kind, (long long)res->chg[i].rowid); fprintf(stderr, "\n"); }
-            *epoch = ti.commit_epoch; return ti.commit_epoch ? SQLITE_OK : MW_CONFLICT;
-        }
-        rc = (crc & 0xff) == SQLITE_BUSY ? SQLITE_BUSY : MW_CONFLICT;
+    return SQLITE_OK;
+}
+
+// All the requests of a batch in one transaction at the snapshot that the helper has now. SQLITE_OK: the transaction committed (or no request could be replayed: every state is final); SQLITE_BUSY: lost the race, again.
+static int group_once (mw_lane *L, rb_state *R, rb_req **b, int n) {
+    sqlite3 *h = L->rb_db;
+    for (int i = 0; i < n; i++) b[i]->state = 0;
+    if (sqlite3_exec(h, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) return SQLITE_BUSY;
+    int ok = 0, rc = SQLITE_OK; uint32_t cookie = 0;
+    sqlite3_stmt *sv = NULL;
+    if (sqlite3_prepare_v2(h, "PRAGMA schema_version", -1, &sv, NULL) == SQLITE_OK && sqlite3_step(sv) == SQLITE_ROW) cookie = (uint32_t)sqlite3_column_int64(sv, 0); else { sqlite3_finalize(sv); sqlite3_exec(h, "ROLLBACK", NULL, NULL, NULL); for (int i = 0; i < n; i++) b[i]->state = 2; return SQLITE_OK; }
+    sqlite3_finalize(sv);
+    for (int i = 0; i < n; i++) {
+        rb_req *rq = b[i];
+        if (rq->cookie != cookie) { rq->state = 2; continue; }                // (the schema changed meanwhile)
+        sqlite3_exec(h, "SAVEPOINT g", NULL, NULL, NULL);
+        int r = replay_req(h, R, rq);
+        if (r == SQLITE_OK) { sqlite3_exec(h, "RELEASE g", NULL, NULL, NULL); rq->state = 1; ok++; }
+        else if (r == SQLITE_BUSY) { rc = SQLITE_BUSY; break; }
+        else { sqlite3_exec(h, "ROLLBACK TO g", NULL, NULL, NULL); sqlite3_exec(h, "RELEASE g", NULL, NULL, NULL); rq->state = 2; }      // (a true conflict: this request alone is taken back)
     }
-out:
-    sqlite3_exec(h, "ROLLBACK", NULL, NULL, NULL);
-    return rc;
+    if (rc == SQLITE_BUSY || ok == 0) { sqlite3_exec(h, "ROLLBACK", NULL, NULL, NULL); if (rc == SQLITE_BUSY) return SQLITE_BUSY; return SQLITE_OK; }
+    int crc = sqlite3_exec(h, "COMMIT", NULL, NULL, NULL);
+    if (crc != SQLITE_OK) {
+        sqlite3_exec(h, "ROLLBACK", NULL, NULL, NULL);
+        if ((crc & 0xff) == SQLITE_BUSY) return SQLITE_BUSY;
+        for (int i = 0; i < n; i++) if (b[i]->state == 1) b[i]->state = 2;
+        return SQLITE_OK;
+    }
+    mw_tx_info ti; memset(&ti, 0, sizeof ti); sqlite3_file_control(h, "main", MW_FCNTL_TXINFO, &ti);
+    uint32_t order = 0;
+    for (int i = 0; i < n; i++) if (b[i]->state == 1) { if (ti.commit_epoch) { b[i]->epoch = ti.commit_epoch; b[i]->order = order++; } else b[i]->state = 2; }
+    return SQLITE_OK;
+}
+
+static void run_batch (mw_lane *L, rb_req **b, int n) {
+    mw_db *db = L->db; rb_state *R = L->rb_state;
+    uint64_t t0 = now_ns();
+    if (helper_open(L) != SQLITE_OK) { for (int i = 0; i < n; i++) b[i]->state = 2; return; }
+    if (R->sync != L->sync_level) { char q[40]; snprintf(q, sizeof q, "PRAGMA synchronous=%d", L->sync_level); sqlite3_exec(L->rb_db, q, NULL, NULL, NULL); R->sync = L->sync_level; }
+    mw_lane *hl = NULL; { void *lp = NULL; if (sqlite3_file_control(L->rb_db, "main", MW_FCNTL_LANE_PTR, &lp) == SQLITE_OK) hl = lp; }
+    if (db->mp) mw_mp_rebase_lock(db);                                          // (one batch at a time in all the processes)
+    int attempt = 0; bool closed = false;
+    for (; attempt < MW_REBASE_MAX_ATTEMPTS; attempt++) {
+        if (attempt == MW_REBASE_GATE_AFTER && hl) { mw_gate_close(db, hl); closed = true; }      // (the next attempt runs against a frozen state)
+        if (group_once(L, R, b, n) != SQLITE_BUSY) break;
+        atomic_fetch_add(&db->n_rebase_retries, 1);
+        if (!closed) sched_yield();
+    }
+    if (attempt == MW_REBASE_MAX_ATTEMPTS) for (int i = 0; i < n; i++) b[i]->state = 2;
+    if (closed) mw_gate_open(db);
+    if (db->mp) mw_mp_rebase_unlock(db);
+    int done = 0; for (int i = 0; i < n; i++) if (b[i]->state == 1) done++;
+    atomic_fetch_add(&db->n_rebases, (uint64_t)done);
+    if (done > 1) atomic_fetch_add(&db->n_rebase_grouped, (uint64_t)done);
+    uint64_t att = (uint64_t)attempt + 1, m = atomic_load(&db->n_rebase_max_attempts);
+    while (att > m && !atomic_compare_exchange_weak(&db->n_rebase_max_attempts, &m, att)) {}
+    atomic_fetch_add(&db->n_rebase_ns, now_ns() - t0);
 }
 
 // The commit of `lane` conflicted on pages that it wrote: replay its row changes. SQLITE_OK: committed at *out_epoch (the lane's own pages are not published); MW_CONFLICT: refused.
 int mw_lane_rebase (mw_lane *lane, const uint8_t *const *imgs, uint32_t cookie, uint64_t *out_epoch) {
     mw_db *db = lane->db;
-    uint64_t t0 = now_ns();
     rb_state *R = lane->rb_state;
     if (!R) { R = calloc(1, sizeof *R); if (!R) return MW_CONFLICT; lane->rb_state = R; }
     if (!R->cat || R->cat->cookie != cookie) { state_reset_stmts(R); mw_cat_free(R->cat); R->cat = mw_cat_build(lane); if (R->cat) { R->ts = calloc((size_t)(R->cat->n ? R->cat->n : 1), sizeof *R->ts); R->nts = R->cat->n; } }
     if (!R->cat || !R->ts || !R->cat->rebasable || R->cat->cookie != cookie) { atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }
     mw_rd_result res;
-    mw_rowdiff_compute(lane, imgs, R->cat, &res);
+    mw_rowdiff_compute(lane, imgs, R->cat, &res);                               // (in parallel: every connection decodes its own pages)
     if (res.unsupported || res.n == 0) { mw_rd_result_free(&res); atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }
-    if (helper_open(lane) != SQLITE_OK) { mw_rd_result_free(&res); return MW_CONFLICT; }
-    for (int i = 0; i < res.n; i++) {                                           // the statements of the tables that this transaction touched
-        int ti = (int)(res.chg[i].tab - R->cat->tabs); tstmt *ts = &R->ts[ti];
-        if (!ts->ready && tstmt_prepare(lane->rb_db, res.chg[i].tab, ts) != SQLITE_OK) { mw_rd_result_free(&res); atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }
+    rb_req rq = { .lane = lane, .res = &res, .cookie = cookie };
+    pthread_mutex_lock(&db->rb_qmu);
+    if (db->rb_qtail) ((rb_req *)db->rb_qtail)->next = &rq; else db->rb_qhead = &rq;
+    db->rb_qtail = &rq;
+    while (!rq.done) {
+        if (!db->rb_leader) {                                                   // the leader of the next batch: what is queued now, in the order it came
+            db->rb_leader = true;
+            rb_req *batch[MW_REBASE_BATCH]; int n = 0;
+            while (db->rb_qhead && n < MW_REBASE_BATCH) { rb_req *x = db->rb_qhead; db->rb_qhead = x->next; if (!db->rb_qhead) db->rb_qtail = NULL; x->next = NULL; batch[n++] = x; }
+            pthread_mutex_unlock(&db->rb_qmu);
+            run_batch(lane, batch, n);
+            pthread_mutex_lock(&db->rb_qmu);
+            for (int i = 0; i < n; i++) batch[i]->done = true;                  // (the states were provisional until now: a waiter that woke up for another reason must not read them)
+            db->rb_leader = false;
+            pthread_cond_broadcast(&db->rb_qcv);
+        } else pthread_cond_wait(&db->rb_qcv, &db->rb_qmu);
     }
-    if (R->sync != lane->sync_level) { char q[40]; snprintf(q, sizeof q, "PRAGMA synchronous=%d", lane->sync_level); sqlite3_exec(lane->rb_db, q, NULL, NULL, NULL); R->sync = lane->sync_level; }
-    mw_lane *hl = NULL; { void *lp = NULL; if (sqlite3_file_control(lane->rb_db, "main", MW_FCNTL_LANE_PTR, &lp) == SQLITE_OK) hl = lp; }
-    pthread_mutex_lock(&db->rebase_mu);                                         // (one replay at a time: replays that run together lose races against each other and against the ordinary commits, measured 20-40% slower; the decoding above is parallel)
-    if (db->mp) mw_mp_rebase_lock(db);
-    int rc = MW_CONFLICT, attempt = 0; bool closed = false; uint64_t epoch = 0;
-    for (; attempt < MW_REBASE_MAX_ATTEMPTS; attempt++) {
-        if (attempt == MW_REBASE_GATE_AFTER && hl) { mw_gate_close(db, hl); closed = true; }      // (the next attempt runs against a frozen state)
-        rc = replay_once(lane, R, &res, cookie, &epoch);
-        if (rc != SQLITE_BUSY) break;
-        atomic_fetch_add(&db->n_rebase_retries, 1);
-        if (!closed) sched_yield();
-    }
-    if (closed) mw_gate_open(db);
-    if (db->mp) mw_mp_rebase_unlock(db);
-    pthread_mutex_unlock(&db->rebase_mu);
+    pthread_mutex_unlock(&db->rb_qmu);
     mw_rd_result_free(&res);
-    uint64_t att = (uint64_t)attempt + 1, m = atomic_load(&db->n_rebase_max_attempts);
-    while (att > m && !atomic_compare_exchange_weak(&db->n_rebase_max_attempts, &m, att)) {}
-    atomic_fetch_add(&db->n_rebase_ns, now_ns() - t0);
-    if (rc == SQLITE_OK) { atomic_fetch_add(&db->n_rebases, 1); *out_epoch = epoch; lane->tx.commit_epoch = epoch; return SQLITE_OK; }
+    if (rq.state == 1) { *out_epoch = rq.epoch; lane->tx.commit_epoch = rq.epoch; lane->tx.commit_order = rq.order; return SQLITE_OK; }
     return MW_CONFLICT;
 }

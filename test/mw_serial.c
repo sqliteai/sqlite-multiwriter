@@ -23,7 +23,7 @@
 
 enum { MAXOPS = 4, ROKEYS = 8 };
 typedef struct { int kind, key, a, b; int sex, sv, su, spl, sw; } op_t;                 // kinds: 0 touch (w += 1: a write that the page really sees), 1 v += a, 2 delete, 3 u = b (-1: NULL), 4 insert (v = a, u = b, payload ins_pl), 5 payload = a bytes
-typedef struct { uint64_t snap, commit; uint64_t seq; int n; op_t op[MAXOPS]; int ins_pl; int slot; } rw_t;
+typedef struct { uint64_t snap, commit; uint64_t seq; int n; op_t op[MAXOPS]; int ins_pl; int slot; uint32_t order; } rw_t;      // order: among the commits of one epoch (a group replay of the rebase), their place
 typedef struct { uint64_t snap; int n; int key[ROKEYS], ex[ROKEYS], v[ROKEYS], u[ROKEYS], pl[ROKEYS], w[ROKEYS]; } ro_t;
 typedef struct { rw_t *rw; size_t nrw, caprw; ro_t *ro; size_t nro, capro; long busy, constraint, other; } rec_t;
 
@@ -45,14 +45,14 @@ static int read_row (sqlite3_stmt *sel, int key, int *ex, int *v, int *u, int *p
     sqlite3_reset(sel); return rc;
 }
 static uint64_t snap_epoch (sqlite3 *db) { mw_tx_info ti; memset(&ti, 0, sizeof ti); sqlite3_file_control(db, "main", MW_FCNTL_TXINFO, &ti); return ti.snapshot_epoch; }
-static uint64_t commit_epoch (sqlite3 *db) { mw_tx_info ti; memset(&ti, 0, sizeof ti); sqlite3_file_control(db, "main", MW_FCNTL_TXINFO, &ti); return ti.commit_epoch; }
+static uint64_t commit_epoch (sqlite3 *db, uint32_t *order) { mw_tx_info ti; memset(&ti, 0, sizeof ti); sqlite3_file_control(db, "main", MW_FCNTL_TXINFO, &ti); *order = ti.commit_order; return ti.commit_epoch; }
 
 // ---- the record file of a process (one write() per record: a kill never leaves half of one in the middle) ----
 enum { REC_INTENT = 1, REC_COMMIT, REC_RO, REC_RESOLVE, REC_ABORT, REC_FULL };
-typedef struct { uint32_t type, slot; uint64_t seq, epoch; } rhdr;
-static void put_rec (int fd, uint32_t type, int slot, uint64_t seq, uint64_t epoch, const void *pl, size_t n) {
+typedef struct { uint32_t type, slot; uint64_t seq, epoch; uint32_t order, pad; } rhdr;
+static void put_rec (int fd, uint32_t type, int slot, uint64_t seq, uint64_t epoch, uint32_t order, const void *pl, size_t n) {
     if (fd < 0) return;
-    char buf[sizeof(rhdr) + sizeof(rw_t) + sizeof(ro_t)]; rhdr h = { type, (uint32_t)slot, seq, epoch };
+    char buf[sizeof(rhdr) + sizeof(rw_t) + sizeof(ro_t)]; rhdr h = { type, (uint32_t)slot, seq, epoch, order, 0 };
     memcpy(buf, &h, sizeof h); if (n) memcpy(buf + sizeof h, pl, n);
     if (write(fd, buf, sizeof h + n) != (ssize_t)(sizeof h + n)) _exit(3);
 }
@@ -66,7 +66,7 @@ static void run_ro (ctx_t *c, ro_t *out, int *got) {
     for (int i = 0; i < ROKEYS && !bad; i++) { ro.key[i] = 1 + (int)(rnd(&c->rng) % (uint64_t)g_keys); bad = read_row(c->sel, ro.key[i], &ro.ex[i], &ro.v[i], &ro.u[i], &ro.pl[i], &ro.w[i]); }
     ro.snap = snap_epoch(c->db); mw_exec(c->db, "COMMIT");
     if (bad) { c->R->other++; return; }
-    put_rec(c->fd, REC_RO, c->slot, 0, 0, &ro, sizeof ro);
+    put_rec(c->fd, REC_RO, c->slot, 0, 0, 0, &ro, sizeof ro);
     *out = ro; *got = 1;
 }
 static void run_rw (ctx_t *c, rw_t *out, int *got) {
@@ -90,19 +90,19 @@ static void run_rw (ctx_t *c, rw_t *out, int *got) {
         else if (r < 9) { o->kind = 5; do o->a = (int)(rnd(&c->rng) % 600); while (o->a == o->spl); snprintf(sql, sizeof sql, "UPDATE t SET p = zeroblob(%d) WHERE id = %d", o->a, o->key); }
         else { o->kind = 0; snprintf(sql, sizeof sql, "UPDATE t SET w = w + 1 WHERE id = %d", o->key); }
         int rc = mw_exec(db, sql);
-        if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_FULL) put_rec(c->fd, REC_FULL, c->slot, 0, 0, NULL, 0); if ((rc & 0xff) == SQLITE_CONSTRAINT) R->constraint++; else if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else { R->other++; if (getenv("MW_VERBOSE")) printf("  other rc %d on: %s\n", rc, sql); } }
+        if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_FULL) put_rec(c->fd, REC_FULL, c->slot, 0, 0, 0, NULL, 0); if ((rc & 0xff) == SQLITE_CONSTRAINT) R->constraint++; else if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else { R->other++; if (getenv("MW_VERBOSE")) printf("  other rc %d on: %s\n", rc, sql); } }
     }
     if (ok && c->slot >= 0) { snprintf(sql, sizeof sql, "UPDATE txlog SET seq = %llu WHERE slot = %d", (unsigned long long)tx.seq, c->slot); int rc = mw_exec(db, sql); if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else R->other++; } }
     if (ok) {
         tx.snap = snap_epoch(db);
-        put_rec(c->fd, REC_INTENT, c->slot, tx.seq, 0, &tx, sizeof tx);                              // (before COMMIT: a kill from here on leaves the transaction in doubt)
+        put_rec(c->fd, REC_INTENT, c->slot, tx.seq, 0, 0, &tx, sizeof tx);                              // (before COMMIT: a kill from here on leaves the transaction in doubt)
         int rc = mw_exec(db, "COMMIT");
-        if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_FULL) put_rec(c->fd, REC_FULL, c->slot, 0, 0, NULL, 0); if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else { R->other++; if (getenv("MW_VERBOSE")) printf("  commit rc %d\n", rc); } }
-        else tx.commit = commit_epoch(db);
+        if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_FULL) put_rec(c->fd, REC_FULL, c->slot, 0, 0, 0, NULL, 0); if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else { R->other++; if (getenv("MW_VERBOSE")) printf("  commit rc %d\n", rc); } }
+        else tx.commit = commit_epoch(db, &tx.order);
     }
-    if (!ok) { mw_exec(db, "ROLLBACK"); put_rec(c->fd, REC_ABORT, c->slot, tx.seq, 0, NULL, 0); return; }
+    if (!ok) { mw_exec(db, "ROLLBACK"); put_rec(c->fd, REC_ABORT, c->slot, tx.seq, 0, 0, NULL, 0); return; }
     if (tx.commit == 0) { R->other++; return; }                                                       // (it wrote no page: nothing to order)
-    put_rec(c->fd, REC_COMMIT, c->slot, tx.seq, tx.commit, NULL, 0);
+    put_rec(c->fd, REC_COMMIT, c->slot, tx.seq, tx.commit, tx.order, NULL, 0);
     c->seq = tx.seq; *out = tx; *got = 1;
 }
 
@@ -133,7 +133,7 @@ static void slot_loop (int slot, int generation, int arm_crash) {
     sqlite3_stmt *q; char sql[100]; snprintf(sql, sizeof sql, "SELECT seq FROM txlog WHERE slot = %d", slot); sqlite3_prepare_v2(db, sql, -1, &q, NULL);
     if (sqlite3_step(q) != SQLITE_ROW) _exit(2);
     c.seq = (uint64_t)sqlite3_column_int64(q, 0); sqlite3_finalize(q);
-    put_rec(fd, REC_RESOLVE, slot, c.seq, 0, NULL, 0);
+    put_rec(fd, REC_RESOLVE, slot, c.seq, 0, 0, NULL, 0);
     if (arm_crash && rnd(&c.rng) % 3 != 0) {                                                         // most incarnations also die on their own at a point of the publication (inside the lock, mid-record, just after it): the repair of a dead publisher
         static const mw_fault_t pts[] = { MW_CRASH_MID_LOG, MW_CRASH_BEFORE_LOG, MW_CRASH_SHARED_APPENDED, MW_CRASH_SHARED_INSTALLED, MW_CRASH_AFTER_LOG, MW_CRASH_AFTER_VISIBLE, MW_CRASH_SHARED_GC, MW_CRASH_SHARED_GC };       // (twice: the collection runs every 16 commits, and a dead holder in it is a case of its own)
         mw_fault_arm(pts[rnd(&c.rng) % (sizeof pts / sizeof *pts)], 20 + (int)(rnd(&c.rng) % 800));
@@ -174,7 +174,7 @@ static void apply_rw (const rw_t *t, uint64_t epoch, model *M, viol *V) {
 static void check_ro (const ro_t *r, const model *M, viol *V) {
     for (int k = 0; k < r->n; k++) if (!same(r->ex[k], r->v[k], r->u[k], r->pl[k], r->w[k], &M->m[r->key[k]])) REPORT(V->bad_ro, "read-only at snapshot %llu: key %d saw (%d,%d,%d,%d,%d), model (%d,%d,%d,%d,%d)", (unsigned long long)r->snap, r->key[k], r->ex[k], r->v[k], r->u[k], r->pl[k], r->w[k], M->m[r->key[k]].ex, M->m[r->key[k]].v, M->m[r->key[k]].u, M->m[r->key[k]].pl, M->m[r->key[k]].w);
 }
-static int cmp_known (const void *a, const void *b) { uint64_t x = (*(rw_t *const *)a)->commit, y = (*(rw_t *const *)b)->commit; return x < y ? -1 : x > y; }
+static int cmp_known (const void *a, const void *b) { const rw_t *p = *(rw_t *const *)a, *q = *(rw_t *const *)b; if (p->commit != q->commit) return p->commit < q->commit ? -1 : 1; return p->order < q->order ? -1 : p->order > q->order; }
 static int cmp_ro (const void *a, const void *b) { uint64_t x = (*(ro_t *const *)a)->snap, y = (*(ro_t *const *)b)->snap; return x < y ? -1 : x > y; }
 static int cmp_doubt (const void *a, const void *b) { uint64_t x = (*(rw_t *const *)a)->snap, y = (*(rw_t *const *)b)->snap; return x < y ? -1 : x > y; }
 
@@ -188,8 +188,10 @@ static void replay (txset *S, model *M, viol *V) {
         if (!have_known && ndone == S->ndoubt) break;
         while (ri < S->nro && S->ro[ri]->snap < e) check_ro(S->ro[ri++], M, V);                  // (read-only transactions whose snapshot lies before this epoch saw the state so far)
         if (have_known && S->known[ki]->commit == e) {
-            if (ki && S->known[ki - 1]->commit == e) REPORT(V->bad_dup_epoch, "two commits at epoch %llu", (unsigned long long)e);
-            apply_rw(S->known[ki], e, M, V); ki++; e++; continue;
+            if (ki && S->known[ki - 1]->commit == e && S->known[ki - 1]->order >= S->known[ki]->order) REPORT(V->bad_dup_epoch, "two commits at epoch %llu with the same place in it", (unsigned long long)e);
+            apply_rw(S->known[ki], e, M, V); ki++;
+            if (!(ki < S->nknown && S->known[ki]->commit == e)) e++;                      // (the commits of one epoch, a group replay: one after the other in their order)
+            continue;
         }
         if (have_known && S->known[ki]->commit < e) { REPORT(V->bad_dup_epoch, "two commits at epoch %llu", (unsigned long long)S->known[ki]->commit); apply_rw(S->known[ki], S->known[ki]->commit, M, V); ki++; continue; }
         // an epoch that no recorded transaction has (inside the recorded range, or after it)
@@ -201,7 +203,13 @@ static void replay (txset *S, model *M, viol *V) {
             for (size_t d = 0; d < S->ndoubt; d++) if (!used[d]) { REPORT(V->bad_tail, "transaction in doubt (snapshot %llu, slot %d seq %llu) committed but fits no epoch", (unsigned long long)S->doubt[d]->snap, S->doubt[d]->slot, (unsigned long long)S->doubt[d]->seq); used[d] = 1; ndone++; }
             break;
         }
-        used[pick] = 1; ndone++; apply_rw(S->doubt[pick], e, M, V); e++;
+        used[pick] = 1; ndone++; apply_rw(S->doubt[pick], e, M, V);
+        if (g_threadmode && g_rebase) for (;;) {                                                   // (the threads of one process can have committed together, at one epoch: the ones that fit and began before it)
+            size_t more = (size_t)-1; for (size_t d = 0; d < S->ndoubt; d++) if (!used[d] && S->doubt[d]->snap < e && reads_fit(S->doubt[d], M)) { more = d; break; }
+            if (more == (size_t)-1) break;
+            used[more] = 1; ndone++; apply_rw(S->doubt[more], e, M, V);
+        }
+        e++;
     }
     while (ri < S->nro) check_ro(S->ro[ri++], M, V);
     free(used);
@@ -308,7 +316,7 @@ static void procs_verify (const char *name, const char *path, int keys, int npro
         while (fread(&h, sizeof h, 1, f) == 1) {
             if (h.type == REC_INTENT) { rw_t *t = malloc(sizeof *t); if (fread(t, sizeof *t, 1, f) != 1) { free(t); break; } if (pending) free(pending); pending = t; }
             else if (h.type == REC_RO) { ro_t *r = malloc(sizeof *r); if (fread(r, sizeof *r, 1, f) != 1) { free(r); break; } if (S.nro == cap_r) { cap_r *= 2; S.ro = realloc(S.ro, cap_r * sizeof *S.ro); } S.ro[S.nro++] = r; }
-            else if (h.type == REC_COMMIT) { if (pending && pending->seq == h.seq) { pending->commit = h.epoch; if (S.nknown == cap_k) { cap_k *= 2; S.known = realloc(S.known, cap_k * sizeof *S.known); } S.known[S.nknown++] = pending; pending = NULL; committed++; } }
+            else if (h.type == REC_COMMIT) { if (pending && pending->seq == h.seq) { pending->commit = h.epoch; pending->order = h.order; if (S.nknown == cap_k) { cap_k *= 2; S.known = realloc(S.known, cap_k * sizeof *S.known); } S.known[S.nknown++] = pending; pending = NULL; committed++; } }
             else if (h.type == REC_ABORT) { free(pending); pending = NULL; }
             else if (h.type == REC_FULL) full_errors++;
             else if (h.type == REC_RESOLVE) {

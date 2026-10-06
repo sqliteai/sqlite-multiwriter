@@ -127,6 +127,7 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
 
     lane->tx.tx_id = atomic_fetch_add(&db->next_tx_id, 1);
     lane->tx.commit_epoch = 0;
+    lane->tx.commit_order = 0;
     lane->tx.schema_generation = atomic_load(&db->schema_generation);
     lane->tx.state = MW_TX_ACTIVE;
     lane->tx.is_writer = 0;
@@ -245,7 +246,7 @@ void mw_lane_fill_stats (mw_lane *lane, mw_db_stats *st) {
     st->schema_generation = atomic_load(&db->schema_generation);
     st->last_schema_epoch = atomic_load(&db->last_schema_epoch);
     st->ddl_barriers = atomic_load(&db->n_ddl_barriers);
-    st->rebases = atomic_load(&db->n_rebases);
+    st->rebases = atomic_load(&db->n_rebases); st->rebases_grouped = atomic_load(&db->n_rebase_grouped);
     st->relocations = atomic_load(&db->n_relocations);
     st->reloc_prep_used = atomic_load(&db->n_prep_used); st->reloc_prep_dropped = atomic_load(&db->n_prep_dropped); st->reloc_prep_rewrote = atomic_load(&db->n_prep_rewrote);
     st->reads_saved = atomic_load(&db->n_reads_saved);

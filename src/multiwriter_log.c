@@ -382,7 +382,6 @@ int mw_db_recover (mw_db *db) {
     db->npending = 0;
     pthread_mutex_unlock(&db->log_mu);
     mw_log_stage_reset(db, E);
-    if (db->cdc) mw_cdc_reset(db);
     atomic_store(&db->failed, 0);
     rc = SQLITE_OK;
 out:

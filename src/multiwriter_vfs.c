@@ -9,7 +9,6 @@
 #include <stdatomic.h>
 #include <string.h>
 #include "multiwriter_internal.h"
-#include "multiwriter_runs.h"
 #include "multiwriter_io.h"
 
 static sqlite3_vfs  mw_vfs;
@@ -41,26 +40,9 @@ static void tl_exit (void *unused) { (void)unused; tl_flush(); }
 static void tl_init (void) { pthread_key_create(&tl_key, tl_exit); }
 uint64_t mw_vfs_event_count (mw_event_t ev) { return (ev < MW_EV_COUNT) ? atomic_load(&mw_counts[ev]) + tl_cnt[ev] : 0; }
 void mw_vfs_events_reset (void) { for (int i = 0; i < MW_EV_COUNT; ++i) { atomic_store(&mw_counts[i], 0); tl_cnt[i] = 0; } tl_n = 0; }
-int64_t mw_db_reserve_version (sqlite3 *db, int64_t at_least) {
-    int64_t v = at_least;
-    if (sqlite3_file_control(db, "main", MW_FCNTL_RESERVE_DBV, &v) != SQLITE_OK) return -1;
-    return v;
-}
-int64_t mw_db_send_ceiling (sqlite3 *db) {
-    int64_t c = 0;
-    if (sqlite3_file_control(db, "main", MW_FCNTL_SEND_CEILING, &c) != SQLITE_OK) return INT64_MAX;
-    return c;
-}
-
 // Statement-start hook (sqlite3_trace_v2): recognises DDL/VACUUM and raises the schema barrier before it runs.
 static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
     (void)ctx; (void)x;
-    if (type == SQLITE_TRACE_PROFILE) {                                          // a statement is over: a VACUUM that did not commit leaves nothing behind
-        sqlite3_stmt *ps = (sqlite3_stmt *)p; const char *q = ps ? sqlite3_sql(ps) : NULL;
-        while (q && (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')) q++;
-        if (q && sqlite3_strnicmp(q, "VACUUM", 6) == 0) { int off = 0; sqlite3_file_control(sqlite3_db_handle(ps), "main", MW_FCNTL_VACUUM_BEGIN, &off); }
-        return 0;
-    }
     if (type != SQLITE_TRACE_STMT) return 0;
     sqlite3_stmt *st = (sqlite3_stmt *)p;
     const char *sql = sqlite3_sql(st);
@@ -71,7 +53,6 @@ static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
         size_t n = strlen(kw[i]);
         if (sqlite3_strnicmp(sql, kw[i], (int)n) == 0) {
             sqlite3_file_control(sqlite3_db_handle(st), "main", MW_FCNTL_DDL_BEGIN, NULL);
-            if (i == 4) { int on = 1; sqlite3_file_control(sqlite3_db_handle(st), "main", MW_FCNTL_VACUUM_BEGIN, &on); }
             return 0;
         }
     }
@@ -80,12 +61,7 @@ static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
 
 static int mw_connection_init (sqlite3 *db, char **err, const sqlite3_api_routines *api) {
     (void)err; (void)api;
-    sqlite3_trace_v2(db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, mw_trace_cb, NULL);
-    void *lp = NULL;
-    if (sqlite3_file_control(db, "main", MW_FCNTL_LANE_PTR, &lp) == SQLITE_OK && lp) {          // the tables of the CRDT metadata are created by the first connection, before anyone writes
-        mw_lane *lane = lp;
-        if (lane->db && lane->db->cdc && !lane->sys && !sqlite3_db_readonly(db, "main")) mw_cdc_ensure_schema(db, lane->db);
-    }
+    sqlite3_trace_v2(db, SQLITE_TRACE_STMT, mw_trace_cb, NULL);
     return SQLITE_OK;
 }
 
@@ -264,24 +240,15 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
             return SQLITE_NOMEM;
         }
         mw_lane_init(lane, db);
-        if (sqlite3_uri_boolean(name, "mw_cdc", 0) && mode >= 2 && mpmode == 1) { /* private-store multi-process mode keeps the pages in every process; the metadata design needs the shared mode */ mw_lane_free(lane); mw_db_release(db); f->real->pMethods->xClose(f->real); f->base.pMethods = NULL; return SQLITE_MISUSE; }
-        if (sqlite3_uri_boolean(name, "mw_cdc", 0) && mode >= 2) {
-            sqlite3_mutex_enter(db->mu); int crc = db->cdc ? SQLITE_OK : mw_cdc_open(db); sqlite3_mutex_leave(db->mu);
-            if (crc != SQLITE_OK) {                                  // (a database that is to be tracked does not open untracked: its commits would carry no metadata)
-                mw_lane_free(lane); mw_db_release_ex(db, want_sys); f->real->pMethods->xClose(f->real); f->base.pMethods = NULL;
-                return crc;
-            }
-        }
         if (sqlite3_uri_parameter(name, "mw_fullfsync") ? sqlite3_uri_boolean(name, "mw_fullfsync", 0) : (getenv("MW_FULLFSYNC") != NULL)) mw_set_fullfsync(1);
         // mw_profile=small (or MW_PROFILE=small): for a phone or a small server, where 300 MB for a process is too much: the caches (memory table of the metadata, pages of the real file kept in memory) at 8 MB
         // instead of 64, filters of 8 bits a row, a log of 16 MB before it is compacted. Every one of them can still be set by its own parameter.
         const char *prof = sqlite3_uri_parameter(name, "mw_profile"); if (!prof) prof = getenv("MW_PROFILE");
         const bool small = prof && !strcmp(prof, "small");
-        if (db->cdc && (small || sqlite3_uri_parameter(name, "mw_meta_bloom_bits"))) rs_set_bloom_bits((int)sqlite3_uri_int64(name, "mw_meta_bloom_bits", 8));
-        if (db->cdc && (small || sqlite3_uri_parameter(name, "mw_meta_cache_mb"))) mw_cdc_set_cache_mb(db, (int)sqlite3_uri_int64(name, "mw_meta_cache_mb", small ? 8 : 64));
         if (small || sqlite3_uri_parameter(name, "mw_base_cache_mb")) { db->base_cache_bytes = (uint64_t)sqlite3_uri_int64(name, "mw_base_cache_mb", small ? 8 : 64) << 20; if (db->store) db->store->base_limit = db->base_cache_bytes; }
         if (small && !sqlite3_uri_parameter(name, "mw_log_max_mb")) db->log_max_bytes = 16ull << 20;
         lane->norebase = sqlite3_uri_boolean(name, "mw_norebase", 0) != 0;
+        lane->rebase_on = sqlite3_uri_boolean(name, "mw_rebase", 0) != 0 && !lane->norebase;
         if (want_sys) lane->sys = true;
         lane->noreloc = sqlite3_uri_boolean(name, "mw_noreloc", 0) != 0;
         lane->noroute = sqlite3_uri_boolean(name, "mw_noroute", 0) != 0;

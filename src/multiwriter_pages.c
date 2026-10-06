@@ -314,7 +314,7 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
         if (!adopt) memcpy(copies[ncopied], images[ncopied], (size_t)st->pgsz);
     }
     if (rc == SQLITE_OK && mw_fault_hit(MW_FAULT_ALLOC_ERR)) rc = SQLITE_NOMEM;
-    if (rc == SQLITE_OK && db->has_log) { mw_log_decide_mode(db, sync); rc = mw_log_ensure_room(db, mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0)); }       // (no room on the disk: this commit fails, before it takes an epoch)
+    if (rc == SQLITE_OK && db->has_log) { mw_log_decide_mode(db, sync); rc = mw_log_ensure_room(db, mw_log_record_size(db, n, 0)); }       // (no room on the disk: this commit fails, before it takes an epoch)
     if (rc != SQLITE_OK) goto fail_free;
 
     // ---- lock the stripes of every page written or read (ascending) --------------------------------
@@ -398,7 +398,7 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     st->sizes[st->nsizes].dbsize = new_dbsize;
     size_note(st, epoch, new_dbsize);
     uint64_t log_off = 0, log_end = 0;                           // log_end: the log's size after our record, taken under seq_mu (the compaction check below must not read db->log_off unlocked)
-    if (db->has_log) { log_off = db->log_off; __atomic_store_n(&db->log_off, log_off + mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0), __ATOMIC_RELAXED); mw_log_reserve_space(db); log_end = db->log_off; }
+    if (db->has_log) { log_off = db->log_off; __atomic_store_n(&db->log_off, log_off + mw_log_record_size(db, n, 0), __ATOMIC_RELAXED); mw_log_reserve_space(db); log_end = db->log_off; }
     st->sizes[st->nsizes].log_off = log_off;
     st->nsizes++;
     atomic_store(&db->next_epoch, epoch);                        // assigned; NOT visible yet (db->epoch is untouched)
@@ -412,7 +412,6 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     lpush lc = {0}, ld = {0};
     for (int i = 0; i < n; i++) chain_install_batched(st, pgnos[i], chains[i], epoch, copies[i], &lc, &ld);
     lists_splice(st, &lc, &ld);                                  // (still under the stripe locks: the lists never miss a page a compactor could look for)
-    if (db->cdc && lane && !lane->norebase) mw_cdc_apply_owner(db, lane, pgnos, images, n);        // (page owners: under the stripe locks, so two commits of one page apply in epoch order)
     if (lane && lane->holds_reloc && !db->mp) {                  // hand the new page 1 to the next relocation (it is the newest version: nobody else wrote page 1 since)
         for (int i = 0; i < n; i++) if (pgnos[i] == 1 && db->p1_cache) { memcpy(db->p1_cache, copies[i], (size_t)st->pgsz); db->p1_cache_epoch = epoch; break; }
     }
@@ -424,14 +423,14 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     // ---- outside the locks: persist, then become visible (in epoch order) --------------------------
     mw_fault_hit(MW_CRASH_BEFORE_LOG);
     uint64_t ta0 = MW_T0();
-    rc = db->has_log ? mw_log_append(db, log_off, epoch, new_dbsize, n, pgnos, images, lane ? lane->cdc_ext : NULL, lane ? lane->cdc_ext_len : 0, sync) : SQLITE_OK;
+    rc = db->has_log ? mw_log_append(db, log_off, epoch, new_dbsize, n, pgnos, images, NULL, 0, sync) : SQLITE_OK;
     MW_T1(MW_ST_APPEND, ta0);
     if (rc != SQLITE_OK) {
         // The record never made it. If nothing was assigned after us we can take the commit back cleanly:
         // uninstall, return the log space. Otherwise a successor may already sit behind the hole: the
         // database is failed (sticky) and recovers by reopening (the log stops at the hole).
         mw_spinlock(&st->seq_mu);
-        bool latest = atomic_load(&db->next_epoch) == epoch && MW_LOG_OFF(db) == log_off + mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0);
+        bool latest = atomic_load(&db->next_epoch) == epoch && MW_LOG_OFF(db) == log_off + mw_log_record_size(db, n, 0);
         if (latest) {
             st->nsizes--;
             atomic_store(&db->next_epoch, epoch - 1);
@@ -460,11 +459,10 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
         mw_db_wake_all_visibility(db);
         return rc;
     }
-    if (db->cdc && lane && !lane->norebase) mw_cdc_apply_cells(db, lane, epoch);               // (cell versions into the store: the record is in the log, the commit is not visible yet)
     if (sync && !db->mp) {                                       // (multi-process: the wrapper fsyncs after releasing the publication lock)
         uint64_t s0 = now_ns();
         uint64_t ts0 = MW_T0();
-        rc = mw_log_sync(db, epoch, log_off + mw_log_record_size(db, n, lane ? lane->cdc_ext_len : 0));
+        rc = mw_log_sync(db, epoch, log_off + mw_log_record_size(db, n, 0));
         MW_T1(MW_ST_SYNC, ts0);
         atomic_fetch_add(&db->n_log_sync_ns, now_ns() - s0);
         if (rc != SQLITE_OK) {                                   // outcome uncertain: stop accepting commits
@@ -499,7 +497,7 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
         // with change capture, the flush of the metadata are asked every time round); a compaction that cannot run for 20 s lets the commit through (the writers must not wait for ever)
         if (log_end > MW_LOG_HARD_BYTES && !sys_lane) {
             for (int w = 0; w < 10000; w++) {
-                mw_db_compactor_kick(db); if (db->cdc) mw_cdc_kick_flush(db);
+                mw_db_compactor_kick(db);
                 struct timespec ts = { 0, 2000000 }; nanosleep(&ts, NULL);
                 if (mw_log_end_locked(db) <= MW_LOG_HARD_BYTES - (64ull << 20)) break;
             }

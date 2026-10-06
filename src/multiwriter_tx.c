@@ -26,7 +26,6 @@ void mw_lane_init (mw_lane *lane, mw_db *db) {
     lane->db = db;
     lane->writer_id = atomic_fetch_add(&db->next_writer_id, 1);
     lane->mp_slot = -1;
-    lane->rb_sync = -1;
     lane->hot_credit = 16;
     lane->adm_slot = -1;
     lane->sync_level = 2;                                   // SQLite's default (FULL)
@@ -52,7 +51,7 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
     // The wait *sleeps* (50 us polls, at most 20 ms, then goes optimistic): measured against a spinning turn and a
     // condition-variable turn, sleeping is clearly best (10 agents: appends 192k vs 108k tx/s, hot rows 228k vs 130k),
     // because lanes that are not contending keep running instead of being woken in lock-step.
-    if (db->mp && lane->recent_writer && lane->adm_slot < 0 && lane->tx_long_run < 3 && !lane->forced_snapshot && !lane->sys) mw_mp_admit(lane);      // (a writer of the previous transaction waits for a slot when there are many processes)
+    if (db->mp && lane->recent_writer && lane->adm_slot < 0 && lane->tx_long_run < 3 && !lane->sys) mw_mp_admit(lane);      // (a writer of the previous transaction waits for a slot when there are many processes)
     uint64_t tturn0 = MW_T0();
     if (lane->retry_credit > 0 && lane->private_mode && !lane->holds_hot && !lane->sys) {      // (the metadata store's connections never queue for a turn behind the writers: the writers wait for them)
         if (lane->tx_long_run >= 3) {
@@ -103,9 +102,9 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
         MW_T1(MW_ST_TURN, tturn0);
     }
     for (;;) {
-        if (db->mp && !lane->forced_snapshot) mw_mp_catchup(db);           // see the other processes' commits
+        if (db->mp) mw_mp_catchup(db);           // see the other processes' commits
         sqlite3_mutex_enter(db->mu);
-        lane->tx.snapshot_epoch = lane->forced_snapshot ? lane->forced_snapshot : mw_db_visible_epoch(db);
+        lane->tx.snapshot_epoch = mw_db_visible_epoch(db);
         lane->next_active = db->active;
         lane->prev_active = NULL;
         if (db->active) db->active->prev_active = lane;
@@ -116,7 +115,7 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
         if (!db->mp) break;
         mw_mp_snapshot_register(lane);
         // a compactor in another process may have announced a target above this snapshot: refresh and retry
-        if (lane->forced_snapshot || lane->tx.snapshot_epoch >= atomic_load(&db->shm->compact_T)) break;
+        if (lane->tx.snapshot_epoch >= atomic_load(&db->shm->compact_T)) break;
         sqlite3_mutex_enter(db->mu);
         if (lane->prev_active) lane->prev_active->next_active = lane->next_active; else db->active = lane->next_active;
         if (lane->next_active) lane->next_active->prev_active = lane->prev_active;
@@ -135,8 +134,6 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
     for (int i = 0; i < lane->rs_n; i++) lane->rs_bits[lane->rs_list[i]] = 0;
     lane->rs_n = 0;
     lane->rs_overflow = false;
-    lane->rebasable = true;
-    lane->nresv = 0;
     lane->ws_n = 0;                 // write set of the previous transaction stays inspectable until now
     atomic_fetch_add(&db->n_snapshots, 1);
     MW_T1(MW_ST_SNAPBEGIN, tsb0);
@@ -161,7 +158,6 @@ void mw_lane_snapshot_end (mw_lane *lane) {
     if (db->mp) { lane->recent_writer = lane->tx.is_writer != 0; mw_mp_admit_release(lane); }
     if (db->mp && lane->mp_slot >= 0) { atomic_store(&db->shm->slots[lane->mp_slot].writing, 0); atomic_store(&db->shm->slots[lane->mp_slot].snap, MW_MP_NONE); atomic_store(&db->shm->slots[lane->mp_slot].minres, 0); }
     if (!lane->tx.is_writer && lane->retry_credit > 0) lane->retry_credit--;      // (a read-only transaction spends hot-spot credit too: it must not keep others waiting for ever)
-    lane->min_reserved = 0;          // the transaction is over (published, rebased or aborted): its versions are resolved
     sqlite3_mutex_leave(db->mu);
 
     if (lane->tx.state == MW_TX_ACTIVE) lane->tx.state = lane->tx.is_writer ? MW_TX_ABORTED : MW_TX_COMMITTED;
@@ -259,7 +255,6 @@ void mw_lane_fill_stats (mw_lane *lane, mw_db_stats *st) {
     st->rebase_ns = atomic_load(&db->n_rebase_ns);
     st->unrebasable = atomic_load(&db->n_unrebasable);
     st->read_conflicts = atomic_load(&db->n_read_conflicts);
-    st->pk_collisions = atomic_load(&db->n_pk_collisions);
     pthread_mutex_lock(&db->log_mu);
     const uint64_t base_epoch = db->base_epoch;                     // (written under log_mu)
     pthread_mutex_unlock(&db->log_mu);
@@ -292,40 +287,6 @@ void mw_lane_fill_stats (mw_lane *lane, mw_db_stats *st) {
 
 // MARK: - db_version reservation and the sync frontier -
 //
-// Concurrent lanes must never share a db_version, and a change may only be exported once no
-// transaction can still publish a lower one (the send cursor is a db_version watermark: a lower
-// version committing after a higher one was sent would never be sent). Each transaction therefore
-// reserves a unique version; the ceiling = (lowest reservation of any unresolved transaction) - 1.
-
-int64_t mw_lane_reserve_version (mw_lane *lane, int64_t at_least) {
-    mw_db *db = lane->db;
-    if (db->mp) return mw_mp_reserve(lane, at_least);
-    sqlite3_mutex_enter(db->mu);
-    int64_t v = (db->dbv_counter > at_least ? db->dbv_counter : at_least) + 1;
-    db->dbv_counter = v;
-    if (lane->min_reserved == 0) lane->min_reserved = v;
-    sqlite3_mutex_leave(db->mu);
-    if (lane->nresv == lane->resv_cap) {
-        int cap = lane->resv_cap ? lane->resv_cap * 2 : 8;
-        int64_t *p = sqlite3_realloc64(lane->resv, (sqlite3_uint64)cap * sizeof(int64_t));
-        if (p) { lane->resv = p; lane->resv_cap = cap; }
-    }
-    if (lane->nresv < lane->resv_cap) lane->resv[lane->nresv++] = v;
-    else lane->rebasable = false;                         // cannot remember the version: never rebase
-    return v;
-}
-
-int64_t mw_db_send_ceiling_of (mw_db *db) {
-    if (db->mp) return mw_mp_ceiling(db);
-    sqlite3_mutex_enter(db->mu);
-    int64_t ceiling = db->dbv_counter;
-    for (mw_lane *l = db->active; l; l = l->next_active) {
-        if (l->min_reserved != 0 && l->min_reserved - 1 < ceiling) ceiling = l->min_reserved - 1;
-    }
-    sqlite3_mutex_leave(db->mu);
-    return ceiling;
-}
-
 // MARK: - exclusive schema barrier -
 //
 // Sequence for a DDL statement (detected at statement start by the trace hook): take the schema mutex

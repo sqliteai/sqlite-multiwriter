@@ -11,7 +11,7 @@
 static uint32_t be32 (const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 static int be16 (const uint8_t *p) { return (p[0] << 8) | p[1]; }
 
-typedef struct { char *name; uint32_t root; char *sql; } srow;
+typedef struct { char *type; char *name; uint32_t root; char *sql; } srow;
 typedef struct { srow *rows; int n, cap; } srows;
 
 // a text or integer column of the local part of a record, as a NUL-terminated copy
@@ -69,9 +69,9 @@ static void schema_collect (mw_lane *lane, uint32_t pgno, uint32_t pgsz, srows *
             uint32_t off = (uint32_t)be16(pg + base + 8 + 2 * i); if (off >= pgsz) continue;
             uint32_t plen = 0; uint8_t *rec = cell_payload(lane, pg + off, pg + pgsz, pgsz, &plen); if (!rec) continue;
             char *type = rec_col_text(rec, plen, 0), *name = rec_col_text(rec, plen, 1), *root = rec_col_text(rec, plen, 3), *sql = rec_col_text(rec, plen, 4);
-            if (type && !strcmp(type, "table") && name && root && sql && strtoul(root, NULL, 10) > 1) {
+            if (type && name && (!strcmp(type, "table") || !strcmp(type, "trigger"))) {
                 if (out->n == out->cap) { out->cap = out->cap ? out->cap * 2 : 32; out->rows = realloc(out->rows, (size_t)out->cap * sizeof *out->rows); }
-                out->rows[out->n++] = (srow){ name, (uint32_t)strtoul(root, NULL, 10), sql }; name = sql = NULL;
+                out->rows[out->n++] = (srow){ type, name, root ? (uint32_t)strtoul(root, NULL, 10) : 0, sql }; type = name = sql = NULL;
             }
             free(type); free(name); free(root); free(sql); free(rec);
         }
@@ -85,19 +85,13 @@ static void schema_collect (mw_lane *lane, uint32_t pgno, uint32_t pgsz, srows *
 
 static bool starts_ci (const char *s, const char *p) { while (*s == ' ' || *s == '\n' || *s == '\t' || *s == '\r') s++; return strncasecmp(s, p, strlen(p)) == 0; }
 
-uint32_t mw_name_id (const char *name) {
-    uint32_t h = 2166136261u;
-    for (const unsigned char *p = (const unsigned char *)name; *p; p++) { h ^= (uint32_t)((*p >= 'A' && *p <= 'Z') ? *p + 32 : *p); h *= 16777619u; }
-    return h == 0xFFFFFFFFu ? 0xFFFFFFFEu : h;
-}
-
-static void tab_free (mw_tab *t) { free(t->cell_id); free(t->name); free(t->cell_rec); for (int i = 0; i < t->ncells; i++) free(t->cell_name[i]); free(t->cell_name); }
+static void tab_free (mw_tab *t) { free(t->name); for (int i = 0; i < t->nrec; i++) free(t->rec_name[i]); free(t->rec_name); }
 
 // understand one table with SQLite's help
 static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
-    memset(t, 0, sizeof *t); t->root = r->root; t->name = strdup(r->name);
-    { uint64_t h = 1469598103934665603ull; for (const unsigned char *q = (const unsigned char *)r->sql; *q; q++) { h ^= *q; h *= 1099511628211ull; } t->sqlhash = h; }
-    if (!starts_ci(r->sql, "CREATE TABLE") || starts_ci(r->sql, "CREATE VIRTUAL")) return;
+    memset(t, 0, sizeof *t); t->root = r->root; t->name = strdup(r->name); t->alias_rec = -1;
+    if (!r->sql || !starts_ci(r->sql, "CREATE TABLE") || starts_ci(r->sql, "CREATE VIRTUAL")) return;
+    if (strncasecmp(r->name, "sqlite_", 7) == 0) return;
     char *err = NULL;
     if (sqlite3_exec(scratch, r->sql, NULL, NULL, &err) != SQLITE_OK) { sqlite3_free(err); return; }
     t->without_rowid = strcasestr(r->sql, "WITHOUT ROWID") != NULL;                                       // (a table named so would fool this; the scratch database rejects the statement then)
@@ -110,42 +104,38 @@ static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
         cols[nc].pk = sqlite3_column_int(st, 5); cols[nc].hidden = sqlite3_column_int(st, 6); nc++;
     }
     sqlite3_finalize(st);
-    int rec_of[2048]; int npk = 0;
-    for (int i = 0; i < nc; i++) if (cols[i].pk > 0) npk++;
-    t->npk = npk > MW_CAT_MAXPK ? MW_CAT_MAXPK : npk; t->has_pk = npk > 0;
+    int npk = 0; for (int i = 0; i < nc; i++) if (cols[i].pk > 0) npk++;
+    if (!t->without_rowid && npk == 1) for (int i = 0; i < nc; i++) if (cols[i].pk == 1 && strcasecmp(cols[i].type, "INTEGER") == 0) t->alias_pk = true;
+    t->rec_name = calloc((size_t)(nc ? nc : 1), sizeof(char *));
     int pos = 0;
-    if (t->without_rowid) {
-        for (int k = 1; k <= npk; k++) for (int i = 0; i < nc; i++) if (cols[i].pk == k) rec_of[i] = pos++;
-        for (int i = 0; i < nc; i++) if (cols[i].pk == 0) rec_of[i] = cols[i].hidden == 2 ? -1 : pos++;
-    } else {
-        for (int i = 0; i < nc; i++) rec_of[i] = cols[i].hidden == 2 ? -1 : pos++;
+    for (int i = 0; i < nc && t->rec_name; i++) {
+        if (cols[i].hidden == 2) continue;                                                                   // (generated, virtual: not stored)
+        if (t->alias_pk && cols[i].pk == 1) t->alias_rec = pos;
+        t->rec_name[pos++] = (cols[i].hidden == 3) ? NULL : strdup(cols[i].name);                            // (generated, stored: in the record, derived)
     }
     t->nrec = pos;
-    for (int k = 1; k <= t->npk; k++) for (int i = 0; i < nc; i++) if (cols[i].pk == k) t->pk_rec[k - 1] = rec_of[i];
-    if (!t->without_rowid && npk == 1) for (int i = 0; i < nc; i++) if (cols[i].pk == 1 && strcasecmp(cols[i].type, "INTEGER") == 0) t->alias_pk = true;
-    t->cell_rec = malloc((size_t)nc * sizeof(int)); t->cell_name = malloc((size_t)nc * sizeof(char *));
-    for (int i = 0; i < nc; i++) if (cols[i].pk == 0 && cols[i].hidden == 0) { t->cell_rec[t->ncells] = rec_of[i]; t->cell_name[t->ncells] = strdup(cols[i].name); t->ncells++; }
     for (int i = 0; i < nc; i++) { free(cols[i].name); free(cols[i].type); }
-    t->tracked = true;
-    t->tid = mw_name_id(t->name);
-    t->cell_id = malloc((size_t)(t->ncells ? t->ncells : 1) * sizeof(uint32_t));
-    bool ok = t->cell_id != NULL;
-    for (int i = 0; ok && i < t->ncells; i++) { t->cell_id[i] = mw_name_id(t->cell_name[i]); for (int j = 0; j < i; j++) if (t->cell_id[j] == t->cell_id[i]) ok = false; }
-    if (strncasecmp(t->name, "mw_", 3) == 0 || strncasecmp(t->name, "sqlite_", 7) == 0) t->tracked = false;      // (the store's own tables)
-    // a table without a primary key is identified by its rowid (the user's choice: if peers insert into it concurrently, equal rowids are the same row)
-    t->synced = ok && (t->has_pk || !t->without_rowid) && strncasecmp(t->name, "mw_", 3) != 0 && strncasecmp(t->name, "sqlite_", 7) != 0;
+    t->ok = t->rec_name != NULL;
 }
 
 mw_cat *mw_cat_build (mw_lane *lane) {
     uint32_t pgsz = (uint32_t)lane->db->store->pgsz; srows rows = {0};
-    mw_cat *c = calloc(1, sizeof *c); if (!c) return NULL; atomic_init(&c->refs, 1);
-    uint8_t *p1 = malloc(pgsz); if (p1 && mw_rd_snap_page(lane, 1, p1)) c->cookie = be32(p1 + 40); free(p1);
+    mw_cat *c = calloc(1, sizeof *c); if (!c) return NULL; atomic_init(&c->refs, 1); c->rebasable = true;
+    uint8_t *p1 = malloc(pgsz); if (p1 && mw_rd_snap_page(lane, 1, p1)) { c->cookie = be32(p1 + 40); if (be32(p1 + 56) != 1) { c->rebasable = false; c->why = "the text encoding is not UTF-8"; } } free(p1);
     schema_collect(lane, 1, pgsz, &rows, 0);
     sqlite3 *scratch = NULL; sqlite3_open_v2(":memory:", &scratch, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
     c->tabs = calloc((size_t)(rows.n ? rows.n : 1), sizeof *c->tabs);
-    for (int i = 0; i < rows.n && c->tabs && scratch; i++) { tab_parse(scratch, &rows.rows[i], &c->tabs[c->n]); c->n++; }
-    for (int i = 0; i < c->n; i++) if (c->tabs[i].synced) for (int j = 0; j < i; j++) if (c->tabs[j].synced && c->tabs[j].tid == c->tabs[i].tid) c->tabs[i].synced = false;     // (an id collision between two tables: the later one is not synchronised)
-    for (int i = 0; i < rows.n; i++) { free(rows.rows[i].name); free(rows.rows[i].sql); }
+    for (int i = 0; i < rows.n && c->tabs && scratch; i++) {
+        const srow *r = &rows.rows[i];
+        if (!strcmp(r->type, "trigger")) { c->rebasable = false; c->why = "the database has a trigger"; continue; }
+        if (r->sql && starts_ci(r->sql, "CREATE VIRTUAL")) { c->rebasable = false; c->why = "the database has a virtual table"; }
+        if (r->sql && strcasestr(r->sql, "REFERENCES")) { c->rebasable = false; c->why = "the database has a foreign key"; }
+        tab_parse(scratch, r, &c->tabs[c->n]);
+        if (c->tabs[c->n].without_rowid) { c->rebasable = false; c->why = "the database has a WITHOUT ROWID table"; }
+        c->n++;
+    }
+    if (!c->tabs || !scratch) { c->rebasable = false; c->why = "no memory"; }
+    for (int i = 0; i < rows.n; i++) { free(rows.rows[i].type); free(rows.rows[i].name); free(rows.rows[i].sql); }
     free(rows.rows); sqlite3_close(scratch);
     return c;
 }

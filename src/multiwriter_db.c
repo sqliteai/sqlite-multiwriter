@@ -111,11 +111,6 @@ void mw_db_release_ex (mw_db *db, bool sys) {
     if (!db) return;
     sqlite3_mutex *g = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MAIN);
     sqlite3_mutex_enter(g);
-    if (!sys && db->cdc && db->open_done && !db->orphaned && db->refs - 1 == atomic_load(&db->sys_refs)) {
-        sqlite3_mutex_leave(g);
-        mw_cdc_quiesce(db);
-        sqlite3_mutex_enter(g);
-    }
     if (sys) atomic_fetch_sub(&db->sys_refs, 1);
     if (--db->refs == 0) {
         for (mw_db **pp = &mw_dbs; *pp; pp = &(*pp)->next) {
@@ -126,7 +121,6 @@ void mw_db_release_ex (mw_db *db, bool sys) {
         // last connection gone: stop the compactor, materialise everything into the real file (it is then an
         // ordinary SQLite database again) and drop the log. If the database failed, the log is kept for recovery.
         mw_db_compactor_stop(db);
-        mw_cdc_close(db);
         for (int i = 0; i < db->nrext; i++) free(db->rext[i].data);
         free(db->rext); db->rext = NULL; db->nrext = db->caprext = 0;
         bool clean = false, sole = true;

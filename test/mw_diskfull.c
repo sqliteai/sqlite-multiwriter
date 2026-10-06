@@ -14,11 +14,9 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stdbool.h>
 #include "mw_test.h"
 #include "multiwriter.h"
-#include "multiwriter_meta.h"
-#include "multiwriter_catalog.h"
-#include "crdt.h"
 
 static char img[256], mnt[256], ballast[300];
 
@@ -81,7 +79,7 @@ static void ballast_fill (long leave) {
 }
 
 static int open_cdc (const char *path, sqlite3 **db, bool shared) {
-    char uri[600]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_cdc=1&mw_log_max_mb=1%s", path, shared ? "&mw_mp=1" : "");
+    char uri[600]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_log_max_mb=1%s", path, shared ? "&mw_mp=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;
@@ -91,7 +89,6 @@ static int integrity_ok (sqlite3 *db) {
     if (sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) ok = strcmp((const char *)sqlite3_column_text(st, 0), "ok") == 0;
     sqlite3_finalize(st); return ok;
 }
-static void pk_int (int64_t id, uint8_t *pk, size_t *n) { crdt_value v = { CRDT_INTEGER, id, 0, NULL, 0 }; *n = crdt_pk_encode(&v, 1, pk, 32); }
 static int exec_retry (sqlite3 *db, const char *sql) { for (int i = 0; i < 1000; i++) { int rc = mw_exec(db, sql); if ((rc & 0xff) != SQLITE_BUSY) return rc; } return SQLITE_BUSY; }
 
 #define NROWS 100
@@ -105,25 +102,17 @@ static void make_db (const char *path) {
     CHECK_RC(mw_exec(db, "COMMIT"), SQLITE_OK);
     sqlite3_close(db);
 }
-static int check_rows (sqlite3 *db, int64_t *sum, int *rows) {
-    mw_meta *m = NULL; if (sqlite3_file_control(db, "main", MW_FCNTL_META, &m) != SQLITE_OK) return -1;
+static int check_rows (sqlite3 *db, int64_t *sum, int *rows) {                      // returns -1 when the table cannot be read; the counters themselves are checked against the commits that were acknowledged
     sqlite3_stmt *st; if (sqlite3_prepare_v2(db, "SELECT id, n FROM t", -1, &st, NULL) != SQLITE_OK) return -1;
-    int bad = 0; *sum = 0; *rows = 0; uint32_t ncol = mw_name_id("n");
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        int64_t id = sqlite3_column_int64(st, 0), n = sqlite3_column_int64(st, 1); uint8_t pk[32]; size_t pl; pk_int(id, pk, &pl);
-        mw_mcell *c; int nc; mw_meta_row(m, mw_name_id("t"), pk, pl, &c, &nc);
-        int64_t cv = -1; for (int i = 0; i < nc; i++) if (c[i].col == ncol) cv = c[i].cv;
-        if (cv != 1 + 2 * n) { if (bad < 3) printf("    row %lld: n=%lld cv=%lld (cells %d)\n", (long long)id, (long long)n, (long long)cv, nc); bad++; }
-        free(c); *sum += n; (*rows)++;
-    }
-    sqlite3_finalize(st); return bad;
+    *sum = 0; *rows = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) { *sum += sqlite3_column_int64(st, 1); (*rows)++; }
+    sqlite3_finalize(st); return 0;
 }
 
 // The child: transactions of two counter updates and one 2 KB row. `ms`: for how long it keeps trying after the first failure (the parent frees the space meanwhile when relief is set).
 // Reports each acknowledged transaction, then (-1, failures, successes after the first failure).
 static void child_run (const char *path, bool shared, int ackfd, int ms_after_fail, int max_txn, const char *gate) {
     alarm(120);
-    setenv("MW_META_FLUSH_ROWS", "7", 1); setenv("MW_META_FLUSH_MS", "5", 1);
     sqlite3 *db = NULL; int failures = 0, after = 0; bool failed_once = false; struct timespec t_fail = {0};
     int orc = open_cdc(path, &db, shared);
     if (orc != SQLITE_OK && getenv("MW_VERBOSE")) fprintf(stderr, "child: open failed: %d %s (errno %d)\n", orc, db ? sqlite3_errmsg(db) : "", db ? sqlite3_system_errno(db) : 0);

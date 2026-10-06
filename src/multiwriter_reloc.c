@@ -336,7 +336,6 @@ int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgno
                 v.own_pgnos = own_pg; v.own_epochs = own_ep; v.own_n = nown;    // page 1 and the merged pages were merged against the state at their epochs
                 v.adopt_images = true;                                          // the store keeps our private copies (and frees them on failure)
                 if (rc == SQLITE_OK) {
-                    if (db->cdc) mw_cdc_relocated(lane);
                     uint64_t *rch = NULL;                                       // (multi-process: the hashes made before the lock hold for the pages that the relocation did not change; the others are made by the append)
                     if (db->mp && lane->pre_ch && n == lane->ws_n && (rch = malloc((size_t)n * sizeof(uint64_t)))) {
                         memcpy(rch, lane->pre_ch, (size_t)n * sizeof(uint64_t)); rch[i1] = 0;

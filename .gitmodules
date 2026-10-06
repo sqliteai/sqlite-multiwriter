@@ -1,3 +1,0 @@
-[submodule "deps/sqlite-sync"]
-	path = deps/sqlite-sync
-	url = https://github.com/sqliteai/sqlite-sync.git

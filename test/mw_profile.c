@@ -3,7 +3,7 @@
 #include "multiwriter.h"
 
 static int open_lane (const char *path, sqlite3 **db, const char *extra) {
-    char uri[500]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_cdc=1%s", path, extra);
+    char uri[500]; snprintf(uri, sizeof uri, "file:%s?mw=2%s", path, extra);
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 5000); }
     return rc;

@@ -14,14 +14,12 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <stdbool.h>
 #include "mw_test.h"
 #include "multiwriter.h"
-#include "multiwriter_meta.h"
-#include "multiwriter_catalog.h"
-#include "crdt.h"
 
 static int open_cdc (const char *path, sqlite3 **db, bool shared) {
-    char uri[400]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_cdc=1&mw_log_max_mb=1%s", path, shared ? "&mw_mp=1" : "");
+    char uri[400]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_log_max_mb=1%s", path, shared ? "&mw_mp=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;
@@ -31,7 +29,6 @@ static int integrity_ok (sqlite3 *db) {
     if (sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) ok = strcmp((const char *)sqlite3_column_text(st, 0), "ok") == 0;
     sqlite3_finalize(st); return ok;
 }
-static void pk_int (int64_t id, uint8_t *pk, size_t *n) { crdt_value v = { CRDT_INTEGER, id, 0, NULL, 0 }; *n = crdt_pk_encode(&v, 1, pk, 32); }
 static int exec_retry (sqlite3 *db, const char *sql) { for (int i = 0; i < 1000; i++) { int rc = mw_exec(db, sql); if ((rc & 0xff) != SQLITE_BUSY) return rc; } return SQLITE_BUSY; }
 
 #define NROWS 200
@@ -46,19 +43,11 @@ static void make_db (const char *path) {
     sqlite3_close(db);
 }
 
-// the cell of n of every row must have cv == 1 + 2 * n; returns the rows that disagree, -1 when the metadata cannot be read
-static int check_rows (sqlite3 *db, int64_t *sum, int *rows) {
-    mw_meta *m = NULL; if (sqlite3_file_control(db, "main", MW_FCNTL_META, &m) != SQLITE_OK) return -1;
+static int check_rows (sqlite3 *db, int64_t *sum, int *rows) {                      // returns -1 when the table cannot be read; the counters themselves are checked against the commits that were acknowledged
     sqlite3_stmt *st; if (sqlite3_prepare_v2(db, "SELECT id, n FROM t", -1, &st, NULL) != SQLITE_OK) return -1;
-    int bad = 0; *sum = 0; *rows = 0; uint32_t ncol = mw_name_id("n");
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        int64_t id = sqlite3_column_int64(st, 0), n = sqlite3_column_int64(st, 1); uint8_t pk[32]; size_t pl; pk_int(id, pk, &pl);
-        mw_mcell *c; int nc; mw_meta_row(m, mw_name_id("t"), pk, pl, &c, &nc);
-        int64_t cv = -1; for (int i = 0; i < nc; i++) if (c[i].col == ncol) cv = c[i].cv;
-        if (cv != 1 + 2 * n) { if (bad < 3) printf("    row %lld: n=%lld cv=%lld (cells %d)\n", (long long)id, (long long)n, (long long)cv, nc); bad++; }
-        free(c); *sum += n; (*rows)++;
-    }
-    sqlite3_finalize(st); return bad;
+    *sum = 0; *rows = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) { *sum += sqlite3_column_int64(st, 1); (*rows)++; }
+    sqlite3_finalize(st); return 0;
 }
 
 typedef struct { int kinds; int err; int sticky; int shortw; const char *name; int recover; } scenario;       // recover: the fault is lifted after a few failed commits, and the database must take transactions again without being opened
@@ -69,7 +58,6 @@ static void child_run (const char *path, bool shared, const scenario *sc, long n
     int failures = 0, after_ok = 0, recovered_at = 0, possible = 0;
     alarm(120);                                                       // (a hang is a failure: SIGALRM ends the child)
     setenv("MW_ENOSPC_WAIT_MS", sc->recover == 3 ? "2000" : "0", 1);                              // (no waiting for room: the scenarios look at what a failed write does)
-    setenv("MW_META_FLUSH_ROWS", "7", 1); setenv("MW_META_FLUSH_MS", "5", 1);
     mw_io_fault_arm(sc->kinds, nth, sc->err, sc->sticky, sc->shortw);
     sqlite3 *db = NULL;
     if (open_cdc(path, &db, shared) == SQLITE_OK) {

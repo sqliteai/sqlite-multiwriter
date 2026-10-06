@@ -13,7 +13,7 @@ make -j8 dist/mw_serial >/dev/null 2>&1 || { echo "build failed"; exit 2; }
 gcc -O1 -o /tmp/nbdcli test/power/nbdcli.c
 IMG=/tmp/mwpower_disk.img; rm -f $IMG; truncate -s 1G $IMG
 rm -rf /dev/shm/mwp_rec /dev/shm/mwp_side; mkdir -p /dev/shm/mwp_rec /dev/shm/mwp_side
-export MW_SERIAL_MODE=${MW_SERIAL_MODE:-processes} MW_SIDECAR_DIR=/dev/shm/mwp_side MW_SERIAL_REC=/dev/shm/mwp_rec MW_SERIAL_KEYS=$KEYS MW_SERIAL_SECS=$SECS
+export MW_SERIAL_REBASE=${MW_SERIAL_REBASE:-} MW_SERIAL_MODE=${MW_SERIAL_MODE:-processes} MW_SIDECAR_DIR=/dev/shm/mwp_side MW_SERIAL_REC=/dev/shm/mwp_rec MW_SERIAL_KEYS=$KEYS MW_SERIAL_SECS=$SECS
 start_disk () {      # dev
     : > /tmp/mwpower_cli.log
     python3 test/power/nbdsrv.py $IMG 10809 $SEED $P 2>>/tmp/mwpower_srv.log & SRV=$!

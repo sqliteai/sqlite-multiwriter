@@ -69,8 +69,7 @@ static void run (const char *table, int tracked) {
     int ok = 0, retries = 0, bad = 0;
     for (int i = 0; i < NT; i++) { pthread_join(th[i], NULL); ok += w[i].ok; retries += w[i].retries; bad += w[i].bad_last_rowid; }
     mw_db_stats st = stats(a);
-    printf("%-3s (%s): inserts=%d retries=%d collisions=%llu rebases=%llu\n", table, tracked ? "tracked" : "untracked", ok, retries,
-           (unsigned long long)st.pk_collisions, (unsigned long long)st.rebases);
+    printf("%-3s (%s): inserts=%d retries=%d rebases=%llu\n", table, tracked ? "tracked" : "untracked", ok, retries, (unsigned long long)st.rebases);
     CHECK(ok == NT * PER);
     CHECK(bad == 0);
 

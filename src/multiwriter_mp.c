@@ -442,40 +442,8 @@ uint64_t mw_mp_global_oldest (mw_db *db) {
     return oldest;
 }
 
-// Reservation: publish a lower bound in the slot *before* taking the number, so the send ceiling can never
-// pass a version that is about to be reserved.
-int64_t mw_mp_reserve (mw_lane *lane, int64_t at_least) {
-    mw_shm *sh = lane->db->shm;
-    mw_mp_slot *sl = &sh->slots[lane->mp_slot];
-    int64_t low = atomic_load(&sh->dbv_counter) + 1;
-    if (atomic_load(&sl->minres) == 0) { atomic_store(&sl->minres, low); atomic_thread_fence(memory_order_seq_cst); }
-    int64_t cur = atomic_load(&sh->dbv_counter), v;
-    do { v = (cur > at_least ? cur : at_least) + 1; } while (!atomic_compare_exchange_weak(&sh->dbv_counter, &cur, v));
-    if (lane->nresv == lane->resv_cap) {
-        int cap = lane->resv_cap ? lane->resv_cap * 2 : 8;
-        int64_t *p = sqlite3_realloc64(lane->resv, (sqlite3_uint64)cap * sizeof(int64_t));
-        if (p) { lane->resv = p; lane->resv_cap = cap; }
-    }
-    if (lane->nresv < lane->resv_cap) lane->resv[lane->nresv++] = v; else lane->rebasable = false;
-    return v;
-}
-
-int64_t mw_mp_ceiling (mw_db *db) {
-    mw_shm *sh = db->shm;
-    int64_t ceiling = atomic_load(&sh->dbv_counter);
-    for (int i = 0; i < MW_MP_SLOTS; i++) {
-        int32_t pid = atomic_load(&sh->slots[i].pid);
-        if (pid <= 0) continue;
-        int64_t m = atomic_load(&sh->slots[i].minres);
-        if (m != 0 && m - 1 < ceiling && pid_alive(db, pid)) ceiling = m - 1;
-    }
-    return ceiling;
-}
-
 // MARK: - compaction coordination and log reset -
 
-bool mw_mp_meta_lock (mw_db *db, int which, bool wait) { return fcntl_lock(db->mp_pubfd, ((off_t)1 << 20) + 8 + which, F_WRLCK, wait) == 0; }
-void mw_mp_meta_unlock (mw_db *db, int which) { fcntl_lock(db->mp_pubfd, ((off_t)1 << 20) + 8 + which, F_UNLCK, false); }
 bool mw_mp_compaction_lock (mw_db *db) { return fcntl_lock(db->mp_pubfd, MP_LOCK_COMPACT, F_WRLCK, false) == 0; }
 void mw_mp_compaction_unlock (mw_db *db) { fcntl_lock(db->mp_pubfd, MP_LOCK_COMPACT, F_UNLCK, false); }
 

@@ -95,13 +95,11 @@ static uint32_t lane_schema_cookie (mw_lane *lane) {
     return ((uint32_t)c[0] << 24) | ((uint32_t)c[1] << 16) | ((uint32_t)c[2] << 8) | c[3];
 }
 
-// A conflicting transaction can be rebased only if everything it did has a logical (sqlite-sync)
-// representation: no DDL (its page 1 carries a different schema cookie than the snapshot's), no write to
-// an untracked table or by a remote apply (both flagged through the preupdate hook), at least one
-// reserved db_version, and it is not itself a rebase helper.
+// A conflicting transaction can be rebased (multiwriter_rebase.c: its row changes are replayed at the latest snapshot) only if the connection asked for it (URI mw_rebase=1), it is not itself a
+// rebase helper, it is the first commit of its snapshot (a later one would be missing the pages of the earlier one) and it changed no schema (its page 1 carries the snapshot's cookie).
 static bool lane_can_rebase (mw_lane *lane, const uint8_t *pg1, uint32_t snapshot_cookie) {
-    if (lane->norebase || !lane->rebasable || lane->nresv == 0) return false;
-    if (lane->commit_base > 0) return false;                     // a later commit inside one read snapshot: the overlay would miss the earlier one's pages
+    if (lane->norebase || !lane->rebase_on) return false;
+    if (lane->commit_base > 0) return false;
     if (pg1) {
         uint32_t c = ((uint32_t)pg1[40] << 24) | ((uint32_t)pg1[41] << 16) | ((uint32_t)pg1[42] << 8) | pg1[43];
         if (c != snapshot_cookie) return false;                  // DDL in this transaction
@@ -155,9 +153,6 @@ static int lane_publish_inner (mw_lane *lane) {
         for (int i = 0; i < lane->ws_n; i++) if (lane->ws_pgnos[i] < lane->rs_bits_cap) lane->rs_bits[lane->ws_pgnos[i]] &= (uint8_t)~2;
     }
     { static _Atomic int tr = MW_KNOB_UNSET; if (mw_knob_flag(&tr, "MW_PAGE_TRACE")) { char line[2048]; int o = snprintf(line, sizeof line, "PAGES n=%d:", lane->ws_n); for (int i = 0; i < lane->ws_n && o < (int)sizeof line - 12; i++) o += snprintf(line + o, sizeof line - (size_t)o, " %u", (unsigned)lane->ws_pgnos[i]); fprintf(stderr, "%s\n", line); } }   // (diagnostic: the page numbers of every commit, to map them to B-trees offline)
-    if (mw_rowdiff_enabled() && !lane->norebase) mw_rowdiff_commit(lane, imgs);
-    if (db->cdc && !lane->norebase) { if (lane->sys) mw_cdc_skip(lane); else mw_cdc_prepare(lane, imgs); }       // (the metadata store's own commits write only mw_* tables: never tracked, never in the owner maps: nothing to capture)
-    if (lane->cdc_err) { int e = lane->cdc_err; lane->cdc_err = 0; free(imgs); free(ro); return e; }          // (the commit's metadata could not be built: the commit does not go out without it)
     mw_validate v = { .snapshot_epoch = lane->tx.snapshot_epoch, .check_cookie = true, .cookie = cookie, .read_pgnos = ro, .n_read = nro,
                       .own_pgnos = lane->own_pg, .own_n = lane->own_n, .own_epoch = lane->own_epoch, .own_epochs = lane->own_ep };
     uint64_t epoch = 0;
@@ -214,9 +209,8 @@ static int lane_publish_inner (mw_lane *lane) {
         else if (lane_can_rebase(lane, pg1, cookie)) {
             // 2. Physical conflict, but the transaction is fully described by sqlite-sync changes:
             // discard its pages and replay them at the latest snapshot; stock SQLite regenerates the pages.
-            mw_overlay ov = { .images = imgs, .n = lane->ws_n, .dbsize = lane->ws_dbsize, .snapshot = lane->tx.snapshot_epoch };
             if (!long_tx) lane->retry_credit = lane->hot_credit;      // a physical conflict: run the next transactions serialised, on the fast path (not the long ones, see above)
-            rc = mw_lane_rebase(lane, &ov);
+            rc = mw_lane_rebase(lane, imgs, cookie, &epoch);
             if (rc == SQLITE_OK) { lane->tx.state = MW_TX_COMMITTED; lane->consec_aborts = 0; }   // commit_epoch was set by the rebase (the credit granted above is spent by the next commits)
             else if (rc != MW_CONFLICT) { lane->tx.state = MW_TX_ABORTED; atomic_fetch_add(&db->n_aborts, 1); }   // (any other failure also rolls the transaction back)
         }
@@ -236,9 +230,9 @@ static int lane_publish_inner (mw_lane *lane) {
         // its statement again, and waiting for a turn costs more than the occasional retry (measured: 8-32 concurrent bulk / append writers, 1.3-1.5x faster without).
         lane->consec_aborts++;
         const bool starving = lane->consec_aborts >= (long_tx ? long_starve() : 16);          // (a long transaction that lost twice in a row takes the turn and keeps it for hot_credit*16 transactions: FIFO queue, bounded tail)
-        if (!lane->norebase && rc != MW_CONFLICT_SCHEMA && rc != MW_CONFLICT_READ && ((lane->rebasable && lane->nresv > 0 && !long_tx) || starving)) {
+        if (!lane->norebase && rc != MW_CONFLICT_SCHEMA && rc != MW_CONFLICT_READ && ((lane->rebase_on && !long_tx) || starving)) {
             lane->retry_credit = long_tx ? lane->hot_credit * 16 : lane->hot_credit;
-            if (mw_timing_on) { extern _Atomic uint64_t mw_grants[2]; atomic_fetch_add(&mw_grants[(lane->rebasable && lane->nresv > 0) ? 0 : 1], 1); }
+            if (mw_timing_on) { extern _Atomic uint64_t mw_grants[2]; atomic_fetch_add(&mw_grants[lane->rebase_on ? 0 : 1], 1); }
         }
         rc = SQLITE_BUSY_SNAPSHOT;
     }
@@ -389,11 +383,9 @@ void mw_lane_free (mw_lane *lane) {
     sqlite3_free(lane->ws_frame);
     sqlite3_free(lane->own_pg); sqlite3_free(lane->own_ep);
     sqlite3_free(lane->ws_hash);
-    sqlite3_free(lane->resv);
     sqlite3_free(lane->rs_bits);
     sqlite3_free(lane->rs_list);
     mw_lane_rebase_free(lane);
-    mw_cdc_lane_free(lane);
     sqlite3_free(lane);
 }
 
@@ -435,7 +427,6 @@ static int lm_read (sqlite3_file *pf, void *buf, int n, sqlite3_int64 off) {
     mw_ev(MW_EV_READ, (mw_file *)pf, off, n, 2);
     mw_store *st = lane->db->store;
     uint64_t snap = lane_snapshot(lane);
-    const mw_overlay *ov = lane->overlay;
     uint8_t *dst = buf;
     int remaining = n;
     sqlite3_int64 o = off;
@@ -444,20 +435,10 @@ static int lm_read (sqlite3_file *pf, void *buf, int n, sqlite3_int64 off) {
         uint32_t poff = (uint32_t)(o % st->pgsz);
         uint32_t take = (uint32_t)st->pgsz - poff;
         if ((int)take > remaining) take = (uint32_t)remaining;
-        const uint8_t *oimg = NULL;
-        if (ov) {                                   // rebase read view: the transaction's own page images win
-            int lo = 0, hi = ov->n - 1;
-            while (lo <= hi) {
-                int mid = (lo + hi) / 2;
-                if (ov->pgnos[mid] == pgno) { oimg = ov->images[mid]; break; }
-                if (ov->pgnos[mid] < pgno) lo = mid + 1; else hi = mid - 1;
-            }
-        }
-        if (lane->readcheck && lane->snapshot_held && !ov && pgno != 1) rs_mark(lane, pgno);
-        if (oimg) memcpy(dst, oimg + poff, take);
-        else if (!mw_store_read(st, pgno, snap, poff, take, dst)) {
+        if (lane->readcheck && lane->snapshot_held && pgno != 1) rs_mark(lane, pgno);
+        if (!mw_store_read(st, pgno, snap, poff, take, dst)) {
             int rc = mw_io_hit(MW_IO_READ, NULL) ? SQLITE_IOERR_READ : pass_io->xRead(pf, dst, (int)take, o);
-            if (rc == SQLITE_OK && poff == 0 && take == (uint32_t)st->pgsz && !ov) mw_store_cache_base(st, pgno, dst);
+            if (rc == SQLITE_OK && poff == 0 && take == (uint32_t)st->pgsz) mw_store_cache_base(st, pgno, dst);
             if (rc != SQLITE_OK) {
                 if (rc == SQLITE_IOERR_SHORT_READ) memset(dst + take, 0, (size_t)remaining - take);
                 return rc;
@@ -477,8 +458,7 @@ static int lm_filesize (sqlite3_file *pf, sqlite3_int64 *size) {
     mw_lane *lane = FILE_LANE(pf);
     tls_lane = lane;
     uint32_t pages;
-    if (lane->overlay) pages = lane->overlay->dbsize;
-    else {
+    {
         uint64_t snap = lane_snapshot(lane);
         if (!lane->dsz_valid || lane->dsz_epoch != snap) { lane->dsz_val = mw_store_dbsize(lane->db->store, snap); lane->dsz_epoch = snap; lane->dsz_valid = true; }
         pages = lane->dsz_val;
@@ -514,27 +494,9 @@ static int lm_file_control (sqlite3_file *pf, int op, void *arg) {
         return SQLITE_OK;
     }
     if (op == MW_FCNTL_DBSTATS) { mw_lane_fill_stats(lane, (mw_db_stats *)arg); return SQLITE_OK; }
-    if (op == MW_FCNTL_RESERVE_DBV) { int64_t *v = (int64_t *)arg; *v = mw_lane_reserve_version(lane, *v); return SQLITE_OK; }
-    if (op == MW_FCNTL_SEND_CEILING) {
-        // committed rows only exist above the real file's; nothing published at all => no ceiling constraint beyond the counter
-        int64_t c = mw_db_send_ceiling_of(lane->db);
-        *(int64_t *)arg = c;
-        return SQLITE_OK;
-    }
     if (op == MW_FCNTL_DDL_BEGIN) { mw_lane_ddl_begin(lane); return SQLITE_OK; }
-    if (op == MW_FCNTL_MARK_UNREBASABLE) { lane->rebasable = false; return SQLITE_OK; }
-    if (op == MW_FCNTL_SET_OVERLAY) {
-        lane->overlay = (mw_overlay *)arg;
-        lane->forced_snapshot = lane->overlay ? lane->overlay->snapshot : 0;
-        return SQLITE_OK;
-    }
     if (op == MW_FCNTL_COMPACT) { mw_compact_result *r = (mw_compact_result *)arg; return mw_db_compact(lane->db, r); }
     if (op == MW_FCNTL_LANE_PTR) { *(void **)arg = lane; return SQLITE_OK; }
-    if (op == MW_FCNTL_GATE) { if (*(int *)arg) mw_gate_close(lane->db, lane); else mw_gate_open(lane->db); return SQLITE_OK; }
-    if (op == MW_FCNTL_DECLARE) { lane->cdc_decl = arg; return SQLITE_OK; }
-    if (op == MW_FCNTL_VACUUM_BEGIN) { lane->cdc_vacuum = arg ? *(int *)arg != 0 : true; return SQLITE_OK; }       // (an int 0 clears it: the statement is over)
-    if (op == MW_FCNTL_META) { *(void **)arg = mw_cdc_meta(lane->db); return *(void **)arg ? SQLITE_OK : SQLITE_NOTFOUND; }
-    if (op == MW_FCNTL_CDC_SINK) return mw_cdc_set_public_sink(lane->db, (const mw_capture_sink *)arg);
     if (op == MW_FCNTL_GC) { *(uint64_t *)arg = mw_db_gc(lane->db); return SQLITE_OK; }
     if (op == SQLITE_FCNTL_MMAP_SIZE) { *(sqlite3_int64 *)arg = 0; return SQLITE_OK; }   // mmap disabled: reports 0 disabled: reads must go through xRead
     if (op == SQLITE_FCNTL_SIZE_HINT) return SQLITE_OK;         // we never grow the real file from a lane

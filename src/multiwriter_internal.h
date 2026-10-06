@@ -20,12 +20,9 @@
 #include "multiwriter.h"
 #include "multiwriter_catalog.h"
 
-// One row of the net change of a commit. pk: the key as sqlite-sync encodes it (NULL if the row could not be decoded); oldpk: an update that changed the key; changed: bit i = cell i of
-// the table changed (bit 63 = all of them); tab NULL: a row in a page whose table is unknown.
-typedef struct { int kind; const mw_tab *tab; uint32_t root; int64_t rowid; uint8_t *pk; size_t pklen; uint8_t *oldpk; size_t oldpklen; uint64_t changed; uint64_t *wide; } mw_chg;     // wide: a table with more than 63 cells: one bit per cell (changed has bit 63 set)
-typedef struct { uint32_t page, leaf; } mw_ovupd;                    // overflow page -> the leaf page holding the cell whose record spills into it
-typedef struct { mw_chg *chg; int n; uint32_t *freed; int nfreed; mw_ovupd *ovupd; int novupd; int unknown_ovfl; mw_rowdiff_info info; } mw_rd_result;
-
+// One row of the net change of a transaction (multiwriter_rowdiff.c): kind 1 inserted (new_rec), 2 changed (old_rec -> new_rec), 3 deleted (old_rec). The records are SQLite's own (header, serial types, values).
+typedef struct { int kind; const mw_tab *tab; int64_t rowid; uint8_t *old_rec; uint32_t old_len; uint8_t *new_rec; uint32_t new_len; } mw_chg;
+typedef struct { mw_chg *chg; int n; const char *unsupported; } mw_rd_result;
 
 typedef struct mw_db   mw_db;
 #define MW_LOG_OFF(db) __atomic_load_n(&(db)->log_off, __ATOMIC_RELAXED)      // (log_off is written under the store's seq_mu and read by the log's threads under log_mu: both sides are atomic accesses)
@@ -97,26 +94,6 @@ typedef struct mw_shm {
     _Atomic uint64_t  compact_end_ns;     // when the last compaction ended (periodic compactions of all processes share one interval)
     _Atomic uint64_t  compact_busy_T;     // a compaction is reading versions <= this: the index GC must not free them (0 = none)
     // the CRDT metadata in shared mode (multiwriter_mmeta.c)
-#define MW_MAX_SITES 16384
-#define MW_MAX_PURGE 64
-    _Atomic uint64_t  dv_origin;          // db_version = epoch + dv_origin (an incarnation of the database starts its epochs again at 1; the db_versions go on from the largest one the file has seen)
-    _Atomic uint64_t  dv_hwm;             // the largest db_version written to the file tables
-    _Atomic uint64_t  meta_flush_ns;      // when (CLOCK_MONOTONIC) the last flush of any process ended: the flushers of all the processes pace themselves by it
-    _Atomic uint64_t  meta_flushed;       // db_version up to which the cells are in the file tables
-    _Atomic uint64_t  rx_gc_base;          // the last garbage collection of the metadata index ran with this base (nothing older than it is in a chain's head any more)
-    _Atomic uint64_t  meta_last;          // epoch of the newest commit that carried metadata
-    _Atomic uint64_t  meta_dirty;         // row buckets installed since the last flush (approximate)
-    _Atomic uint64_t  own_cookie;         // the owner maps were built for this schema cookie: (1 << 32) | cookie, 0 = not built
-    _Atomic uint32_t  cdc_on;             // the database captures metadata (set by the first opener; every process then does)
-    _Atomic uint32_t  own_ovfl_complete;  // the overflow owner map covers every record with overflow
-    _Atomic uint32_t  meta_state;         // 0 = not loaded from the file, 1 = being loaded, 2 = ready
-    _Atomic int32_t   flush_pid;          // process flushing the metadata (0 = none)
-    _Atomic uint32_t  sites_flushed;      // site ids [0, sites_flushed) are in the file table
-    _Atomic uint32_t  nsites;             // site ids known (ord -> id); ord 0 is this database
-    _Atomic uint32_t  npurge;
-    struct { _Atomic uint32_t tbl; _Atomic uint64_t epoch; } purge[MW_MAX_PURGE];     // dropped tables whose old cells in the file are dead and not yet deleted
-    uint64_t          sen_bloom[(1u << 23) / 64];     // a filter over the keys that have, or had, a causal-length entry (the rows that were deleted): a key that is not in it has no earlier life
-    uint8_t           sites[MW_MAX_SITES][16];
     mw_mp_proc        procs[MW_MP_PROCS];
     mw_mp_slot        slots[MW_MP_SLOTS];
 } mw_shm;
@@ -205,14 +182,11 @@ struct mw_lane {
     size_t      rs_bits_cap;
     uint32_t   *rs_list;
     int         rs_n, rs_cap;
-    bool        rebasable;      // no write without a logical representation (DDL, untracked tables, remote apply)
     bool        sys;            // URI mw_sys=1: a connection of the metadata store itself (not counted as a user of the database)
     bool        norebase;       // this connection is itself a rebase helper: never rebase recursively
-    int64_t    *resv;           // db_versions reserved by the current transaction (ascending)
-    int         nresv, resv_cap;
-    mw_overlay *overlay;        // rebase read view (helper connections only)
-    uint64_t    forced_snapshot;// helper connections read at this epoch instead of the current one
-    uint64_t    rb_gen;          // schema generation the helpers were opened at (they cache the table list)
+    bool        rebase_on;      // URI mw_rebase=1: a commit that conflicts on pages only is replayed at the latest snapshot (multiwriter_rebase.c)
+    sqlite3    *rb_db;          // the helper connection that replays (opened at the first rebase)
+    void       *rb_state;       // what the helper caches: catalog, statements (multiwriter_rebase.c)
     int         consec_aborts;   // refusals since this lane last committed (a starving lane is granted a turn even when its transactions are untracked)
     int         adm_slot;            // multi-process admission slot held by the current transaction (-1 none)
     bool        recent_writer;       // the previous transaction wrote: the next one goes through admission
@@ -232,23 +206,7 @@ struct mw_lane {
     bool        dsz_valid;
     bool        noreloc;         // URI mw_noreloc=1: never renumber new pages after a growth conflict (measurement)
     bool        rs_overflow;     // read-set tracking ran out of memory in this snapshot: the read set is incomplete
-    sqlite3_stmt *rb_st[7];     // prepared statements of the helpers (extract, base version | row cl, cell version, insert, BEGIN, COMMIT)
-    int         rb_sync;        // synchronous level set on rb_c (-1: not yet)
-    sqlite3    *rb_c, *rb_v;    // cached rebase helper connections (writer at the latest snapshot / overlay reader)
-    // change capture (mw_cdc=1): the row changes of the transaction being committed, and the catalog they were decoded with
-    mw_rd_result cdc_res; mw_cat *cdc_cat; int cdc_nfreed;
     uint32_t    bp_wait_us;                      // back-pressure: sleep this long after the publication lock is released
-    bool        cdc_vacuum;                      // a VACUUM statement is running on this connection (its commit rebuilds every table)
-    const uint8_t *const *cdc_over;              // while the catalog of a schema-changing commit is read: the pages the commit wrote (they win over the snapshot's)
-    const char *const *cdc_skip; int cdc_nskip;  // tables whose rows are not diffed in this commit (reshaped by DDL)
-    const char *const *cdc_skip_old; int cdc_nskip_old;   // tables whose rows are not diffed on the old side only (dropped and created again: the old rows are gone, the new ones are inserts)
-    struct mw_ovl *cdc_decl;                     // set by the sync layer around the transaction that applies remote changes: its metadata is declared, not derived
-    struct mw_ovl *cdc_ovl;
-    int          cdc_ng; uint32_t *cdc_gbucket, *cdc_goff; uint64_t *cdc_gseen;      // the groups of the extension (shared mode): bucket, offset in the extension, the head epoch of the bucket when its state was read
-                         // the metadata delta of the commit being published (multiwriter_meta.c)
-    int          cdc_err;                       // the capture could not produce the commit's metadata (a read of the metadata store failed, no memory): the commit is refused, never written without it
-    uint8_t *cdc_ext; uint32_t cdc_ext_len;      // the commit's change-capture extension, written in the log record next to the pages
-    int64_t     min_reserved;   // lowest db_version reserved by the current transaction, 0 = none (protected by db->mu)
     uint64_t    writer_id;      // unique per connection (lane) in this process; NOT the sqlite-sync site_id
     mw_tx_info  tx;             // current/last transaction
     uint64_t    mp_t0, adm_t0;
@@ -586,42 +544,17 @@ void    mw_db_release (mw_db *db);
 void     mw_lane_init (mw_lane *lane, mw_db *db);
 void     mw_lane_snapshot_begin (mw_lane *lane);
 void     mw_lane_snapshot_end (mw_lane *lane);
-int64_t  mw_lane_reserve_version (mw_lane *lane, int64_t at_least);
-int64_t  mw_db_send_ceiling_of (mw_db *db);
-int      mw_lane_rebase (mw_lane *lane, mw_overlay *ov);
 void     mw_gate_enter (mw_db *db, mw_lane *lane);       // publishers: shared side
 void     mw_gate_exit (mw_db *db);
 void     mw_gate_close (mw_db *db, mw_lane *owner);       // starving rebase: exclusive side
 void     mw_gate_open (mw_db *db);   // multiwriter_rebase.c: replay the logical changes at the latest snapshot
-void     mw_lane_rebase_free (mw_lane *lane);
-typedef struct { void *ctx; uint32_t (*old_owner) (void *ctx, uint32_t pgno); uint32_t (*ovfl_owner) (void *ctx, uint32_t pgno); const mw_cat *cat; const mw_cat *old_cat; const char *const *skip; int nskip; } mw_rd_owner;      // the table (root page) a page belonged to before the commit, 0 if unknown; the schema
 // One row of the net change of a commit. pk: the key as sqlite-sync encodes it (NULL if the row could not be decoded); oldpk: an update that changed the key; changed: bit i = cell i of the
-// table changed (bit 63 = all of them).
 void     mw_rd_result_free (mw_rd_result *r);
-int      mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_rd_owner *own, mw_rd_result *res);
+int      mw_lane_rebase (mw_lane *lane, const uint8_t *const *imgs, uint32_t cookie, uint64_t *out_epoch);    // multiwriter_rebase.c: replay the row changes at the latest snapshot
+void     mw_lane_rebase_free (mw_lane *lane);
+int      mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_cat *cat, mw_rd_result *res);   // multiwriter_rowdiff.c
 bool     mw_rd_snap_page (mw_lane *lane, uint32_t pgno, uint8_t *dst);
-int      mw_cdc_open (mw_db *db);
-int      mw_cdc_set_public_sink (mw_db *db, const mw_capture_sink *s);
-void     mw_cdc_close (mw_db *db);
-void     mw_cdc_prepare (mw_lane *lane, const uint8_t *const *imgs);
-typedef void (*mw_cdc_sink_fn) (void *arg, const mw_chg *chg, int n, const mw_rowdiff_info *info);
-void     mw_cdc_set_sink (mw_db *db, mw_cdc_sink_fn fn, void *arg);
-void     mw_cdc_lane_free (mw_lane *lane);
-void     mw_cdc_relocated (mw_lane *lane);
-void     mw_cdc_apply_owner (mw_db *db, mw_lane *lane, const uint32_t *pgnos, const uint8_t *const *images, int n);
-void     mw_cdc_apply_cells (mw_db *db, mw_lane *lane, uint64_t epoch);
-struct mw_meta *mw_cdc_meta (mw_db *db);
-void     mw_cdc_quiesce (mw_db *db);
 void     mw_shared_repair (mw_db *db);
-void     mw_cdc_skip (mw_lane *lane);
-void     mw_cdc_set_cache_mb (mw_db *db, int mb);
-void     mw_cdc_kick_flush (mw_db *db);
-int      mw_cdc_shared_create (mw_db *db);
-void     mw_cdc_shared_unlink (mw_db *db);
-uint64_t mw_cdc_safe_epoch (mw_db *db);
-void     mw_cdc_ensure_schema (sqlite3 *conn, mw_db *db);
-bool     mw_rowdiff_enabled (void);
-void     mw_rowdiff_commit (mw_lane *lane, const uint8_t *const *imgs);          // (experiment, docs §51)
 void     mw_lane_fill_stats (mw_lane *lane, mw_db_stats *st);
 int      mw_lane_on_shm_lock (mw_lane *lane, int ofst, int flags);
 void     mw_lane_ddl_begin (mw_lane *lane);

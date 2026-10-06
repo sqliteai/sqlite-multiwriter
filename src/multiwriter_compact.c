@@ -62,7 +62,6 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
         T = oldest < visible ? oldest : visible;
         base = db->base_epoch;
     }
-    if (db->cdc) { uint64_t lim = mw_cdc_safe_epoch(db); if (T > lim) T = lim; }       // (the metadata of the commits above the last flush lives in the log records only)
     if (T <= base) goto done;                                      // nothing new to materialise (or pinned by an old reader)
     if (!db->mp && db->has_log) {                                  // (commits with synchronous < FULL are visible before they are on the disk: the log has them there before their pages go into the file, or a power failure leaves the file ahead of the log)
         uint64_t du; pthread_mutex_lock(&db->log_mu); du = db->synced_upto; pthread_mutex_unlock(&db->log_mu);

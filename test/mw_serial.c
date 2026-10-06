@@ -27,9 +27,9 @@ typedef struct { uint64_t snap, commit; uint64_t seq; int n; op_t op[MAXOPS]; in
 typedef struct { uint64_t snap; int n; int key[ROKEYS], ex[ROKEYS], v[ROKEYS], u[ROKEYS], pl[ROKEYS], w[ROKEYS]; } ro_t;
 typedef struct { rw_t *rw; size_t nrw, caprw; ro_t *ro; size_t nro, capro; long busy, constraint, other; } rec_t;
 
-static const char *g_path; static int g_keys; static double g_secs; static int g_procs_mode, g_threadmode;      // g_threadmode: the "processes" of the power-loss run are threads of one process (the engine's single-process mode)
+static const char *g_path; static int g_keys; static double g_secs; static int g_procs_mode, g_threadmode, g_rebase;      // g_threadmode: the "processes" of the power-loss run are threads of one process (the engine's single-process mode)
 static int open_db (const char *path, sqlite3 **db) {
-    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=16%s", path, ((g_procs_mode && !g_threadmode) || getenv("MW_TEST_MP")) ? "&mw_mp=1" : "");
+    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=16%s%s", path, ((g_procs_mode && !g_threadmode) || getenv("MW_TEST_MP")) ? "&mw_mp=1" : "", g_rebase ? "&mw_rebase=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;
@@ -85,8 +85,9 @@ static void run_rw (ctx_t *c, rw_t *out, int *got) {
             o->spl = tx.ins_pl; }
         else if (r < 3) { o->kind = 1; o->a = 1 + (int)(rnd(&c->rng) % 9); snprintf(sql, sizeof sql, "UPDATE t SET v = v + %d WHERE id = %d", o->a, o->key); }
         else if (r < 5) { o->kind = 2; snprintf(sql, sizeof sql, "DELETE FROM t WHERE id = %d", o->key); }
-        else if (r < 7) { o->kind = 3; o->b = ucol(&c->rng); if (o->b < 0) snprintf(sql, sizeof sql, "UPDATE t SET u = NULL WHERE id = %d", o->key); else snprintf(sql, sizeof sql, "UPDATE t SET u = %d WHERE id = %d", o->b, o->key); }
-        else if (r < 9) { o->kind = 5; o->a = (int)(rnd(&c->rng) % 600); snprintf(sql, sizeof sql, "UPDATE t SET p = zeroblob(%d) WHERE id = %d", o->a, o->key); }
+        else if (r < 7) { o->kind = 3; do o->b = ucol(&c->rng); while (o->b == o->su);       // (a change that changes nothing writes no page: the row would be read and not written)
+            if (o->b < 0) snprintf(sql, sizeof sql, "UPDATE t SET u = NULL WHERE id = %d", o->key); else snprintf(sql, sizeof sql, "UPDATE t SET u = %d WHERE id = %d", o->b, o->key); }
+        else if (r < 9) { o->kind = 5; do o->a = (int)(rnd(&c->rng) % 600); while (o->a == o->spl); snprintf(sql, sizeof sql, "UPDATE t SET p = zeroblob(%d) WHERE id = %d", o->a, o->key); }
         else { o->kind = 0; snprintf(sql, sizeof sql, "UPDATE t SET w = w + 1 WHERE id = %d", o->key); }
         int rc = mw_exec(db, sql);
         if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_FULL) put_rec(c->fd, REC_FULL, c->slot, 0, 0, NULL, 0); if ((rc & 0xff) == SQLITE_CONSTRAINT) R->constraint++; else if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else { R->other++; if (getenv("MW_VERBOSE")) printf("  other rc %d on: %s\n", rc, sql); } }
@@ -230,7 +231,9 @@ static void make_db (const char *path, int nslots) {
 }
 static model new_model (int keys) { model M = { calloc((size_t)keys + 2, sizeof(mrow)), malloc((size_t)(2 * keys + 4) * sizeof(int)), keys }; for (int i = 0; i < 2 * keys + 4; i++) M.owner[i] = -1; return M; }
 
+static int skip (const char *name) { const char *o = getenv("MW_SERIAL_ONLY"); return o && !strstr(name, o); }
 static void run_threads (const char *name, int keys, int threads, double secs) {
+    if (skip(name)) return;
     char path[256]; mw_tmpdb(path, sizeof path, "serial"); g_procs_mode = 0; make_db(path, 0);
     g_path = path; g_keys = keys; g_secs = secs;
     sqlite3 *obs; CHECK_RC(open_db(path, &obs), SQLITE_OK);                                               // (kept open: the statistics belong to the database object, which lives while a connection does)
@@ -244,11 +247,12 @@ static void run_threads (const char *name, int keys, int threads, double secs) {
     for (int i = 0; i < threads; i++) { for (size_t k = 0; k < R[i].nrw; k++) S.known[S.nknown++] = &R[i].rw[k]; for (size_t k = 0; k < R[i].nro; k++) S.ro[S.nro++] = &R[i].ro[k]; }
     model M = new_model(keys); viol V; memset(&V, 0, sizeof V); replay(&S, &M, &V);
     long rows, model_rows, bad_final, dup; int integ; final_check(path, &M, &rows, &model_rows, &bad_final, &dup, &integ);
-    printf("%s: %d keys, %d threads: %zu read-write and %zu read-only transactions committed, %ld refused (busy), %ld constraint errors, %ld other; page conflicts %llu, relocations %llu, merges %llu; table %ld rows (model %ld)\n",
-           name, keys, threads, nrw, nro, busy, cons, oth, (unsigned long long)ds.page_conflicts, (unsigned long long)ds.relocations, (unsigned long long)ds.merges, rows, model_rows);
+    printf("%s: %d keys, %d threads: %zu read-write and %zu read-only transactions committed, %ld refused (busy), %ld constraint errors, %ld other; page conflicts %llu, relocations %llu, merges %llu, rebases %llu (%llu lost races, %llu refused to replay); table %ld rows (model %ld)\n",
+           name, keys, threads, nrw, nro, busy, cons, oth, (unsigned long long)ds.page_conflicts, (unsigned long long)ds.relocations, (unsigned long long)ds.merges, (unsigned long long)ds.rebases, (unsigned long long)ds.rebase_retries, (unsigned long long)ds.unrebasable, rows, model_rows);
     printf("   reads that differ from the serial order %ld, UNIQUE broken %ld, read-only inconsistent %ld, duplicate epochs %ld, final differs %ld, duplicate u in the table %ld, integrity %s\n", V.bad_read, V.bad_unique, V.bad_ro, V.bad_dup_epoch, bad_final, dup, integ ? "ok" : "BAD");
     CHECK(V.bad_read == 0); CHECK(V.bad_unique == 0); CHECK(V.bad_ro == 0); CHECK(V.bad_dup_epoch == 0); CHECK(bad_final == 0); CHECK(dup == 0); CHECK(integ); CHECK(rows == model_rows);
     CHECK(nrw >= 500);                                                                                // (not vacuous)
+    if (g_rebase) CHECK(ds.rebases > 0);                                               // (and the rebase did take part)
     for (int i = 0; i < threads; i++) { free(R[i].rw); free(R[i].ro); } free(R); free(S.known); free(S.ro); free(M.m); free(M.owner);
     mw_rmdb(path);
 }
@@ -327,6 +331,7 @@ static void procs_verify (const char *name, const char *path, int keys, int npro
 }
 
 static void run_procs (const char *name, int keys, int nprocs, double secs, int kill_ms, const char *idx_entries) {
+    if (skip(name)) return;
     char path[256]; mw_tmpdb(path, sizeof path, "serialp"); g_procs_mode = 1; make_db(path, nprocs);
     int kills, crashes; procs_run(path, keys, nprocs, secs, kill_ms, idx_entries, NULL, &kills, &crashes);
     procs_verify(name, path, keys, nprocs, kills, crashes, 10);
@@ -336,6 +341,7 @@ static void run_procs (const char *name, int keys, int nprocs, double secs, int 
 // Power-loss test (test/power/run.sh): the database is on a disk with a volatile write cache that is cut at the end of the run phase; the verify phase runs on what the disk kept.
 //   MW_SERIAL_MODE=threads: one process with a thread for each slot instead of the processes mode.   MW_SERIAL_PHASE=run|verify  MW_SERIAL_DB=<path>  MW_SERIAL_REC=<dir that the loss does not touch>  [MW_SERIAL_KEYS=300 MW_SERIAL_PROCS=6 MW_SERIAL_SECS=6]  MW_SERIAL_CUT_CMD=<command>
 static int power_phase (const char *phase) {
+    g_rebase = getenv("MW_SERIAL_REBASE") != NULL && *getenv("MW_SERIAL_REBASE");
     g_threadmode = getenv("MW_SERIAL_MODE") && !strcmp(getenv("MW_SERIAL_MODE"), "threads");
     const char *path = getenv("MW_SERIAL_DB"); g_recdir = getenv("MW_SERIAL_REC");
     if (!path || !g_recdir) { printf("MW_SERIAL_DB and MW_SERIAL_REC are needed\n"); return 2; }
@@ -364,12 +370,23 @@ static int power_phase (const char *phase) {
 int main (void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (getenv("MW_SERIAL_PHASE")) return power_phase(getenv("MW_SERIAL_PHASE"));
-    run_threads("hot (few keys, many conflicts)", 12, 8, 3.0);
-    run_threads("medium", 200, 8, 3.0);
-    run_threads("wide (many pages, pages freed and reused)", 3000, 8, 4.0);
-    run_procs("processes, hot", 12, 6, 6.0, 250, NULL);
-    run_procs("processes, medium", 300, 6, 6.0, 250, NULL);
-    run_procs("processes, wide", 3000, 6, 6.0, 250, NULL);
-    run_procs("processes, small index of versions", 300, 6, 10.0, 250, "3000");
+    g_rebase = getenv("MW_TEST_REBASE") != NULL;                                                          // (MW_TEST_REBASE=1: only the runs with the rebase)
+    for (int pass = g_rebase ? 1 : 0; pass < 2; pass++) {
+        g_rebase = pass;
+        const char *suffix = pass ? " + rebase" : "";
+        char nm[100];
+        snprintf(nm, sizeof nm, "hot (few keys, many conflicts)%s", suffix); run_threads(nm, 12, 8, 3.0);
+        snprintf(nm, sizeof nm, "medium%s", suffix); run_threads(nm, 200, 8, 3.0);
+        snprintf(nm, sizeof nm, "wide (many pages, pages freed and reused)%s", suffix); run_threads(nm, 3000, 8, 4.0);
+        if (!pass) {
+            run_procs("processes, hot", 12, 6, 6.0, 250, NULL);
+            run_procs("processes, medium", 300, 6, 6.0, 250, NULL);
+            run_procs("processes, wide", 3000, 6, 6.0, 250, NULL);
+            run_procs("processes, small index of versions", 300, 6, 10.0, 250, "3000");
+        } else {
+            run_procs("processes, hot + rebase", 12, 6, 6.0, 250, NULL);
+            run_procs("processes, medium + rebase", 300, 6, 6.0, 250, NULL);
+        }
+    }
     MW_DONE();
 }

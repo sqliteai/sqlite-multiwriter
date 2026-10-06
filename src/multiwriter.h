@@ -68,34 +68,16 @@ typedef struct {
     uint64_t compaction_backlog;    // commits not yet materialised (epoch - base_epoch)
     uint64_t pages_published, log_sync_ns, gate_closures, backpressure_stalls, hot_serialised;
     uint64_t log_bytes, compactions, compaction_ns, compacted_pages, log_syncs;
-    uint64_t rebases, rebase_retries, rebase_max_attempts, rebase_ns, unrebasable, read_conflicts, pk_collisions;
+    uint64_t rebases, rebase_retries, rebase_max_attempts, rebase_ns, unrebasable, read_conflicts;   // rebases: commits saved by replaying their row changes at the latest snapshot
     uint64_t reloc_prep_used, reloc_prep_dropped, reloc_prep_rewrote;   // processes mode: phase 1 of a relocation made before the publication lock: used / thrown away (the plain publication succeeded, or it did not fit) / used with the references rewritten because the end of the file moved meanwhile
     uint64_t relocations;           // commits saved by renumbering their new pages after other commits extended the file
     uint64_t merges;                // interior b-tree pages rewritten by two transactions that were merged instead of refusing the second
     uint64_t reads_saved;           // read conflicts on interior pages avoided because the pages the transaction went through were routed unchanged
 } mw_db_stats;
 
-#define MW_FCNTL_RESERVE_DBV 0x4d570005   // in/out int64_t: in = "at least", out = a unique db_version for this transaction
-#define MW_FCNTL_SEND_CEILING 0x4d570006  // out int64_t: highest db_version that may be exported (sync frontier)
-#define MW_FCNTL_MARK_UNREBASABLE 0x4d570007  // the transaction wrote something with no logical representation
-#define MW_FCNTL_SET_OVERLAY 0x4d570008   // internal: mw_overlay * (read view used by the rebase)
 #define MW_FCNTL_DDL_BEGIN 0x4d570009   // internal: a schema-changing statement is about to run (exclusive schema barrier)
 #define MW_FCNTL_LANE_PTR 0x4d57000b   // internal: void ** (the connection's lane)
 #define MW_FCNTL_GC             0x4d570004   // sqlite3_file_control(db, "main", MW_FCNTL_GC, uint64_t *reclaimed)
-
-// Read view of a transaction that is being rebased: its own page images over the snapshot.
-typedef struct {
-    const uint32_t *pgnos;                  // ascending
-    const uint8_t *const *images;
-    int             n;
-    uint32_t        dbsize;                 // pages
-    uint64_t        snapshot;               // epoch the transaction executed against
-} mw_overlay;
-
-// db_version reservation / sync frontier for the connection's database. Both return the
-// "not a private lane" answer (-1 / INT64_MAX) for a database that is not in lane mode.
-int64_t mw_db_reserve_version (sqlite3 *db, int64_t at_least);
-int64_t mw_db_send_ceiling (sqlite3 *db);
 
 // Fault / crash injection (tests). arm(f, nth): the nth time the point is reached, error points fail once
 // (SQLITE_IOERR); crash points _exit(9) on the spot, simulating a kill at exactly that instant.
@@ -110,7 +92,7 @@ typedef enum {
     MW_CRASH_COMPACT_BASE,      // compaction: after the new base epoch was recorded
     MW_CRASH_LOG_RENAME,        // log rewrite: new log file renamed into place, header (log_pos) not yet updated
     MW_CRASH_SHARED_APPENDED,   // shared mode: the record is in the segment, nothing installed yet
-    MW_CRASH_SHARED_INSTALLED,  // shared mode: pages (and metadata) installed, the commit not yet visible
+    MW_CRASH_SHARED_INSTALLED,  // shared mode: pages installed, the commit not yet visible
     MW_CRASH_SHARED_GC,         // shared mode: in the middle of a collection of the index (the candidate list is half rebuilt)
     MW_FAULT_COUNT
 } mw_fault_t;
@@ -124,25 +106,6 @@ enum { MW_IO_WRITE = 1, MW_IO_SYNC = 2, MW_IO_TRUNC = 4, MW_IO_RENAME = 8, MW_IO
 void mw_io_fault_arm (int kinds, long nth, int err, int sticky, int shortw);
 void mw_io_fault_disarm (void);
 long mw_io_fault_calls (void);
-
-// EXPERIMENT (docs §51): row-level changes of every commit, derived from the page images alone. A sink is called once per commit of a private lane, from the
-// committing thread, before the commit is published. Changes are the net change of the table rows over the whole write set (rows of different tables are pooled).
-typedef struct { int kind; int64_t rowid; uint32_t changed; uint32_t root; int ncols; } mw_rowchg;      // root = the table (its root page) when the page owners are known, ncols = columns of the record           // kind 1 insert, 2 update (changed = bitmask of columns, bit 31: not decidable per column), 3 delete
-typedef struct { int pages, opaque, index_pages, interior, schema, undecodable; uint64_t ns; } mw_rowdiff_info;   // what the write set held, and the decoding time
-typedef void (*mw_rowdiff_sink_fn) (void *arg, const mw_rowchg *chg, int n, const mw_rowdiff_info *info);
-void mw_rowdiff_set_sink (mw_rowdiff_sink_fn fn, void *arg);
-
-// Change capture (URI mw_cdc=1; docs/design.md). The row-level changes of every commit of the connection's database, derived in the VFS from the pages: the table, the primary key as
-// sqlite-sync encodes it, what happened (1 insert, 2 update, 3 delete) and for an update the cells that changed (bit i = the i-th non-key column; bit 63: all of them) and, if the key itself
-// changed, the old key. Called from the committing thread before the commit is published, for every attempt (a refused commit is reported again when it is retried).
-typedef struct { int kind; const char *table; const uint8_t *pk; size_t pklen; const uint8_t *oldpk; size_t oldpklen; uint64_t changed; int64_t rowid; } mw_capture_row;
-typedef void (*mw_capture_fn) (void *arg, const mw_capture_row *rows, int n);
-#define MW_FCNTL_VACUUM_BEGIN 0x4d57000e   // internal: a VACUUM statement is about to run (the change capture must not take the rebuilt rows for changes)
-#define MW_FCNTL_DECLARE  0x4d57000f       // sqlite3_file_control(db, "main", MW_FCNTL_DECLARE, mw_ovl *): the commit of this transaction carries exactly this metadata (a merge of remote changes), not what the capture would derive; NULL clears
-#define MW_FCNTL_GATE     0x4d570010       // sqlite3_file_control(db, "main", MW_FCNTL_GATE, int *close): hold the commit gate of this process (1) / release it (0); a transaction that keeps losing takes the commits of the others out of its way
-#define MW_FCNTL_META     0x4d57000d       // sqlite3_file_control(db, "main", MW_FCNTL_META, mw_meta **): the CRDT metadata store of the database (mw_cdc=1), for tests and the sync API
-#define MW_FCNTL_CDC_SINK 0x4d57000c       // sqlite3_file_control(db, "main", MW_FCNTL_CDC_SINK, &(mw_capture_sink){ fn, arg })
-typedef struct { mw_capture_fn fn; void *arg; } mw_capture_sink;
 
 #define MW_FCNTL_COMPACT  0x4d57000a   // sqlite3_file_control(db, "main", MW_FCNTL_COMPACT, mw_compact_result *)
 typedef struct {

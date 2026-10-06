@@ -200,12 +200,13 @@ uint32_t mw_store_dbsize (mw_store *st, uint64_t snap) {
 // atomic operations per commit.
 
 void mw_gate_enter (mw_db *db, mw_lane *lane) {
-    for (;;) {
+    for (unsigned spins = 0;; spins++) {
         if (atomic_load(&db->gate_closing) == 0 || (lane && db->gate_owner == lane)) {
             atomic_fetch_add(&db->gate_active, 1);                       // (seq_cst: pairs with the closer's store/load order)
             if (atomic_load(&db->gate_closing) == 0 || (lane && db->gate_owner == lane)) return;
             atomic_fetch_sub(&db->gate_active, 1);                       // lost the race with the closer: back off
         }
+        if (spins < 400) { sched_yield(); continue; }                      // (the gate is closed for a replay of some tens of microseconds: a sleep of 20 us on a machine that rounds it up would be longer than the closure)
         struct timespec ts = { 0, 20000 };
         nanosleep(&ts, NULL);
     }

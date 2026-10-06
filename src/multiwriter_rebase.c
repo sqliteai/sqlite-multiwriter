@@ -25,7 +25,7 @@
 #include "multiwriter_internal.h"
 
 #define MW_REBASE_MAX_ATTEMPTS 200
-#define MW_REBASE_GATE_AFTER   32     // lost attempts before the publication gate is closed for the next one (measured 20-60% faster than closing it after 3: the gate stops every committer; a replay that is still losing after 32 is starving)
+#define MW_REBASE_GATE_AFTER   1      // lost attempts before the publication gate is closed for the next one: the first attempt runs without it (it is cheap and often wins); the one that follows a loss runs against a frozen state (the commits that were assigned an epoch are in the pages before they are visible: against a moving page a replay loses 97% of the time, measured; with the gate after the first loss 5%, and 1.2-1.4x the throughput on one page)
 
 typedef struct { uint64_t mask; sqlite3_stmt *st; } ucache;
 typedef struct { sqlite3_stmt *sel, *ins, *del; ucache upd[8]; int nupd, next_upd; bool ready; } tstmt;      // upd: UPDATE statements by the set of columns they change (few: a transaction changes the same columns again and again)

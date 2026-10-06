@@ -58,7 +58,9 @@ a commit conflicts, not at every commit.
    the one the transaction had; for every row that was changed or deleted the row is *exactly what the transaction saw* (the whole row, with `COLLATE BINARY IS`, so the type affinities and collations of the columns do not hide a difference);
    the deletes, then the updates, then the inserts are run (a key that one frees and another takes); a row that was inserted must not be there, and the constraints (UNIQUE, CHECK, NOT NULL, the key) are evaluated by SQLite on the rows as
    they are now. Any of these that fails is a **true conflict**: the transaction is refused (`SQLITE_BUSY_SNAPSHOT`) and the application runs it again, as without the rebase. If the helper's commit loses a race it replays again on the
-   newer snapshot; after three losses the publication gate is closed so that the next attempt runs against a frozen state; rebases are serialised per database.
+   newer snapshot; after three losses the publication gate is closed after 32 lost attempts so that the next one runs against a frozen state. The replays are serialised (per database, and in the processes mode across all the processes by an `fcntl` lock: measured faster than parallel, see the measurements); the decoding of the pages is not.
+   The `UPDATE` of a replay sets only the columns that changed (naming an unchanged indexed column rewrites its index, which refuses the transactions that only read that page). A connection whose replay was refused skips the replay of its next 1, 3, 7... conflicts (the true conflicts of a hot row would fail again
+   at the cost of the decoding; `mw_rebase_backoff=0` turns it off, for the tests), and a conflict that was rebased does not make the connection take the hot-spot turn.
 3. **What the result is.** The state that a serial execution of the two commits could have produced: the replay has the epoch of the helper's commit, and every row that the transaction touched is, in that order, what it was when it read it.
    The commit is a *row-level* first-committer-wins: two transactions that change different cells of the same row conflict (the whole row is compared: the transaction may have read the cells it did not write).
 4. **What is not covered.** The rows that the transaction read and did *not* change: a page that it only read is validated as before, but a row that it read from a page that it also wrote is not looked at. That is snapshot isolation
@@ -143,7 +145,7 @@ the relocation prepared before the lock, the rebase (`mw_rebase`: what is replay
 
 URI parameters (read at open): `mw` (0 off, 2 lanes: the engine), `mw_mp` (0 one process, 1 processes: the shared mode, 3 processes with private stores), **`mw_rebase`** (1: the rebase), `mw_fullfsync`, `mw_profile` (`small`: the cache of pages of the
 real file at 8 MB, a log of 16 MB before it is compacted), `mw_base_cache_mb`, `mw_log_max_mb`, `mw_gc` (commits between two collections of versions), `mw_hot_credit`, `mw_readcheck` (0: no validation of the pages read), and, for tests and
-measurements, `mw_noreloc`, `mw_noroute`, `mw_nomerge`, `mw_norebase` (marks a connection that never rebases: the helper), `mw_prep_delay_us` (waits between the preparation of a relocation and the publication lock).
+measurements, `mw_noreloc`, `mw_noroute`, `mw_nomerge`, `mw_norebase` (marks a connection that never rebases: the helper), `mw_rebase_backoff` (0: replay every conflict), `mw_prep_delay_us` (waits between the preparation of a relocation and the publication lock).
 
 Environment: `MW_FULLFSYNC`, `MW_PROFILE`, `MW_SEG_MB` (size of a segment of the shared log), `MW_IDX_ENTRIES`, `MW_SIDECAR_DIR` (where the shared maps go: `/dev/shm` on Linux), `MW_MP_LAZY`, `MW_MP_PRIVATE`, `MW_SPIN_US`, `MW_POOL_BATCH`, `MW_ENOSPC_WAIT_MS`;
 diagnostics: `MW_DEBUG`, `MW_TIMING` (time spent in each stage of a commit), `MW_IO_TRACE`, `MW_COMPACT_TRACE`, `MW_PAGE_TRACE`. Measurement only (`make EXPERIMENTS=1`): `MW_EXP_*`.
@@ -164,56 +166,113 @@ that reorders writes around a flush. Platforms: macOS and Linux (arm64 tested); 
 
 The code is under `LICENSE.md` (Elastic License 2.0, modified). `third_party/sqlite` is SQLite 3.53.4 (public domain), unchanged. The measurements are in `bench/results/`.
 
-## Measurements (2026-10-06, this Mac, 18 cores, SQLite 3.53.4, `synchronous=FULL`, one run per point of 8-10 s; `bench/results/rebase_*_2026-10-06.jsonl`)
+## Measurements (2026-10-06, this Mac, 18 cores, SQLite 3.53.4, `synchronous=FULL`, one run per point of 8-10 s; `bench/results/rebase2_*_2026-10-06b.jsonl`)
 
-`bench/compare_sqlite.py`: "no rebase" and "rebase" are this engine without and with `mw_rebase=1`; "SQLite" is stock WAL with `busy_timeout 0` and the application retrying a refused transaction (the retries are counted). No transaction failed
-(gave up) in any run. Retries for this engine are refused commits that the application ran again.
+`bench/compare_sqlite.py`: "no rebase" and "rebase" are this engine without and with `mw_rebase=1`; "SQLite" is stock WAL with `busy_timeout 0` and the application retrying a refused transaction (its retries are counted).
+For this engine a retry is a commit that was refused and that the application ran again; the replays that the rebase lost to other commits and tried again inside the engine are not counted here (they are `rebase_retries`
+in the statistics: about 3 per rebase on one hot page). "Gave up" is a transaction that did not commit after 1000 retries (none unless written). The workloads (`bench/mw_bench.c`): **bulk** = 100-row inserts on disjoint keys;
+**groups** = each agent updates its own row, the rows of four groups of agents share a page each (four contended pages); **same page** = each agent its own row, all rows on one page; **hot rows** = `UPDATE a = a + 1` on 4 rows
+(true conflicts: the same rows); **columns** = agents update different columns of shared rows (the same rows: true conflicts for the rebase, which compares the whole row); **unique inserts** = inserts of unique keys into one table.
 
-**Bulk inserts of 100 rows on disjoint keys, threads**
-
-| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
-|---|---|---|---|---|---|---|
-| 1 | 14701 | 0 | 14736 | 0 | 13129 | 0 |
-| 2 | 20574 | 13 | 20969 | 12 | 9813 | 92416 |
-| 4 | 31487 | 65 | 31735 | 54 | 8728 | 113235 |
-| 8 | 38681 | 199 | 38984 | 202 | 8721 | 128246 |
-| 16 | 47474 | 637 | 47602 | 734 | 8443 | 165153 |
-| 32 | 50357 | 1793 | 49927 | 1321 | 8286 | 223580 |
-| 64 | 41610 | 5363 | 40069 | 2578 | 8090 | 342174 |
-
-**The same, processes (`mw_mp=1`)**
+**Bulk inserts on disjoint keys, threads**
 
 | N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
 |---|---|---|---|---|---|---|
-| 1 | 14379 | 0 | 14321 | 0 | 13188 | 0 |
-| 2 | 20106 | 8 | 20138 | 7 | 9106 | 112889 |
-| 4 | 28380 | 30 | 28525 | 25 | 8839 | 118419 |
-| 8 | 26741 | 89 | 26547 | 102 | 8571 | 131169 |
-| 16 | 24837 | 350 | 24756 | 200 | 8380 | 158287 |
-| 32 | 23008 | 786 | 22704 | 638 | 8042 | 197076 |
-| 64 | 20743 | 903 | 20457 | 433 | 7913 | 285497 |
+| 1 | 14664 | 0 | 14885 | 0 | 12893 | 0 |
+| 2 | 21511 | 14 | 20991 | 10 | 9278 | 106858 |
+| 4 | 32261 | 92 | 32145 | 63 | 8783 | 115434 |
+| 8 | 38324 | 202 | 38378 | 234 | 8546 | 128976 |
+| 16 | 46259 | 625 | 47010 | 645 | 8650 | 165730 |
+| 32 | 49655 | 1887 | 49370 | 1641 | 8093 | 226797 |
+| 64 | 41351 | 5134 | 41698 | 3098 | 8137 | 344395 |
 
-The rebase changes nothing here (the conflicts are few: the pages are shared by growth of the file, which the relocation saves). With one writer the engine is above SQLite (14.4-14.7k against 13.1k): there is no metadata to
-capture any more. The throughput of the processes mode is bounded by the publication lock (held about 40 us per commit).
+**Bulk, processes (`mw_mp=1`)**
 
-**Contended workloads (updates on 4 hot rows; rows that share pages; different columns of shared rows; unique-key inserts into one table), 16 threads / 64 threads / 16 processes**
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 1 | 14166 | 0 | 14250 | 0 | 13144 | 0 |
+| 2 | 19932 | 9 | 20016 | 7 | 9659 | 108399 |
+| 4 | 28280 | 33 | 28277 | 27 | 8932 | 118165 |
+| 8 | 26760 | 89 | 26915 | 76 | 8683 | 128762 |
+| 16 | 24782 | 346 | 24714 | 324 | 8392 | 155666 |
+| 32 | 22888 | 877 | 22734 | 561 | 8166 | 200971 |
+| 64 | 20585 | 1045 | 20460 | 578 | 7884 | 286828 |
 
-| workload | no rebase | rebase | SQLite |
-|---|---|---|---|
-| hot rows, 16 threads | 33644 (50164 retries) | 28836 (25180 retries) | 14991 (26891 retries) |
-| hot rows, 64 threads | 30317 (246581 retries) | 13759 (11346 retries) | 15572 (120178 retries) |
-| hot rows, 16 processes | 42457 (404154 retries) | 34454 (333477 retries) | 14457 (26745 retries) |
-| same page, 16 threads | 31896 (48736 retries) | 28502 (23809 retries) | 15672 (27181 retries) |
-| same page, 64 threads | 31335 (249893 retries) | 13589 (11901 retries) | 15655 (120550 retries) |
-| same page, 16 processes | 42346 (400847 retries) | 16609 (185875 retries) | 15253 (28209 retries) |
-| columns, 16 threads | 27863 (44063 retries) | 29012 (24855 retries) | 15478 (28386 retries) |
-| columns, 64 threads | 30503 (243482 retries) | 13610 (11747 retries) | 15003 (119473 retries) |
-| columns, 16 processes | 42209 (391700 retries) | 34415 (290255 retries) | 14157 (26351 retries) |
-| unique inserts, 16 threads | 30032 (43936 retries) | 25811 (53564 retries) | 20611 (150207 retries) |
-| unique inserts, 64 threads | 26870 (245742 retries) | 12825 (12985 retries) | 5497 (144230 retries) |
-| unique inserts, 16 processes | 36221 (302440 retries) | 33669 (347782 retries) | 5128 (50297 retries) |
+The rebase changes nothing here (few conflicts: the pages that the agents share are grown by the file, which the relocation saves). With one writer the engine is above SQLite (14.2-14.9k against 12.9-13.1k).
+The throughput of the processes mode is bounded by the publication lock (held about 40 us per commit).
 
-What the rebase does and does not do, measured: it removes most of the retries that the application sees (hot rows, 64 threads: 246 thousand refused commits against 11 thousand; same page, 4 processes: 215 thousand against 18 thousand), because the commits
-that conflicted only on pages are saved. It does **not** raise the throughput: with 16 threads it is 0-15% below the engine without it, and with 64 threads (or 16 processes on the same page) it is 2-3 times below, because the replays are serialised per database
-(`rebase_mu`) and each one decodes the pages and runs a transaction on a helper connection, which costs more than refusing the commit and running the transaction again at the application's pace. It is for an application that cannot retry, or whose
-retries are costly (a transaction that does a lot before it writes); a faster rebase would need the replays to run in parallel (the conflict checks are per row, the commit of the helper is where they meet).
+**Four contended pages (groups), threads**
+
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 4 | 36551 | 2194 | 35597 | 0 | 15830 | 5301 |
+| 16 | 37344 (6 gave up) | 23970 | 42257 | 0 | 15328 | 27714 |
+| 64 | 35769 | 204770 | 45274 | 0 | 15217 | 124678 |
+
+**Groups, processes**
+
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 4 | 38082 | 55541 | 36296 | 0 | 20763 | 7080 |
+| 16 | 34149 | 333872 | 37438 | 0 | 22628 | 39546 |
+
+**One contended page (same page), threads**
+
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 4 | 31752 | 9028 | 23075 | 0 | 14891 | 5189 |
+| 16 | 28852 | 46493 | 30546 | 0 | 18304 | 29389 |
+| 64 | 32237 | 253015 | 32946 | 0 | 15314 | 123083 |
+
+**Same page, processes**
+
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 4 | 32872 | 149820 | 30896 | 0 | 20913 | 6142 |
+| 16 | 35303 | 396507 | 25157 | 0 | 24048 | 38498 |
+
+**Four hot rows (true conflicts), threads**
+
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 4 | 34761 | 9377 | 24810 | 19531 | 15760 | 5591 |
+| 16 | 27107 | 45279 | 28921 | 86505 | 15155 | 27979 |
+| 64 | 31921 | 260089 | 30017 | 339802 | 14844 | 119131 |
+
+**Hot rows, processes**
+
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 4 | 34384 | 171686 | 33779 | 119766 | 18823 | 6356 |
+| 16 | 37482 | 409355 | 35312 | 360909 | 15425 | 35921 |
+
+**Different columns of shared rows (columns), threads**
+
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 4 | 25936 | 10063 | 29674 | 9930 | 15710 | 7806 |
+| 16 | 34175 | 58624 | 27349 | 51336 | 15221 | 32309 |
+| 64 | 25120 | 234469 | 19398 | 62907 | 14028 | 140740 |
+
+**Unique inserts into one table, threads**
+
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 4 | 30277 | 8237 | 30286 | 8027 | 12899 | 57954 |
+| 16 | 30060 | 48237 | 29946 | 48402 | 10566 | 101588 |
+| 64 | 25999 | 245325 | 26311 | 248249 | 7368 | 168344 |
+
+(The processes runs of "columns" and "unique inserts" are not shown: the benchmark cannot verify them with several processes, and reports them as not valid.)
+
+What the rebase does, measured: where the conflicts are on pages and not on rows (groups, same page) the application sees **no retry at all** and the throughput is the same or higher (groups, 64 threads: 45k against 36k and 205 thousand
+retries; same page, 4 processes: 47k against 41k and 216 thousand retries); the repeated replays inside the engine are a cost, not a gain. Where the conflicts are on the same rows (hot rows, columns) it cannot save them (it refuses, correctly), it
+costs a decode and a failed check for each, and the back-off that skips the replay after a refusal keeps the throughput near the engine's without it (hot rows 64 threads 30k against 32k) with more retries
+(340 thousand against 260 thousand) in some runs and fewer in others (columns, 64 threads: 63 thousand against 234 thousand). It is for an application that cannot retry, or whose retries are costly. In the processes mode with 16 processes on one
+or four pages the throughput is now 33-48k only because the replays are serialised across all the processes (an `fcntl` lock): without it the replays of the processes beat each other (15k and 27k).
+
+**Why the replays are serialised, and not parallel (measured).** The first version with a mutex per database was 13.7k tx/s at 64 threads on one page against 31k for the engine without the rebase. Two of the causes were not the mutex: (1) an `UPDATE` that named
+every column rewrote the index of an indexed column that had not changed, so every reader of that index page was refused (the replay now sets only the columns that changed: read conflicts 254 thousand -> 0); (2) a rebased conflict granted
+the connection a turn of hot-spot serialisation (it no longer does). With those fixed, replays that run in parallel (no mutex, the gate only for the starving) were 20-40% *slower* than serialised ones (same page: 18-24k against 31-36k;
+lost races 280 thousand against 148 thousand): the replays of one page can only commit one at a time, and the ones that run together lose to each other and to the ordinary commits. Parallel replays without a gate also hang in the
+worst case (two replays closing the gate). What does run in parallel: the decoding of the pages (before the lock), the ordinary commits, and the replays of nothing else. The publication gate is closed only after 32 lost attempts (it was 3: it stops every
+committer; 20-60% slower). A replay that could run in parallel for different pages would have to be a group replay (several transactions in one helper commit, one epoch): not done.

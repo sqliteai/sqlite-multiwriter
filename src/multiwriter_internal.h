@@ -517,6 +517,8 @@ void      mw_mp_ddl_begin (mw_db *db);
 void      mw_mp_ddl_end (mw_db *db);
 bool      mw_mp_ddl_blocked (mw_db *db);               // another live process owns the schema barrier
 void      mw_mp_writing (mw_lane *lane, bool on);
+void      mw_mp_rebase_lock (mw_db *db);               // the replays of the rebase, one at a time in all the processes
+void      mw_mp_rebase_unlock (mw_db *db);
 bool      mw_mp_compaction_lock (mw_db *db);
 bool      mw_mp_meta_lock (mw_db *db, int which, bool wait);     // cross-process byte locks of the metadata store: 0 = sites, 1 = flusher
 void      mw_mp_meta_unlock (mw_db *db, int which);

@@ -46,6 +46,7 @@
 #define MP_MAGIC 0x4d574d5031303031ull       /* "MWMP1001" */
 #define MP_LOCK_PUBLISH ((off_t)1 << 20)      /* fcntl lock bytes (beyond EOF is fine) */
 #define MP_LOCK_COMPACT (((off_t)1 << 20) + 1)
+#define MP_LOCK_REBASE  (((off_t)1 << 20) + 4)      /* one replay of the rebase at a time in all the processes (the kernel drops it with the process) */
 
 static int fcntl_lock (int fd, off_t byte, int type, bool wait) {
     struct flock fl;
@@ -444,6 +445,8 @@ uint64_t mw_mp_global_oldest (mw_db *db) {
 
 // MARK: - compaction coordination and log reset -
 
+void mw_mp_rebase_lock (mw_db *db) { fcntl_lock(db->mp_pubfd, MP_LOCK_REBASE, F_WRLCK, true); }
+void mw_mp_rebase_unlock (mw_db *db) { fcntl_lock(db->mp_pubfd, MP_LOCK_REBASE, F_UNLCK, false); }
 bool mw_mp_compaction_lock (mw_db *db) { return fcntl_lock(db->mp_pubfd, MP_LOCK_COMPACT, F_WRLCK, false) == 0; }
 void mw_mp_compaction_unlock (mw_db *db) { fcntl_lock(db->mp_pubfd, MP_LOCK_COMPACT, F_UNLCK, false); }
 

@@ -247,6 +247,7 @@ int mw_lane_rebase (mw_lane *lane, const uint8_t *const *imgs, uint32_t cookie, 
     if (R->sync != lane->sync_level) { char q[40]; snprintf(q, sizeof q, "PRAGMA synchronous=%d", lane->sync_level); sqlite3_exec(lane->rb_db, q, NULL, NULL, NULL); R->sync = lane->sync_level; }
     mw_lane *hl = NULL; { void *lp = NULL; if (sqlite3_file_control(lane->rb_db, "main", MW_FCNTL_LANE_PTR, &lp) == SQLITE_OK) hl = lp; }
     pthread_mutex_lock(&db->rebase_mu);                                         // (one replay at a time: replays that run together lose races against each other and against the ordinary commits, measured 20-40% slower; the decoding above is parallel)
+    if (db->mp) mw_mp_rebase_lock(db);
     int rc = MW_CONFLICT, attempt = 0; bool closed = false; uint64_t epoch = 0;
     for (; attempt < MW_REBASE_MAX_ATTEMPTS; attempt++) {
         if (attempt == MW_REBASE_GATE_AFTER && hl) { mw_gate_close(db, hl); closed = true; }      // (the next attempt runs against a frozen state)
@@ -256,6 +257,7 @@ int mw_lane_rebase (mw_lane *lane, const uint8_t *const *imgs, uint32_t cookie, 
         if (!closed) sched_yield();
     }
     if (closed) mw_gate_open(db);
+    if (db->mp) mw_mp_rebase_unlock(db);
     pthread_mutex_unlock(&db->rebase_mu);
     mw_rd_result_free(&res);
     uint64_t att = (uint64_t)attempt + 1, m = atomic_load(&db->n_rebase_max_attempts);

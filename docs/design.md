@@ -216,7 +216,10 @@ The throughput of the processes mode is bounded by the publication lock (held ab
 | 4 | 38082 | 55541 | 36296 | 0 | 20763 | 7080 |
 | 16 | 34149 | 333872 | 37438 | 0 | 22628 | 39546 |
 
-**One contended page (same page), threads**
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 4 | 44944 | 71109 | 47703 | 0 | 13862 | 5962 |
+| 16 | 45008 | 380628 | 48825 | 0 | 13585 | 28408 |
 
 | N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
 |---|---|---|---|---|---|---|
@@ -231,7 +234,10 @@ The throughput of the processes mode is bounded by the publication lock (held ab
 | 4 | 32872 | 149820 | 30896 | 0 | 20913 | 6142 |
 | 16 | 35303 | 396507 | 25157 | 0 | 24048 | 38498 |
 
-**Four hot rows (true conflicts), threads**
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 4 | 41263 | 220823 | 39018 | 0 | 13751 | 6210 |
+| 16 | 42708 | 399517 | 34154 | 0 | 13416 | 27280 |
 
 | N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
 |---|---|---|---|---|---|---|
@@ -246,7 +252,10 @@ The throughput of the processes mode is bounded by the publication lock (held ab
 | 4 | 34384 | 171686 | 33779 | 119766 | 18823 | 6356 |
 | 16 | 37482 | 409355 | 35312 | 360909 | 15425 | 35921 |
 
-**Different columns of shared rows (columns), threads**
+| N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
+|---|---|---|---|---|---|---|
+| 4 | 41105 | 220001 | 41856 | 160509 | 13569 | 5925 |
+| 16 | 42665 | 402193 | 43613 | 379535 | 12883 | 25766 |
 
 | N | no rebase tx/s | retries | rebase tx/s | retries | SQLite tx/s | retries |
 |---|---|---|---|---|---|---|
@@ -264,11 +273,12 @@ The throughput of the processes mode is bounded by the publication lock (held ab
 
 (The processes runs of "columns" and "unique inserts" are not shown: the benchmark cannot verify them with several processes, and reports them as not valid.)
 
-What the rebase does, measured: where the conflicts are on pages and not on rows (groups, same page) the application sees **no retry at all** and the throughput is the same or higher (groups, 64 threads: 45k against 36k and 205 thousand
-retries; same page, 4 processes: 47k against 41k and 216 thousand retries); the repeated replays inside the engine are a cost, not a gain. Where the conflicts are on the same rows (hot rows, columns) it cannot save them (it refuses, correctly), it
-costs a decode and a failed check for each, and the back-off that skips the replay after a refusal keeps the throughput near the engine's without it (hot rows 64 threads 30k against 32k) with more retries
-(340 thousand against 260 thousand) in some runs and fewer in others (columns, 64 threads: 63 thousand against 234 thousand). It is for an application that cannot retry, or whose retries are costly. In the processes mode with 16 processes on one
-or four pages the throughput is now 33-48k only because the replays are serialised across all the processes (an `fcntl` lock): without it the replays of the processes beat each other (15k and 27k).
+What the rebase does, measured: where the conflicts are on pages and not on rows (groups, same page) the application sees **no retry at all**, and the throughput is the same or higher with threads (groups, 64 threads: 45k against 36k and 205 thousand
+retries; same page, 64 threads: 33k against 32k and 253 thousand retries) and with four groups of processes (16 processes: 49k against 45k and 381 thousand retries). It is **lower** with processes on one single page (16 processes: 34k against 43k, 0 retries
+against 400 thousand; 4 processes: 39k against 41k) and with threads in the smallest cases (4 threads on one page: 23k against 32k): the replays of one page are serialised and each costs the decode, the replay and a second commit. Where the conflicts are on the same rows (hot rows, columns) it cannot save them (it refuses,
+correctly, and the back-off that skips the replay after a refusal keeps the throughput near the engine's without it: hot rows, 64 threads 30k against 32k, 16 processes 44k against 43k), with the retries about the same or fewer
+(hot rows 16 processes 380 thousand against 402 thousand; columns 64 threads 63 thousand against 234 thousand; more with threads on hot rows: 340 thousand against 260 thousand). It is for an application that cannot retry, or whose retries are costly. In the processes mode the replays
+are serialised across all the processes (an `fcntl` lock): without it the replays of 16 processes on one page were 15k.
 
 **Why the replays are serialised, and not parallel (measured).** The first version with a mutex per database was 13.7k tx/s at 64 threads on one page against 31k for the engine without the rebase. Two of the causes were not the mutex: (1) an `UPDATE` that named
 every column rewrote the index of an indexed column that had not changed, so every reader of that index page was refused (the replay now sets only the columns that changed: read conflicts 254 thousand -> 0); (2) a rebased conflict granted

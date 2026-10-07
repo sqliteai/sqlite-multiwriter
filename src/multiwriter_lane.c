@@ -177,7 +177,7 @@ static int lane_publish_inner (mw_lane *lane) {
         if (lane->pre_ch) { for (int i = 0; i < lane->ws_n; i++) lane->pre_ch[i] = mw_seglog_content_hash(imgs[i], (size_t)w->pgsz); lane->pre_use = lane->pre_ch; }
     }
     if (mp_hold) { uint64_t tw0 = MW_T0(); mw_gate_enter(db, lane); mw_mp_lock(db); MW_T1(MW_ST_MP_WAIT, tw0); lane->mp_held = true; lane->mp_t0 = MW_T0(); }
-    int rc = lane->rs_overflow && lane->readcheck ? MW_CONFLICT_READ
+    int rc = lane->rs_overflow && lane->readcheck ? SQLITE_NOMEM                 // (the read set could not be kept: out of memory, which is what the application must see, not a conflict it would retry)
            : mw_db_publish(db, lane, &v, lane->ws_pgnos, imgs, lane->ws_n, lane->ws_dbsize, snap_size, lane->sync_level >= 2, &epoch);
 #define MP_RELEASE_NOFINISH() do { if (mp_hold) { mp_hold = false; lane->mp_held = false; MW_T1(MW_ST_MP_HELD, lane->mp_t0); mw_mp_unlock(db); mw_gate_exit(db); mw_log_prefill_bg(db); } } while (0)
 #define MP_RELEASE() do { if (mp_hold) { mp_hold = false; lane->mp_held = false; MW_T1(MW_ST_MP_HELD, lane->mp_t0); mw_mp_unlock(db); mw_gate_exit(db); mw_log_prefill_bg(db); \
@@ -325,6 +325,7 @@ static int wal_write (sqlite3_file *pf, const void *buf, int n, sqlite3_int64 of
     // header and the page of a frame with two calls (walWriteOneFrame); the page write ends it.
     if (off == 0 && n == 32) { w->pgsz = (int)be32(w->buf + 8); return SQLITE_OK; }
     if (n == 24) return SQLITE_OK;                                       // frame header, or checksum rewrite of one
+    if (w->commit_seen && w->pgsz && n < w->pgsz) return SQLITE_OK;      // (padding after the commit frame: a device that is not power-safe makes SQLite pad the WAL to a sector boundary with a frame header and part of a page; a VFS stacked over this one can say so)
     if (w->pgsz == 0 || n != w->pgsz || off < 32 || ((size_t)off - 32) % ((size_t)w->pgsz + 24) != 24) return SQLITE_IOERR_WRITE;   // unexpected layout: fail loudly
     int k = (int)(((size_t)off - 32) / ((size_t)w->pgsz + 24));
     uint32_t ntrunc = be32(w->buf + 32 + (size_t)k * ((size_t)w->pgsz + 24) + 4);
@@ -398,7 +399,7 @@ static void rs_mark (mw_lane *lane, uint32_t pgno) {
         size_t cap = lane->rs_bits_cap ? lane->rs_bits_cap : 4096;
         while (cap <= pgno) cap *= 2;
         uint8_t *p = sqlite3_realloc64(lane->rs_bits, cap);
-        if (!p) { lane->rs_overflow = true; return; }                            // cannot track: the commit is refused as a read conflict
+        if (!p) { lane->rs_overflow = true; return; }                            // cannot track: the commit fails with SQLITE_NOMEM
         memset(p + lane->rs_bits_cap, 0, cap - lane->rs_bits_cap);
         lane->rs_bits = p;
         lane->rs_bits_cap = cap;

@@ -362,7 +362,12 @@ static void procs_run (const char *path, int keys, int nprocs, double secs, int 
 static void procs_verify (const char *name, const char *path, int keys, int nprocs, int kills, int crashes, int min_events) {
     g_procs_mode = 1; g_path = path; g_keys = keys;
     // what the database has of each process's transactions
-    sqlite3 *chk; CHECK_RC(open_db(path, &chk), SQLITE_OK);                                              // (after a loss of power this open is the recovery)
+    sqlite3 *chk; int orc = open_db(path, &chk);
+    if (orc != SQLITE_OK) {                                                                              // (forensics: what the files were when the open failed)
+        printf("  [open of %s failed: rc %d: %s]\n", path, orc, chk ? sqlite3_errmsg(chk) : "?"); fflush(stdout);
+        char cmd[900]; snprintf(cmd, sizeof cmd, "ls -la %s* 2>&1 | head -20; head -c 100 %s | xxd | head -4", path, path); (void)!system(cmd);
+    }
+    CHECK_RC(orc, SQLITE_OK);                                              // (after a loss of power this open is the recovery)
     uint64_t final_seq[32] = {0}; for (int i = 0; i < nprocs; i++) { char q[100]; snprintf(q, sizeof q, "SELECT seq FROM txlog WHERE slot = %d", i); sqlite3_stmt *st; sqlite3_prepare_v2(chk, q, -1, &st, NULL); if (sqlite3_step(st) == SQLITE_ROW) final_seq[i] = (uint64_t)sqlite3_column_int64(st, 0); sqlite3_finalize(st); }
     sqlite3_close(chk);
     // the record files

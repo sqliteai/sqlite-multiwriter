@@ -40,26 +40,22 @@ static void tl_exit (void *unused) { (void)unused; tl_flush(); }
 static void tl_init (void) { pthread_key_create(&tl_key, tl_exit); }
 uint64_t mw_vfs_event_count (mw_event_t ev) { return (ev < MW_EV_COUNT) ? atomic_load(&mw_counts[ev]) + tl_cnt[ev] : 0; }
 void mw_vfs_events_reset (void) { for (int i = 0; i < MW_EV_COUNT; ++i) { atomic_store(&mw_counts[i], 0); tl_cnt[i] = 0; } tl_n = 0; }
-// Statement-start hook (sqlite3_trace_v2): recognises DDL/VACUUM and raises the schema barrier before it runs.
-static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
-    (void)ctx; (void)x;
-    if (type == SQLITE_TRACE_PROFILE) {                     // the statement is over: a schema change that never touched the main file (CREATE TEMP TABLE...) opened no snapshot of it, and nothing else would give the barrier back
-        sqlite3_file_control(sqlite3_db_handle((sqlite3_stmt *)p), "main", MW_FCNTL_DDL_RELEASE_IDLE, NULL);
-        return 0;
-    }
-    if (type != SQLITE_TRACE_STMT) return 0;
-    sqlite3_stmt *st = (sqlite3_stmt *)p;
-    const char *sql = sqlite3_sql(st);
-    if (!sql) return 0;
+// Statement hook (sqlite3_trace_v2): recognises DDL/VACUUM, raises the schema barrier before it runs and gives it back, if it is still idle, when the statement ends.
+static bool mw_is_ddl_sql (const char *sql) {
     while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r') sql++;
     static const char *kw[] = { "CREATE", "DROP", "ALTER", "REINDEX", "VACUUM" };
-    for (unsigned i = 0; i < sizeof(kw) / sizeof(kw[0]); i++) {
-        size_t n = strlen(kw[i]);
-        if (sqlite3_strnicmp(sql, kw[i], (int)n) == 0) {
-            sqlite3_file_control(sqlite3_db_handle(st), "main", MW_FCNTL_DDL_BEGIN, NULL);
-            return 0;
-        }
-    }
+    for (unsigned i = 0; i < sizeof(kw) / sizeof(kw[0]); i++) if (sqlite3_strnicmp(sql, kw[i], (int)strlen(kw[i])) == 0) return true;
+    return false;
+}
+static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
+    (void)ctx; (void)x;
+    if (type != SQLITE_TRACE_STMT && type != SQLITE_TRACE_PROFILE) return 0;
+    sqlite3_stmt *st = (sqlite3_stmt *)p;
+    const char *sql = sqlite3_sql(st);
+    if (!sql || !mw_is_ddl_sql(sql)) return 0;
+    // at the start of a schema change the barrier is raised; at its end it is given back if no snapshot of the main file is open (a change of a temporary object never opens one, and
+    // nothing else would end the barrier)
+    sqlite3_file_control(sqlite3_db_handle(st), "main", type == SQLITE_TRACE_STMT ? MW_FCNTL_DDL_BEGIN : MW_FCNTL_DDL_RELEASE_IDLE, NULL);
     return 0;
 }
 
@@ -219,6 +215,8 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         const char *cache = sqlite3_uri_parameter(name, "cache");
         if (cache && !strcmp(cache, "shared")) return SQLITE_CANTOPEN;          // shared-cache shares one pager between connections: no private lanes
     }
+    if (mode >= 2 && name && (flags & SQLITE_OPEN_READONLY) && !mw_path_is_clean_wal_db(name)) mode = 0;       // (a read-only connection must not write to the file: it cannot be converted to WAL, and it reads as stock does)
+    if (mode >= 2 && name && !(flags & SQLITE_OPEN_CREATE) && access(name, F_OK) != 0) return SQLITE_CANTOPEN;      // (the conversion to WAL below would create the file that the application asked not to create)
     if (mode >= 2) {
         int rc = mw_ensure_wal_db(name);      // private lanes require a WAL-mode database file
         if (rc != SQLITE_OK) return rc;

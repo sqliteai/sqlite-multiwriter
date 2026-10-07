@@ -387,6 +387,7 @@ void        mw_ev (mw_event_t e, mw_file *f, int64_t a, int64_t b, int flags);
 sqlite3_vfs *mw_root_vfs (void);
 mw_db      *mw_db_find_by_wal (const char *wal_name);
 int         mw_ensure_wal_db (const char *path);
+bool        mw_path_is_clean_wal_db (const char *path);
 
 // private lanes (multiwriter_lane.c)
 void mw_lane_methods_init (const sqlite3_io_methods *pass);   // once, from mw_vfs_register()

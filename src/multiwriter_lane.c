@@ -642,6 +642,16 @@ int mw_lane_open_main (mw_file *f, mw_lane *lane) {
 // Private lanes require the database file to be in WAL mode (the pager then never rewrites the
 // header from a lane). New/rollback-mode files are converted with a private stock connection on
 // the underlying VFS; if a real WAL is left over from stock use it is checkpointed by that close.
+// True if the file is a database in WAL mode with no real -wal that holds committed frames: what the engine can open without writing to it.
+bool mw_path_is_clean_wal_db (const char *path) {
+    size_t n = strlen(path); char *wp = malloc(n + 5); if (!wp) return false;
+    memcpy(wp, path, n); memcpy(wp + n, "-wal", 5);
+    struct stat sb; bool stale = stat(wp, &sb) == 0 && sb.st_size > 0; free(wp);
+    FILE *fp = fopen(path, "rb"); if (!fp) return false;
+    uint8_t h[100]; size_t got = fread(h, 1, sizeof h, fp); fclose(fp);
+    return got == sizeof h && h[18] == 2 && h[19] == 2 && !stale;
+}
+
 int mw_ensure_wal_db (const char *path) {
     // A real -wal left by stock use (a crashed process, the sqlite3 CLI) holds committed frames the lane store cannot see; and the compactor would
     // later overwrite the main file under it, so a stock connection replaying that WAL would corrupt newer pages. Checkpoint it first.

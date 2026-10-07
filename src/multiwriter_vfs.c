@@ -43,6 +43,10 @@ void mw_vfs_events_reset (void) { for (int i = 0; i < MW_EV_COUNT; ++i) { atomic
 // Statement-start hook (sqlite3_trace_v2): recognises DDL/VACUUM and raises the schema barrier before it runs.
 static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
     (void)ctx; (void)x;
+    if (type == SQLITE_TRACE_PROFILE) {                     // the statement is over: a schema change that never touched the main file (CREATE TEMP TABLE...) opened no snapshot of it, and nothing else would give the barrier back
+        sqlite3_file_control(sqlite3_db_handle((sqlite3_stmt *)p), "main", MW_FCNTL_DDL_RELEASE_IDLE, NULL);
+        return 0;
+    }
     if (type != SQLITE_TRACE_STMT) return 0;
     sqlite3_stmt *st = (sqlite3_stmt *)p;
     const char *sql = sqlite3_sql(st);
@@ -61,7 +65,7 @@ static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
 
 static int mw_connection_init (sqlite3 *db, char **err, const sqlite3_api_routines *api) {
     (void)err; (void)api;
-    sqlite3_trace_v2(db, SQLITE_TRACE_STMT, mw_trace_cb, NULL);
+    sqlite3_trace_v2(db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, mw_trace_cb, NULL);
     return SQLITE_OK;
 }
 

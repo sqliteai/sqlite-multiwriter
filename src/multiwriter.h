@@ -76,6 +76,7 @@ typedef struct {
     uint64_t reads_saved;           // read conflicts on interior pages avoided because the pages the transaction went through were routed unchanged
 } mw_db_stats;
 
+#define MW_FCNTL_DDL_RELEASE_IDLE 0x4d57000f   // internal: a statement ended; the schema barrier it raised is given back if no snapshot of the main file is open
 #define MW_FCNTL_DDL_BEGIN 0x4d570009   // internal: a schema-changing statement is about to run (exclusive schema barrier)
 #define MW_FCNTL_LANE_PTR 0x4d57000b   // internal: void ** (the connection's lane)
 #define MW_FCNTL_GC             0x4d570004   // sqlite3_file_control(db, "main", MW_FCNTL_GC, uint64_t *reclaimed)

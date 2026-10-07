@@ -495,6 +495,7 @@ static int lm_file_control (sqlite3_file *pf, int op, void *arg) {
     }
     if (op == MW_FCNTL_DBSTATS) { mw_lane_fill_stats(lane, (mw_db_stats *)arg); return SQLITE_OK; }
     if (op == MW_FCNTL_DDL_BEGIN) { mw_lane_ddl_begin(lane); return SQLITE_OK; }
+    if (op == MW_FCNTL_DDL_RELEASE_IDLE) { if (lane->ddl_active && !lane->snapshot_held) mw_lane_ddl_end(lane); return SQLITE_OK; }
     if (op == MW_FCNTL_COMPACT) { mw_compact_result *r = (mw_compact_result *)arg; return mw_db_compact(lane->db, r); }
     if (op == MW_FCNTL_LANE_PTR) { *(void **)arg = lane; return SQLITE_OK; }
     if (op == MW_FCNTL_GC) { *(uint64_t *)arg = mw_db_gc(lane->db); return SQLITE_OK; }

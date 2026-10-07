@@ -35,6 +35,8 @@ void mw_lane_init (mw_lane *lane, mw_db *db) {
 // The snapshot epoch is read *while holding the registry mutex* and the lane is registered
 // before the mutex is released: a concurrent oldest_active_snapshot() therefore either sees
 // this lane or observes an epoch <= the one taken here. Version GC relies on this.
+#define MW_WARM_AFTER 64      // read-only snapshots in a row before a connection keeps its cache (one that writes now and then must not: see reads_since_write)
+
 void mw_lane_snapshot_begin (mw_lane *lane) {
     mw_db *db = lane->db;
     if (lane->snapshot_held) return;
@@ -132,9 +134,18 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
     lane->tx.state = MW_TX_ACTIVE;
     lane->tx.is_writer = 0;
     lane->tx.ws_pages = 0;
-    for (int i = 0; i < lane->rs_n; i++) lane->rs_bits[lane->rs_list[i]] = 0;
-    lane->rs_n = 0;
-    lane->rs_overflow = false;
+    lane->tried_write = false;
+    if (lane->reads_since_write < UINT32_MAX) lane->reads_since_write++;
+    if (lane->warm && lane->warm_epoch == lane->tx.snapshot_epoch) {
+        // the same epoch as the read-only snapshot before: the cached pages are right, and the read set stays (a superset of what this transaction reads: its cache hits never reach the VFS)
+        lane->warm = false;
+    } else {
+        if (lane->warm && lane->nshm > 0 && lane->shm[0]) memset(lane->shm[0], 0, 96);       // another epoch: the header is invalidated before SQLite looks at it again, and it resets its cache
+        lane->warm = false;
+        for (int i = 0; i < lane->rs_n; i++) lane->rs_bits[lane->rs_list[i]] = 0;
+        lane->rs_n = 0;
+        lane->rs_overflow = false;
+    }
     lane->ws_n = 0;                 // write set of the previous transaction stays inspectable until now
     atomic_fetch_add(&db->n_snapshots, 1);
     MW_T1(MW_ST_SNAPBEGIN, tsb0);
@@ -196,11 +207,17 @@ int mw_lane_on_shm_lock (mw_lane *lane, int ofst, int flags) {
         if (lock) {
             mw_lane_snapshot_begin(lane);                     // no-op if already held
         } else if (!lane->write_locked) {
+            // A connection that has not written for MW_WARM_AFTER snapshots keeps its page cache from one snapshot to the next if that is taken at the same epoch (the header of the wal-index stays valid, so SQLite
+            // does not reset the cache): nothing has changed. A snapshot that wrote, or that could not track its reads, starts the next one cold. The next snapshot_begin
+            // invalidates the header if its epoch is another one.
+            const bool warm = lane->private_mode && !lane->tx.is_writer && lane->reads_since_write >= MW_WARM_AFTER && !lane->tried_write && lane->ws_n == 0 && !lane->rs_overflow && lane->tx.state == MW_TX_ACTIVE;
+            const uint64_t ep = lane->tx.snapshot_epoch;
             mw_lane_snapshot_end(lane);
-            if (lane->private_mode) mw_lane_reset(lane);
+            if (lane->private_mode) { mw_lane_reset(lane, warm); lane->warm = warm; lane->warm_epoch = ep; }
         }
     } else if (ofst == 0 && (flags & SQLITE_SHM_EXCLUSIVE) && lane->snapshot_held) {
         if (lock) {
+            lane->tried_write = true; lane->reads_since_write = 0;
             if (lane->private_mode) {
                 mw_db *db = lane->db;
                 // A snapshot older than the newest schema change can never publish: fail fast (retryable)

@@ -205,6 +205,10 @@ struct mw_lane {
     uint32_t    dsz_val;
     bool        dsz_valid;
     bool        noreloc;         // URI mw_noreloc=1: never renumber new pages after a growth conflict (measurement)
+    uint32_t    reads_since_write; // snapshots since this connection last asked for the write lock: a connection that keeps reading is a reader, and only a reader keeps its cache warm (the read set that it would inherit makes the commits of a writer conflict for pages it did not read)
+    bool        tried_write;     // this snapshot asked for the WAL write lock (whether or not it got it)
+    bool        warm;            // the last snapshot of this connection was read-only: its page cache and read set were kept (see mw_lane_snapshot_begin)
+    uint64_t    warm_epoch;      // ... and was taken at this epoch
     bool        rs_overflow;     // read-set tracking ran out of memory in this snapshot: the read set is incomplete
     uint32_t    bp_wait_us;                      // back-pressure: sleep this long after the publication lock is released
     uint64_t    writer_id;      // unique per connection (lane) in this process; NOT the sqlite-sync site_id
@@ -389,7 +393,7 @@ void mw_lane_methods_init (const sqlite3_io_methods *pass);   // once, from mw_v
 const sqlite3_io_methods *mw_vfs_pass_io (void);
 int  mw_lane_open_main (mw_file *f, mw_lane *lane);          // sets f->base.pMethods
 int  mw_lane_open_wal (mw_file *f, const char *name);        // no real file: memory only
-void mw_lane_reset (mw_lane *lane);                          // drop the private WAL + invalidate the wal-index header
+void mw_lane_reset (mw_lane *lane, bool keep_header);                          // drop the private WAL + invalidate the wal-index header
 void mw_lane_free (mw_lane *lane);
 
 // page store (multiwriter_pages.c)

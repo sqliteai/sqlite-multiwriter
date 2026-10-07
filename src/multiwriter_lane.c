@@ -363,13 +363,13 @@ int mw_lane_open_wal (mw_file *f, const char *name) {
 // Header copies live at bytes 0..95 of the first wal-index region. An all-zero header has
 // isInit == 0, which SQLite treats as "malformed": it takes the (private) write lock, runs
 // walIndexRecover over the (now empty) WAL and reports changed=1 => page cache reset.
-void mw_lane_reset (mw_lane *lane) {
+void mw_lane_reset (mw_lane *lane, bool keep_header) {
     lane->commit_base = 0;
     lane->own_n = 0; lane->poisoned = false;
     lane->wal.size = 0;
     lane->wal.commit_seen = false;
     lane->wal.pgsz = 0;
-    if (lane->nshm > 0 && lane->shm[0]) memset(lane->shm[0], 0, 96);
+    if (!keep_header && lane->nshm > 0 && lane->shm[0]) memset(lane->shm[0], 0, 96);
 }
 
 void mw_lane_free (mw_lane *lane) {

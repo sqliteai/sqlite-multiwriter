@@ -29,7 +29,7 @@ typedef struct { rw_t *rw; size_t nrw, caprw; ro_t *ro; size_t nro, capro; long 
 
 static const char *g_path; static int g_keys; static double g_secs; static int g_procs_mode, g_threadmode, g_rebase;      // g_threadmode: the "processes" of the power-loss run are threads of one process (the engine's single-process mode)
 static int open_db (const char *path, sqlite3 **db) {
-    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=16%s%s", path, ((g_procs_mode && !g_threadmode) || getenv("MW_TEST_MP")) ? "&mw_mp=1" : "", g_rebase ? "&mw_rebase=1" : "");
+    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=%d%s%s", path, getenv("MW_SERIAL_GC") ? atoi(getenv("MW_SERIAL_GC")) : 16, ((g_procs_mode && !g_threadmode) || getenv("MW_TEST_MP")) ? "&mw_mp=1" : "", g_rebase ? "&mw_rebase=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;
@@ -152,7 +152,9 @@ static int cmp_u64 (const void *a, const void *b) { uint64_t x = *(const uint64_
 
 typedef struct { rw_t **known; size_t nknown; rw_t **doubt; size_t ndoubt; ro_t **ro; size_t nro; } txset;      // known: commit epoch known (sorted by it); doubt: committed, epoch unknown (to be placed in a gap)
 typedef struct { mrow *m; int *owner; int keys; } model;
-#define REPORT(counter, ...) do { if ((counter)++ < 4) { printf("    "); printf(__VA_ARGS__); printf("\n"); } } while (0)
+static model new_model (int keys);
+static int g_quiet;      // (while the placement of the transactions in doubt is searched, what is reported is not printed)
+#define REPORT(counter, ...) do { if ((counter)++ < 4 && !g_quiet) { printf("    "); printf(__VA_ARGS__); printf("\n"); } } while (0)
 typedef struct { long bad_read, bad_unique, bad_ro, bad_dup_epoch, bad_gap, bad_tail; } viol;
 
 static int reads_fit (const rw_t *t, const model *M) { for (int k = 0; k < t->n; k++) { const op_t *o = &t->op[k]; if (!same(o->sex, o->sv, o->su, o->spl, o->sw, &M->m[o->key])) return 0; } return 1; }
@@ -176,10 +178,12 @@ static void check_ro (const ro_t *r, const model *M, viol *V) {
 }
 static int cmp_known (const void *a, const void *b) { const rw_t *p = *(rw_t *const *)a, *q = *(rw_t *const *)b; if (p->commit != q->commit) return p->commit < q->commit ? -1 : 1; return p->order < q->order ? -1 : p->order > q->order; }
 static int cmp_ro (const void *a, const void *b) { uint64_t x = (*(ro_t *const *)a)->snap, y = (*(ro_t *const *)b)->snap; return x < y ? -1 : x > y; }
-static int cmp_doubt (const void *a, const void *b) { uint64_t x = (*(rw_t *const *)a)->snap, y = (*(rw_t *const *)b)->snap; return x < y ? -1 : x > y; }
+static int cmp_doubt (const void *a, const void *b) { const rw_t *p = *(rw_t *const *)a, *q = *(rw_t *const *)b; if (p->snap != q->snap) return p->snap < q->snap ? -1 : 1; if (p->slot != q->slot) return p->slot < q->slot ? -1 : 1; return p->seq < q->seq ? -1 : p->seq > q->seq; }      // (a total order: replay() sorts again for every try, and qsort is not stable: two in doubt with the same snapshot must always come in the same order)
 
 // Replays the committed transactions in the order of the epochs. The ones in doubt take the epochs that no recorded transaction has (and the ones after the last), the first of them whose reads fit the model.
-static void replay (txset *S, model *M, viol *V) {
+static int g_choice[256], g_nchoice, g_cand[256], g_nenc;      // the placements of the transactions in doubt that have more than one candidate: which one this try takes, and how many there were
+static void replay_once (txset *S, model *M, viol *V) {
+    g_nenc = 0;
     qsort(S->known, S->nknown, sizeof *S->known, cmp_known); qsort(S->ro, S->nro, sizeof *S->ro, cmp_ro); qsort(S->doubt, S->ndoubt, sizeof *S->doubt, cmp_doubt);
     char *used = calloc(S->ndoubt + 1, 1); size_t ri = 0, ki = 0, ndone = 0;
     uint64_t e = S->nknown ? S->known[0]->commit : 1;
@@ -196,14 +200,17 @@ static void replay (txset *S, model *M, viol *V) {
         if (have_known && S->known[ki]->commit < e) { REPORT(V->bad_dup_epoch, "two commits at epoch %llu", (unsigned long long)S->known[ki]->commit); apply_rw(S->known[ki], S->known[ki]->commit, M, V); ki++; continue; }
         // an epoch that no recorded transaction has (inside the recorded range, or after it)
         size_t pick = (size_t)-1;
-        for (size_t d = 0; d < S->ndoubt; d++) if (!used[d] && S->doubt[d]->snap < e && reads_fit(S->doubt[d], M)) { pick = d; break; }
+        { size_t cl[64]; int nc = 0;
+          for (size_t d = 0; d < S->ndoubt && nc < 64; d++) if (!used[d] && S->doubt[d]->snap < e && reads_fit(S->doubt[d], M)) cl[nc++] = d;
+          if (nc) { int k = g_nenc++; int c = k < g_nchoice ? g_choice[k] : 0; if (c >= nc) c = nc - 1; if (k < 256) g_cand[k] = nc; pick = cl[c]; } }
         if (pick == (size_t)-1) {
+            if (getenv("MW_SERIAL_DEBUG")) { printf("  [gap epoch %llu] doubts left:", (unsigned long long)e); for (size_t d = 0; d < S->ndoubt; d++) if (!used[d]) printf(" (slot %d seq %llu snap %llu n %d fit %d)", S->doubt[d]->slot, (unsigned long long)S->doubt[d]->seq, (unsigned long long)S->doubt[d]->snap, S->doubt[d]->n, reads_fit(S->doubt[d], M)); printf("\n"); }
             if (have_known) { REPORT(V->bad_gap, "epoch %llu has no recorded commit and no transaction in doubt fits it (a commit that nobody accounts for, or a lost one)", (unsigned long long)e); e++; continue; }
             // after the last recorded commit: what is left is in doubt and its place is unknown; each must still fit somewhere: take them in order of their snapshots
             for (size_t d = 0; d < S->ndoubt; d++) if (!used[d]) { REPORT(V->bad_tail, "transaction in doubt (snapshot %llu, slot %d seq %llu) committed but fits no epoch", (unsigned long long)S->doubt[d]->snap, S->doubt[d]->slot, (unsigned long long)S->doubt[d]->seq); used[d] = 1; ndone++; }
             break;
         }
-        used[pick] = 1; ndone++; apply_rw(S->doubt[pick], e, M, V);
+        used[pick] = 1; ndone++; if (getenv("MW_SERIAL_DEBUG")) printf("  [doubt placed] slot %d seq %llu snap %llu -> epoch %llu (nops %d)\n", S->doubt[pick]->slot, (unsigned long long)S->doubt[pick]->seq, (unsigned long long)S->doubt[pick]->snap, (unsigned long long)e, S->doubt[pick]->n); apply_rw(S->doubt[pick], e, M, V);
         if (g_threadmode && g_rebase) for (;;) {                                                   // (the threads of one process can have committed together, at one epoch: the ones that fit and began before it)
             size_t more = (size_t)-1; for (size_t d = 0; d < S->ndoubt; d++) if (!used[d] && S->doubt[d]->snap < e && reads_fit(S->doubt[d], M)) { more = d; break; }
             if (more == (size_t)-1) break;
@@ -213,6 +220,33 @@ static void replay (txset *S, model *M, viol *V) {
     }
     while (ri < S->nro) check_ro(S->ro[ri++], M, V);
     free(used);
+}
+
+// Two transactions that were in doubt can both fit the same epoch (a process killed while another was killed a moment ago): taking the first one is a guess. The placements are searched (the
+// first try is that guess) for one with no violation; if there is none the violations of the first try are what is reported.
+static int viol_total (const viol *V) { return (int)(V->bad_read + V->bad_unique + V->bad_ro + V->bad_dup_epoch + V->bad_gap + V->bad_tail); }
+static void replay (txset *S, model *M, viol *V) {
+    int keys = M->keys, best_choice[256], best_n = 0, tries = 0; int cand[256], nenc = 0;
+    g_nchoice = 0; g_quiet = 1;
+    model B = new_model(keys); viol VB; memset(&VB, 0, sizeof VB); replay_once(S, &B, &VB); tries++;
+    int first_total = viol_total(&VB); nenc = g_nenc < 256 ? g_nenc : 256; memcpy(cand, g_cand, sizeof cand);
+    int found = first_total == 0; memcpy(best_choice, g_choice, sizeof best_choice);
+    int choice[256] = {0};
+    while (!found && tries < 400) {                                                                     // (the next vector of choices, like an odometer over the ambiguous placements)
+        int k = nenc - 1; while (k >= 0 && choice[k] + 1 >= cand[k]) k--;
+        if (k < 0) break;
+        choice[k]++; for (int j = k + 1; j < 256; j++) choice[j] = 0;
+        memcpy(g_choice, choice, sizeof choice); g_nchoice = 256;
+        model T = new_model(keys); viol VT; memset(&VT, 0, sizeof VT); replay_once(S, &T, &VT); tries++;
+        nenc = g_nenc < 256 ? g_nenc : 256; memcpy(cand, g_cand, sizeof cand);
+        if (viol_total(&VT) == 0) { found = 1; memcpy(best_choice, choice, sizeof choice); best_n = 256; free(T.m); free(T.owner); break; }
+        free(T.m); free(T.owner);
+    }
+    free(B.m); free(B.owner);
+    g_quiet = 0;
+    if (found && best_n) { memcpy(g_choice, best_choice, sizeof best_choice); g_nchoice = best_n; } else g_nchoice = 0;     // (the placement that is reported and whose model is kept)
+    if (getenv("MW_SERIAL_DEBUG") || tries > 1 || !found) printf("  [placement of the transactions in doubt: %d tries, %s]\n", tries, found ? (best_n ? "another placement than the first fits" : "the first fits") : "none fits");
+    replay_once(S, M, V);
 }
 
 static int final_check (const char *path, model *M, long *rows_out, long *model_rows_out, long *bad_final, long *dup, int *integ) {

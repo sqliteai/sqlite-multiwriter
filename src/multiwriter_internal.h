@@ -91,6 +91,7 @@ typedef struct mw_shm {
     _Atomic uint32_t  sy_failed;          // an fsync of the log failed: the data it should have covered may never reach the disk, and a later fsync that succeeds (the kernel forgets the error) must not acknowledge it: every commit that is not durable yet fails, in every process, until the log is closed by all
     _Atomic uint32_t  base_dbsize;        // database size in pages at the compaction base (what the real file holds)
     _Atomic uint64_t  compact_req_ns;     // shared mode: a process has claimed the next compaction at this time (0 = none; a claim older than 2 s is void)
+    _Atomic int32_t   compact_req_pid;    // ... and this is the process (0 = not written yet): another one takes the claim over at once if it is gone, instead of waiting for the 2 s
     _Atomic uint64_t  compact_end_ns;     // when the last compaction ended (periodic compactions of all processes share one interval)
     _Atomic uint64_t  compact_busy_T;     // a compaction is reading versions <= this: the index GC must not free them (0 = none)
     mw_mp_proc        procs[MW_MP_PROCS];

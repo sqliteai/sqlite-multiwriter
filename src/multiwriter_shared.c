@@ -344,12 +344,16 @@ static void cmp_collect (void *p, uint32_t pgno, uint64_t epoch, uint64_t loc) {
 bool mw_shared_compact_claim (mw_db *db, bool by_size) {
     mw_shm *sh = db->shm;
     uint64_t now = now_ns(), req = atomic_load(&sh->compact_req_ns);
-    if (req && now - req < 2000000000ull) return false;
+    if (req && now - req < 2000000000ull) {
+        int32_t who = atomic_load(&sh->compact_req_pid);                                   // (0: the claimant has not written its number yet)
+        if (who <= 0 || mw_mp_pid_alive(db, who)) return false;                           // the claimant is gone (a kill, a crash): its claim is not waited for, nor what it announced to be reading
+    }
     if (!by_size) {
         uint64_t iv = (uint64_t)(db->compact_interval_ms > 0 ? db->compact_interval_ms : 1000) * 1000000ull, end = atomic_load(&sh->compact_end_ns);
         if (end && now - end < iv / 2) return false;
     }
     if (!atomic_compare_exchange_strong(&sh->compact_req_ns, &req, now)) return false;
+    atomic_store(&sh->compact_req_pid, (int32_t)getpid());
     db->compact_claimed = true;
     return true;
 }
@@ -375,7 +379,7 @@ int mw_shared_compact (mw_db *db, mw_compact_result *out) {
     uint64_t visible = atomic_load(&sh->committed_epoch);
     if (T > visible) T = visible;
     base = atomic_load(&sh->base_epoch);
-    if (T > base) atomic_store(&sh->compact_busy_T, T);
+    atomic_store(&sh->compact_busy_T, T > base ? T : 0);                       // (we hold the compaction lock: a value that is there is the one of a compactor that died)
     const uint64_t lp = atomic_load_explicit(&sh->log_pos, memory_order_acquire);        // (where the log ends with the commits up to T in it: they are visible before their fsync, so what goes into the file must first be durable in the log)
     mw_mp_unlock(db);
     if (T <= base) goto done;
@@ -420,7 +424,7 @@ done:
     atomic_fetch_add(&db->n_compaction_ns, out->duration_ns);
     if (getenv("MW_COMPACT_TRACE")) fprintf(stderr, "compact: end t=%.0fms pid=%d took=%.0fms pages=%llu rc=%d\n", (double)(now_ns() / 1000000ull % 100000), (int)getpid(), (double)(now_ns() - t0) / 1e6, (unsigned long long)out->pages_written, rc);
     atomic_store(&sh->compact_end_ns, now_ns());
-    if (db->compact_claimed) { db->compact_claimed = false; atomic_store(&sh->compact_req_ns, 0); }
+    if (db->compact_claimed) { db->compact_claimed = false; atomic_store(&sh->compact_req_pid, 0); atomic_store(&sh->compact_req_ns, 0); }
     pthread_mutex_unlock(&db->compact_mu);
     return rc;
 }

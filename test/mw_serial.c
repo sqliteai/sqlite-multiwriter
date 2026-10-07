@@ -192,9 +192,11 @@ static int viol_total (const viol *V);
 static int g_choice[256], g_nchoice, g_cand[256], g_nenc;      // the placements of the transactions in doubt that have more than one candidate: which one this try takes, and how many there were
 static void replay_once (txset *S, model *M, viol *V) {
     g_nenc = 0; g_aborted = 0;
+    if (getenv("MW_SERIAL_DUMP") && !g_quiet) { printf("  [known: %zu, first 14 by epoch:", S->nknown); for (size_t i = 0; i < S->nknown && i < 14; i++) printf(" (e%llu s%d q%llu snap%llu n%d)", (unsigned long long)S->known[i]->commit, S->known[i]->slot, (unsigned long long)S->known[i]->seq, (unsigned long long)S->known[i]->snap, S->known[i]->n); printf("]\n  [doubt (committed): %zu:", S->ndoubt); for (size_t i = 0; i < S->ndoubt && i < 10; i++) printf(" (s%d q%llu snap%llu n%d)", S->doubt[i]->slot, (unsigned long long)S->doubt[i]->seq, (unsigned long long)S->doubt[i]->snap, S->doubt[i]->n); printf("]\n"); }
     qsort(S->known, S->nknown, sizeof *S->known, cmp_known); qsort(S->ro, S->nro, sizeof *S->ro, cmp_ro); qsort(S->doubt, S->ndoubt, sizeof *S->doubt, cmp_doubt);
     char *used = calloc(S->ndoubt + 1, 1); size_t ri = 0, ki = 0, ndone = 0;
-    uint64_t e = S->nknown ? S->known[0]->commit : 1;
+    uint64_t e = 2;                                                                       // (the first commit of a database is at epoch 2: what is before the first recorded commit can be one in doubt too)
+    if (S->nknown && S->known[0]->commit < e) e = S->known[0]->commit;
     for (;;) {
         int have_known = ki < S->nknown;
         if (g_stop && viol_total(V)) { g_aborted = 1; free(used); return; }
@@ -303,7 +305,7 @@ static void run_threads (const char *name, int keys, int threads, double secs) {
            name, keys, threads, nrw, nro, busy, cons, oth, (unsigned long long)ds.page_conflicts, (unsigned long long)ds.relocations, (unsigned long long)ds.merges, (unsigned long long)ds.rebases, (unsigned long long)ds.rebase_retries, (unsigned long long)ds.unrebasable, rows, model_rows);
     printf("   reads that differ from the serial order %ld, UNIQUE broken %ld, read-only inconsistent %ld, duplicate epochs %ld, final differs %ld, duplicate u in the table %ld, integrity %s\n", V.bad_read, V.bad_unique, V.bad_ro, V.bad_dup_epoch, bad_final, dup, integ ? "ok" : "BAD");
     CHECK(V.bad_read == 0); CHECK(V.bad_unique == 0); CHECK(V.bad_ro == 0); CHECK(V.bad_dup_epoch == 0); CHECK(bad_final == 0); CHECK(dup == 0); CHECK(integ); CHECK(rows == model_rows);
-    CHECK(nrw >= 500);                                                                                // (not vacuous)
+    CHECK(nrw >= 100);                                                                                // (not vacuous: on an idle machine there are ten thousand; with 24 copies of the test at once the hot rows with the rebase give a few hundred)
     if (g_rebase) CHECK(ds.rebases > 0);                                               // (and the rebase did take part)
     for (int i = 0; i < threads; i++) { free(R[i].rw); free(R[i].ro); } free(R); free(S.known); free(S.ro); free(M.m); free(M.owner);
     mw_rmdb(path);

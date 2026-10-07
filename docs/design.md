@@ -174,7 +174,7 @@ that reorders writes around a flush. Platforms: macOS and Linux (arm64 tested); 
 
 ## Third party and license
 
-The code is under `LICENSE.md` (Elastic License 2.0, modified). `third_party/sqlite` is SQLite 3.53.4 (public domain), unchanged. The measurements are in `bench/results/`.
+The code is under the Apache License 2.0 (`LICENSE`, `NOTICE`). `third_party/sqlite` is SQLite 3.53.4 (public domain), unchanged. The measurements are in `bench/results/`.
 
 ## Measurements
 

@@ -28,4 +28,4 @@ Status: macOS and Linux (arm64 tested). `docs/design.md` is the design, its guar
 
 ## License
 
-See `LICENSE.md` (Elastic License 2.0, modified). The vendored SQLite (`third_party/sqlite`) is in the public domain.
+Apache License 2.0: see `LICENSE` and `NOTICE`. The vendored SQLite (`third_party/sqlite`) is in the public domain.

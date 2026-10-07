@@ -123,8 +123,14 @@ static void *worker (void *arg) {
 
 static void rec_name (char *fn, size_t n, const char *path, int slot);
 // a process: runs until it is killed. It first says which of its sequence numbers the database has (RESOLVE: the transaction that the previous incarnation left in doubt has committed if its number is not above it).
+static sqlite3 *g_child_db;
+static void child_dump (int sig) {      // (SIGUSR1, debug: what this process counted)
+    (void)sig; mw_db_stats st; memset(&st, 0, sizeof st); if (g_child_db) sqlite3_file_control(g_child_db, "main", MW_FCNTL_DBSTATS, &st);
+    fprintf(stderr, "CHILD %d: commits %llu aborts %llu page_conflicts %llu read_conflicts %llu schema_conflicts %llu rebases %llu rebase_retries %llu unrebasable %llu relocations %llu\n", (int)getpid(), (unsigned long long)st.commits, (unsigned long long)st.aborts, (unsigned long long)st.page_conflicts, (unsigned long long)st.read_conflicts, (unsigned long long)st.schema_conflicts, (unsigned long long)st.rebases, (unsigned long long)st.rebase_retries, (unsigned long long)st.unrebasable, (unsigned long long)st.relocations);
+}
 static void slot_loop (int slot, int generation, int arm_crash) {
     sqlite3 *db; if (open_db(g_path, &db) != SQLITE_OK) _exit(2);
+    g_child_db = db; signal(SIGUSR1, child_dump);
     char fn[300]; rec_name(fn, sizeof fn, g_path, slot);
     int fd = open(fn, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd < 0) _exit(2);
     rec_t R; memset(&R, 0, sizeof R);
@@ -181,14 +187,17 @@ static int cmp_ro (const void *a, const void *b) { uint64_t x = (*(ro_t *const *
 static int cmp_doubt (const void *a, const void *b) { const rw_t *p = *(rw_t *const *)a, *q = *(rw_t *const *)b; if (p->snap != q->snap) return p->snap < q->snap ? -1 : 1; if (p->slot != q->slot) return p->slot < q->slot ? -1 : 1; return p->seq < q->seq ? -1 : p->seq > q->seq; }      // (a total order: replay() sorts again for every try, and qsort is not stable: two in doubt with the same snapshot must always come in the same order)
 
 // Replays the committed transactions in the order of the epochs. The ones in doubt take the epochs that no recorded transaction has (and the ones after the last), the first of them whose reads fit the model.
+static int g_stop, g_aborted;      // while the placements are searched, a try stops at its first violation: the wrong choice is one of the latest ones
+static int viol_total (const viol *V);
 static int g_choice[256], g_nchoice, g_cand[256], g_nenc;      // the placements of the transactions in doubt that have more than one candidate: which one this try takes, and how many there were
 static void replay_once (txset *S, model *M, viol *V) {
-    g_nenc = 0;
+    g_nenc = 0; g_aborted = 0;
     qsort(S->known, S->nknown, sizeof *S->known, cmp_known); qsort(S->ro, S->nro, sizeof *S->ro, cmp_ro); qsort(S->doubt, S->ndoubt, sizeof *S->doubt, cmp_doubt);
     char *used = calloc(S->ndoubt + 1, 1); size_t ri = 0, ki = 0, ndone = 0;
     uint64_t e = S->nknown ? S->known[0]->commit : 1;
     for (;;) {
         int have_known = ki < S->nknown;
+        if (g_stop && viol_total(V)) { g_aborted = 1; free(used); return; }
         if (!have_known && ndone == S->ndoubt) break;
         while (ri < S->nro && S->ro[ri]->snap < e) check_ro(S->ro[ri++], M, V);                  // (read-only transactions whose snapshot lies before this epoch saw the state so far)
         if (have_known && S->known[ki]->commit == e) {
@@ -227,23 +236,23 @@ static void replay_once (txset *S, model *M, viol *V) {
 static int viol_total (const viol *V) { return (int)(V->bad_read + V->bad_unique + V->bad_ro + V->bad_dup_epoch + V->bad_gap + V->bad_tail); }
 static void replay (txset *S, model *M, viol *V) {
     int keys = M->keys, best_choice[256], best_n = 0, tries = 0; int cand[256], nenc = 0;
-    g_nchoice = 0; g_quiet = 1;
+    g_nchoice = 0; g_quiet = 1; g_stop = 1;
     model B = new_model(keys); viol VB; memset(&VB, 0, sizeof VB); replay_once(S, &B, &VB); tries++;
     int first_total = viol_total(&VB); nenc = g_nenc < 256 ? g_nenc : 256; memcpy(cand, g_cand, sizeof cand);
-    int found = first_total == 0; memcpy(best_choice, g_choice, sizeof best_choice);
+    int found = first_total == 0 && !g_aborted; memcpy(best_choice, g_choice, sizeof best_choice);
     int choice[256] = {0};
-    while (!found && tries < 400) {                                                                     // (the next vector of choices, like an odometer over the ambiguous placements)
+    while (!found && tries < 5000) {                                                                     // (the next vector of choices, like an odometer over the ambiguous placements)
         int k = nenc - 1; while (k >= 0 && choice[k] + 1 >= cand[k]) k--;
         if (k < 0) break;
         choice[k]++; for (int j = k + 1; j < 256; j++) choice[j] = 0;
         memcpy(g_choice, choice, sizeof choice); g_nchoice = 256;
         model T = new_model(keys); viol VT; memset(&VT, 0, sizeof VT); replay_once(S, &T, &VT); tries++;
         nenc = g_nenc < 256 ? g_nenc : 256; memcpy(cand, g_cand, sizeof cand);
-        if (viol_total(&VT) == 0) { found = 1; memcpy(best_choice, choice, sizeof choice); best_n = 256; free(T.m); free(T.owner); break; }
+        if (viol_total(&VT) == 0 && !g_aborted) { found = 1; memcpy(best_choice, choice, sizeof choice); best_n = 256; free(T.m); free(T.owner); break; }
         free(T.m); free(T.owner);
     }
     free(B.m); free(B.owner);
-    g_quiet = 0;
+    g_quiet = 0; g_stop = 0;
     if (found && best_n) { memcpy(g_choice, best_choice, sizeof best_choice); g_nchoice = best_n; } else g_nchoice = 0;     // (the placement that is reported and whose model is kept)
     if (getenv("MW_SERIAL_DEBUG") || tries > 1 || !found) printf("  [placement of the transactions in doubt: %d tries, %s]\n", tries, found ? (best_n ? "another placement than the first fits" : "the first fits") : "none fits");
     replay_once(S, M, V);
@@ -266,6 +275,7 @@ static int final_check (const char *path, model *M, long *rows_out, long *model_
 }
 
 static void make_db (const char *path, int nslots) {
+    { char fn[400]; for (int slot = 0; slot < 32; slot++) { snprintf(fn, sizeof fn, "%s.rec%d", path, slot); unlink(fn); } }      // (the record files of a run that was killed: a process number that is used again gives the same path, and its records would be replayed into this run)
     sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL, u INTEGER UNIQUE, p BLOB NOT NULL, w INTEGER NOT NULL DEFAULT 0); CREATE TABLE txlog(slot INTEGER PRIMARY KEY, seq INTEGER NOT NULL, pad BLOB NOT NULL)"), SQLITE_OK);
     for (int i = 0; i < nslots; i++) { char q[120]; snprintf(q, sizeof q, "INSERT INTO txlog VALUES(%d, 0, zeroblob(3500))", i); CHECK_RC(mw_exec(s, q), SQLITE_OK); }          // (a row a page: the processes never conflict on it)
@@ -306,16 +316,28 @@ static void rec_name (char *fn, size_t n, const char *path, int slot) { if (g_re
 // Starts the processes, kills some of them at random moments while others die at crash points, for `secs`. cut_cmd: the end is a loss of power instead of a normal one: all processes are stopped (nothing is acknowledged
 // after that), the command runs (it cuts the power of the disk), then they are killed.
 static void procs_run (const char *path, int keys, int nprocs, double secs, int kill_ms, const char *idx_entries, const char *cut_cmd, int *kills_out, int *crashes_out) {
+    if (getenv("MW_SERIAL_KILL_MS")) kill_ms = atoi(getenv("MW_SERIAL_KILL_MS"));
     if (idx_entries) setenv("MW_IDX_ENTRIES", idx_entries, 1); else unsetenv("MW_IDX_ENTRIES");
     g_procs_mode = 1; g_path = path; g_keys = keys; g_secs = secs;
     pid_t pid[32]; int gen[32]; struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int i = 0; i < nprocs; i++) { gen[i] = 0; pid[i] = fork(); if (pid[i] == 0) child_main(i, 0); }
-    unsigned rng = 555u; int kills = 0, crashes = 0; double next_kill = (double)kill_ms / 1000.0;
+    unsigned rng = 555u; int kills = 0, crashes = 0; double next_kill = (double)kill_ms / 1000.0; int sampled = 0; long long last_tot = -2; double last_move = 0, last_poll = 0;
     for (;;) {
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         double el = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
         if (el > secs) break;
         usleep(5000);
+        if (getenv("MW_SERIAL_STALL_SAMPLE") && !sampled && el > 0.5 && el - last_poll > 0.5) {      // (a stall of the writers: what the processes committed does not grow for 2 s: the header of the shared state and the stacks of the processes are taken, once)
+            last_poll = el; sqlite3 *pdb; long long tot = -1;
+            if (open_db(path, &pdb) == SQLITE_OK) {
+                sqlite3_stmt *q; if (sqlite3_prepare_v2(pdb, "SELECT sum(seq) FROM txlog", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) tot = sqlite3_column_int64(q, 0); sqlite3_finalize(q);
+                if (getenv("MW_SERIAL_STALL_TRACE")) { fprintf(stderr, "[t=%.2f seq-sum=%lld] ", el, tot); sqlite3_file_control(pdb, "main", 0x4d570010, NULL); }
+                if (tot == last_tot && el - last_move > 2.0) { sampled = 1; sqlite3_file_control(pdb, "main", 0x4d570010, NULL); for (int i = 0; i < nprocs; i++) kill(pid[i], SIGUSR1); usleep(300000); fflush(stderr); }
+                sqlite3_close(pdb);
+            }
+            if (tot != last_tot) { last_tot = tot; last_move = el; }
+            else if (sampled) { for (int i = 0; i < nprocs; i++) { char cmd[300]; snprintf(cmd, sizeof cmd, "sample %d 1 -file /tmp/sstack_%d_%d.txt >/dev/null 2>&1", (int)pid[i], (int)getpid(), i); (void)!system(cmd); } printf("  [stall: stacks in /tmp/sstack_%d_*.txt]\n", (int)getpid()); }
+        }
         for (int i = 0; i < nprocs; i++) {                                                           // a process that died by itself (a crash point): replaced
             int st; if (waitpid(pid[i], &st, WNOHANG) == pid[i]) { crashes++; gen[i]++; pid[i] = fork(); if (pid[i] == 0) child_main(i, gen[i]); }
         }

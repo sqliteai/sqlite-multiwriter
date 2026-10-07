@@ -13,6 +13,7 @@
 //  Compaction, snapshots registration (the floor under which versions may be freed) and process liveness are those of the other multi-process mode.
 //
 
+#include <sys/file.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -113,8 +114,11 @@ int mw_shared_open_finish (mw_db *db) {
     // database (a restarted process, which then asks what became of the commit that it was making) must see its fate decided, and not decided after it has looked.
     if (db->mp_stale_owner || (!db->mp_first && atomic_load(&sh->pend_epoch))) { db->mp_stale_owner = false; mw_mp_lock(db); mw_shared_repair(db); mw_mp_unlock(db); }       // (the publisher that died had our pid: what it left half done is finished or undone)
     if (db->mp_first) {
+        { static _Atomic int dly = MW_KNOB_UNSET; const int us = mw_knob_int(&dly, "MW_TEST_OPEN_DELAY_US", 0); if (us > 0) usleep((useconds_t)us); }        // (tests: the time that the first process takes to finish the header)
         atomic_store(&sh->log_pos, MW_LOG_POS(atomic_load(&sh->sl_seg), atomic_load(&sh->sl_end)));
         atomic_store(&sh->committed_epoch, atomic_load(&db->epoch));
+        atomic_store(&sh->ready, 1);
+        flock(db->mp_lockfd, LOCK_SH);                                           // downgrade: others may proceed, now that the header is complete (before, a process that committed in between had its epoch overwritten by the one above: the epoch went back, the versions it installed stayed ahead of it, and every commit after that conflicted for ever)
     }
     return SQLITE_OK;
 }

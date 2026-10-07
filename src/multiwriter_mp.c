@@ -164,8 +164,7 @@ int mw_mp_finish_open (mw_db *db) {
         atomic_store(&sh->compact_T, db->base_epoch);
         atomic_store(&sh->schema_epoch, 1);
         atomic_store(&sh->dbv_counter, 0);
-        atomic_store(&sh->ready, 1);
-        flock(db->mp_lockfd, LOCK_SH);                                  // downgrade: others may proceed
+        if (!db->shared) { atomic_store(&sh->ready, 1); flock(db->mp_lockfd, LOCK_SH); }       // downgrade: others may proceed (the shared mode does it at the end of mw_shared_open_finish: it still has the header to complete, and a process that commits meanwhile must not have its epoch overwritten)
     }
     if (db->mp_first) { db->mp_gen = MW_LOG_GEN(atomic_load(&sh->log_pos)); db->mp_base_seen = atomic_load(&sh->base_epoch); }
     atomic_store(&sh->procs[db->mp_proc].applied, atomic_load(&db->epoch));

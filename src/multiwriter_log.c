@@ -538,7 +538,9 @@ int mw_log_ensure_room (mw_db *db, uint64_t record_size) {
     if (have < db->written_end) have = db->written_end;                               // (the data already in the file is its own reservation)
     int rc = SQLITE_OK;
     if (db->logfd >= 0 && need > atomic_load(&db->log_res_end)) {
-        int e = mw_io_reserve(db->logfd, have, want);
+        const int fd = db->logfd;
+        { static _Atomic int dly = MW_KNOB_UNSET; const int us = mw_knob_int(&dly, "MW_TEST_ROOM_DELAY_US", 0); if (us > 0) usleep((useconds_t)us); }      // (tests: the descriptor is read, and used a moment later)
+        int e = mw_io_reserve(fd, have, want);
         if (e) rc = mw_io_rc(e, SQLITE_IOERR_WRITE); else atomic_store(&db->log_res_end, want);
     }
     pthread_mutex_unlock(&db->log_mu);
@@ -1155,8 +1157,11 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch, mw_log_prep *prep) {
     // swap: offsets shift by (LOG_HDR_SIZE - tail_off)
     sync_quiesce(db);                                                    // (a group-commit leader may be inside msync/fsync on the old mapping and fd)
     log_unmap(db, true);
+    { static _Atomic int dly = MW_KNOB_UNSET; const int us = mw_knob_int(&dly, "MW_TEST_SWAP_DELAY_US", 0); if (us > 0) usleep((useconds_t)us); }      // (tests: widens the gap between the quiesce and the swap of the descriptor)
+    pthread_mutex_lock(&db->log_mu);                                     // (mw_log_ensure_room uses the descriptor under this lock, outside of the group-commit quiesce: it must not find it closed, or reused by another open)
     close(db->logfd);                                                    // (releases the old inode's lock; the new one is held)
     db->logfd = nfd;
+    pthread_mutex_unlock(&db->log_mu);
     int64_t shift = (int64_t)LOG_HDR_SIZE - (int64_t)tail_off;
     for (int i = 0; i < st->nsizes; i++) if (st->sizes[i].log_off >= tail_off) st->sizes[i].log_off = (uint64_t)((int64_t)st->sizes[i].log_off + shift); else st->sizes[i].log_off = 0;
     __atomic_store_n(&db->log_off, out, __ATOMIC_RELAXED);

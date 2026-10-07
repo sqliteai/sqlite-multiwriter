@@ -33,7 +33,7 @@
 #define mw_cpu_relax() ((void)0)
 #endif
 
-typedef struct { char magic[8]; uint32_t version, pgsz; uint64_t base_epoch, salt; uint64_t reserved[3]; uint64_t cksum; } seg_hdr;
+typedef struct { char magic[8]; uint32_t version, pgsz; uint64_t base_epoch, salt; uint64_t features; uint64_t reserved[2]; uint64_t cksum; } seg_hdr;       // (features: see mw_format_check)
 typedef struct { uint32_t magic, npages; uint64_t epoch; uint32_t dbsize, pgsz; uint32_t ext_len, pad; uint64_t cksum; } rec_hdr;
 _Static_assert(sizeof(seg_hdr) == MW_SEG_HDR, "segment header layout");
 _Static_assert(sizeof(rec_hdr) == REC_HDR_SIZE, "record header layout");
@@ -104,7 +104,7 @@ static uint64_t rec_size (mw_seglog *sl, int n, uint32_t ext_len) { return REC_H
 static int write_hdr (mw_seglog *sl, int fd, uint64_t base) {
     seg_hdr h; memset(&h, 0, sizeof h);
     memcpy(h.magic, SEG_MAGIC, 8);
-    h.version = 1; h.pgsz = sl->pgsz; h.base_epoch = base; h.salt = sl->salt;
+    h.version = MW_FORMAT_VERSION; h.features = MW_FORMAT_FEATURES; h.pgsz = sl->pgsz; h.base_epoch = base; h.salt = sl->salt;
     h.cksum = hdr_cksum(&h);
     return pwrite_all(fd, &h, sizeof h, 0);
 }
@@ -264,6 +264,7 @@ int mw_seglog_open (mw_db *db, mw_seglog_replay_fn fn, void *ctx, uint64_t *base
         }
         if (!ok) return SQLITE_CANTOPEN;
         close(fd);
+        if (h.cksum == hdr_cksum(&h)) { char path[620]; seg_path(sl, atomic_load(&sh->seg_min), path, sizeof path); int frc = mw_format_check("segment", path, h.magic, SEG_MAGIC, h.version, h.features); if (frc != SQLITE_OK) return frc; }
         sl->salt = h.salt;
         if (base_out) *base_out = atomic_load(&sh->base_epoch);
         if (last_epoch_out) *last_epoch_out = atomic_load(&sh->committed_epoch);
@@ -287,6 +288,10 @@ int mw_seglog_open (mw_db *db, mw_seglog_replay_fn fn, void *ctx, uint64_t *base
         for (int i = 0; i < nids; i++) {
             char path[620]; seg_path(sl, ids[i].id, path, sizeof path);
             int fd = open(path, O_RDONLY); seg_hdr h;
+            if (fd >= 0 && pread_all(fd, &h, sizeof h, 0) == SQLITE_OK && memcmp(h.magic, SEG_MAGIC, 5) == 0 && (memcmp(h.magic, SEG_MAGIC, 8) != 0 || h.cksum == hdr_cksum(&h))) {       // (a segment of this engine: of this format?)
+                int frc = mw_format_check("segment", path, h.magic, SEG_MAGIC, h.version, h.features);
+                if (frc != SQLITE_OK) { close(fd); free(ids); return frc; }
+            }
             if (fd >= 0 && pread_all(fd, &h, sizeof h, 0) == SQLITE_OK && memcmp(h.magic, SEG_MAGIC, 8) == 0 && h.cksum == hdr_cksum(&h) && h.pgsz == sl->pgsz) {
                 if (!have_salt) { sl->salt = h.salt; have_salt = true; }
                 if (h.base_epoch > base) base = h.base_epoch;

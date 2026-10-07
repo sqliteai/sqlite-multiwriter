@@ -48,7 +48,8 @@ typedef struct {
     char     magic[8];
     uint32_t version, pgsz;
     uint64_t base_epoch, salt;
-    uint64_t reserved[3];
+    uint64_t features;               // incompatible features that the file uses (MW_FORMAT_FEATURES): a library that does not know one refuses the file
+    uint64_t reserved[2];
     uint64_t cksum;
 } log_hdr;
 
@@ -74,6 +75,17 @@ static bool fault_fires (mw_fault_t f) {
     int left = atomic_load_explicit(&fault_left[f], memory_order_relaxed);
     if (left <= 0) return false;                       // (fast path: nothing armed)
     return atomic_fetch_sub(&fault_left[f], 1) == 1;
+}
+
+// 0: this library can read the file. The header of a file of the engine whose checksum does not check out is a damaged one (the caller decides), not one of another format.
+int mw_format_check (const char *what, const char *path, const char magic[8], const char *expected, uint32_t version, uint64_t features) {
+    if (memcmp(magic, expected, 8) != 0) {
+        if (memcmp(magic, expected, 5) == 0) { sqlite3_log(SQLITE_WARNING, "multiwriter: the %s %s is of another format (%.8s, this library reads %.8s): it was made by another version of the engine and is left as it is", what, path, magic, expected); return SQLITE_CANTOPEN; }
+        return SQLITE_OK;
+    }
+    if (version != MW_FORMAT_VERSION) { sqlite3_log(SQLITE_WARNING, "multiwriter: the %s %s is of format version %u, this library reads %u: it was made by another version of the engine and is left as it is", what, path, (unsigned)version, (unsigned)MW_FORMAT_VERSION); return SQLITE_CANTOPEN; }
+    if (features & ~(uint64_t)MW_FORMAT_FEATURES) { sqlite3_log(SQLITE_WARNING, "multiwriter: the %s %s uses features (0x%llx) that this library does not know: it was made by a newer version of the engine and is left as it is", what, path, (unsigned long long)(features & ~(uint64_t)MW_FORMAT_FEATURES)); return SQLITE_CANTOPEN; }
+    return SQLITE_OK;
 }
 
 bool mw_fault_hit (mw_fault_t f) {
@@ -165,7 +177,7 @@ static int hdr_write (mw_db *db, uint32_t pgsz, uint64_t base, uint64_t salt) {
     log_hdr h;
     memset(&h, 0, sizeof h);
     memcpy(h.magic, LOG_MAGIC, 8);
-    h.version = 1; h.pgsz = pgsz; h.base_epoch = base; h.salt = salt;
+    h.version = MW_FORMAT_VERSION; h.features = MW_FORMAT_FEATURES; h.pgsz = pgsz; h.base_epoch = base; h.salt = salt;
     h.cksum = hdr_cksum(&h);
     int rc = pwrite_all(db->logfd, &h, sizeof h, 0);
     if (rc == SQLITE_OK && mw_io_fsync(db->logfd) != 0) rc = SQLITE_IOERR_FSYNC;
@@ -265,6 +277,10 @@ int mw_log_open (mw_db *db, int pgsz) {
     if (fstat(db->logfd, &sb) != 0) return SQLITE_IOERR;
 
     log_hdr h;
+    if (sb.st_size >= LOG_HDR_SIZE && pread_all(db->logfd, &h, sizeof h, 0) == SQLITE_OK && (memcmp(h.magic, LOG_MAGIC, 5) == 0)) {       // a log of this engine: of this format?
+        int frc = (memcmp(h.magic, LOG_MAGIC, 8) == 0 && h.cksum != hdr_cksum(&h)) ? SQLITE_OK : mw_format_check("log", db->logpath, h.magic, LOG_MAGIC, h.version, h.features);
+        if (frc != SQLITE_OK) { close(db->logfd); db->logfd = -1; db->has_log = false; return frc; }
+    }
     bool valid = sb.st_size >= LOG_HDR_SIZE && pread_all(db->logfd, &h, sizeof h, 0) == SQLITE_OK &&
                  memcmp(h.magic, LOG_MAGIC, 8) == 0 && h.cksum == hdr_cksum(&h) && h.pgsz == (uint32_t)pgsz;
     uint64_t base = 1;
@@ -1090,7 +1106,7 @@ mw_log_prep *mw_log_rewrite_prepare (mw_db *db, uint64_t base_epoch) {
     if (p->nfd < 0) { p->nfd = -1; mw_log_rewrite_abort(p); return NULL; }
     int rc = flock(p->nfd, LOCK_EX | LOCK_NB) != 0 ? SQLITE_BUSY : SQLITE_OK;
     log_hdr h; memset(&h, 0, sizeof h);
-    memcpy(h.magic, LOG_MAGIC, 8); h.version = 1; h.pgsz = (uint32_t)db->store->pgsz; h.base_epoch = base_epoch; h.salt = db->log_salt; h.cksum = hdr_cksum(&h);
+    memcpy(h.magic, LOG_MAGIC, 8); h.version = MW_FORMAT_VERSION; h.pgsz = (uint32_t)db->store->pgsz; h.base_epoch = base_epoch; h.salt = db->log_salt; h.cksum = hdr_cksum(&h);
     if (rc == SQLITE_OK) rc = pwrite_all(p->nfd, &h, sizeof h, 0);
     if (rc == SQLITE_OK) rc = copy_range(db->logfd, p->nfd, first, bound, LOG_HDR_SIZE);
     if (rc == SQLITE_OK) p->copied_end = bound;
@@ -1143,7 +1159,7 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch, mw_log_prep *prep) {
         log_hdr h;
         memset(&h, 0, sizeof h);
         memcpy(h.magic, LOG_MAGIC, 8);
-        h.version = 1; h.pgsz = (uint32_t)st->pgsz; h.base_epoch = base_epoch; h.salt = db->log_salt;
+        h.version = MW_FORMAT_VERSION; h.features = MW_FORMAT_FEATURES; h.pgsz = (uint32_t)st->pgsz; h.base_epoch = base_epoch; h.salt = db->log_salt;
         h.cksum = hdr_cksum(&h);
         if (rc == SQLITE_OK) rc = pwrite_all(nfd, &h, sizeof h, 0);
     }

@@ -128,7 +128,7 @@ void mw_shared_close (mw_db *db, bool sole) {
     if (db->sl) {
         if (sole) {                                                              // the last process: everything is in the real file now (or the log stays for recovery)
             uint32_t mn = atomic_load(&db->shm->seg_min), cur = atomic_load(&db->shm->sl_seg);
-            bool clean = atomic_load(&db->shm->base_epoch) == atomic_load(&db->shm->committed_epoch) && !atomic_load(&db->failed);
+            bool clean = db->open_done && atomic_load(&db->shm->base_epoch) == atomic_load(&db->shm->committed_epoch) && !atomic_load(&db->failed);       // (an open that failed, for a file of another format for instance, leaves the segments as they are)
             mw_seglog_close(db);
             if (clean) {
                 for (uint32_t s = mn; s <= cur + 1; s++) { char p[700]; snprintf(p, sizeof p, "%s-mw.%u", db->path, s); unlink(p); }     // (and the next one, prepared ahead)

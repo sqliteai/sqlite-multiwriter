@@ -121,6 +121,12 @@ int mw_mp_open (mw_db *db) {
         if ((size_t)fs.st_size < len && mw_io_ftruncate(db->mp_lockfd, (off_t)len) != 0) MP_OPEN_FAIL(SQLITE_IOERR);
         void *m = mw_io_mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, db->mp_lockfd, 0);
         if (m == MAP_FAILED) MP_OPEN_FAIL(SQLITE_IOERR);
+        if (!first && ((mw_shm *)m)->magic != MP_MAGIC && (((mw_shm *)m)->magic >> 32) == (MP_MAGIC >> 32) && atomic_load(&((mw_shm *)m)->ready)) {
+            // a process that runs another version of the engine has this database open: the two cannot share the header
+            sqlite3_log(SQLITE_WARNING, "multiwriter: another process has %s open with a version of the engine that has another layout of the shared header (0x%016llx, this library 0x%016llx)", db->path, (unsigned long long)((mw_shm *)m)->magic, (unsigned long long)MP_MAGIC);
+            munmap(m, len); close(db->mp_pubfd); db->mp_pubfd = -1; close(db->mp_lockfd); db->mp_lockfd = -1;
+            return SQLITE_CANTOPEN;
+        }
         if (!first && (((mw_shm *)m)->magic != MP_MAGIC || !atomic_load(&((mw_shm *)m)->ready))) {
             // the process that was initialising it failed: release and try to become the first ourselves
             munmap(m, len); close(db->mp_pubfd); db->mp_pubfd = -1; close(db->mp_lockfd); db->mp_lockfd = -1;

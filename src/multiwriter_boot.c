@@ -9,8 +9,11 @@
 //
 
 #include "multiwriter.h"
+#include <stdlib.h>
 
 int mw_extra_init (const char *unused) {
     (void)unused;
+    const char *e = getenv("MW_DEFAULT_MODE");                 // (for running the SQLite test suite through the engine: every database opens with this mw= mode)
+    if (e) mw_vfs_set_enabled_default(atoi(e));
     return mw_vfs_register(1);
 }

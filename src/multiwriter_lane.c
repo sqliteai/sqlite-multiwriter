@@ -661,7 +661,7 @@ int mw_ensure_wal_db (const char *path) {
         if (n == sizeof h && h[18] == 2 && h[19] == 2 && !stale_wal) return SQLITE_OK;
     }
     sqlite3 *c = NULL;
-    int rc = sqlite3_open_v2(path, &c, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, mw_root_vfs()->zName);
+    int rc = sqlite3_open_v2(path, &c, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_PRIVATECACHE, mw_root_vfs()->zName);
     if (rc == SQLITE_OK) {
         sqlite3_busy_timeout(c, 5000);                             // (two openers of a new database may convert it at the same time)
         rc = sqlite3_exec(c, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);

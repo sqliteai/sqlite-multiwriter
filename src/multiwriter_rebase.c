@@ -62,7 +62,7 @@ static int helper_open (mw_lane *lane) {
     char *uri = uri_for(lane->db->path, lane->db->mp_req);
     if (!uri) return SQLITE_NOMEM;
     sqlite3 *h = NULL;
-    int rc = sqlite3_open_v2(uri, &h, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX, MW_VFS_NAME);
+    int rc = sqlite3_open_v2(uri, &h, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_PRIVATECACHE, MW_VFS_NAME);
     sqlite3_free(uri);
     if (rc != SQLITE_OK) { sqlite3_close(h); return rc; }
     sqlite3_busy_timeout(h, 0);

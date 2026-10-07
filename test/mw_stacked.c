@@ -37,6 +37,31 @@ static int v_delete (sqlite3_vfs *v, const char *n, int s) { return under->xDele
 static int v_access (sqlite3_vfs *v, const char *n, int fl, int *o) { return under->xAccess(under, n, fl, o); }
 static int v_full (sqlite3_vfs *v, const char *n, int len, char *o) { return under->xFullPathname(under, n, len, o); }
 
+
+// ---- 1b. a VFS that keeps its own shared memory (what SQLite's test VFS "tvfs" does): the engine never sees the locks of the WAL, so it has no snapshot. A write must fail, clearly, and not as a conflict
+typedef struct { shim_file base; void *region[4]; } own_file;
+static sqlite3_vfs own_vfs;
+static int o_shmmap (sqlite3_file *f, int r, int sz, int w, void volatile **pp) { own_file *p = (own_file *)f; if (r >= 4) return SQLITE_IOERR; if (!p->region[r]) p->region[r] = calloc(1, (size_t)sz); *pp = p->region[r]; (void)w; return SQLITE_OK; }
+static int o_shmlock (sqlite3_file *f, int o, int n, int fl) { (void)f; (void)o; (void)n; (void)fl; return SQLITE_OK; }
+static int o_shmunmap (sqlite3_file *f, int d) { own_file *p = (own_file *)f; for (int i = 0; i < 4; i++) { free(p->region[i]); p->region[i] = NULL; } (void)d; return SQLITE_OK; }
+static int o_close (sqlite3_file *f) { o_shmunmap(f, 1); return s_close(f); }
+static const sqlite3_io_methods own_io = { 2, o_close, s_read, s_write, s_trunc, s_sync, s_size, s_lock, s_unlock, s_chk, s_fc, s_sector, s_dev, o_shmmap, o_shmlock, s_shmbar, o_shmunmap };
+static int ov_open (sqlite3_vfs *v, const char *name, sqlite3_file *f, int flags, int *out) {
+    own_file *p = (own_file *)f; memset(p->region, 0, sizeof p->region); p->base.real = (sqlite3_file *)&p[1]; p->base.base.pMethods = NULL;
+    int rc = under->xOpen(under, name, p->base.real, flags, out);
+    if (rc == SQLITE_OK) p->base.base.pMethods = &own_io;
+    return rc;
+}
+static void own_shm_run (void) {
+    char path[256], uri[400]; mw_tmpdb(path, sizeof path, "ownshm"); snprintf(uri, sizeof uri, "file:%s?mw=2", path);
+    sqlite3 *db; CHECK_RC(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, "ownshm"), SQLITE_OK);
+    sqlite3_extended_result_codes(db, 1);
+    int rc = mw_exec(db, "CREATE TABLE t(a)");
+    if (rc == SQLITE_OK) rc = mw_exec(db, "INSERT INTO t VALUES(1)");
+    CHECK((rc & 0xff) == SQLITE_IOERR);                              // (not BUSY: nobody can retry it into working)
+    sqlite3_close(db); mw_rmfiles(path);
+}
+
 static void stacked_run (int sect, int pgsz) {
     sector = sect;
     char path[256], uri[400]; mw_tmpdb(path, sizeof path, "stacked");
@@ -101,8 +126,11 @@ int main (void) {
     shim_vfs = *under; shim_vfs.zName = "shim"; shim_vfs.pNext = NULL; shim_vfs.szOsFile = (int)sizeof(shim_file) + under->szOsFile;
     shim_vfs.xOpen = v_open; shim_vfs.xDelete = v_delete; shim_vfs.xAccess = v_access; shim_vfs.xFullPathname = v_full;
     CHECK_RC(sqlite3_vfs_register(&shim_vfs, 0), SQLITE_OK);
+    own_vfs = shim_vfs; own_vfs.zName = "ownshm"; own_vfs.szOsFile = (int)sizeof(own_file) + under->szOsFile; own_vfs.xOpen = ov_open;
+    CHECK_RC(sqlite3_vfs_register(&own_vfs, 0), SQLITE_OK);
     static const int sects[] = { 512, 4096, 8192 }, pgs[] = { 1024, 4096 };
     for (int i = 0; i < 3; i++) for (int j = 0; j < 2; j++) stacked_run(sects[i], pgs[j]);
+    own_shm_run();
     oom_run();
     printf("test/mw_stacked.c: %d failure(s)\n", mw_failures);
     return mw_failures ? 1 : 0;

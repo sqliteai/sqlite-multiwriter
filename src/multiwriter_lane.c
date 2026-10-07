@@ -129,6 +129,13 @@ static int lane_publish (mw_lane *lane) {
 }
 static int lane_publish_inner (mw_lane *lane) {
     mw_db *db = lane->db;
+    if (!lane->snapshot_held) {
+        // The engine learns that a transaction began from the locks that SQLite takes in the shared memory of the WAL. A VFS stacked above this one that keeps its own shared memory (SQLite's test VFS
+        // `tvfs` does) never passes them on: there is no snapshot, and the commit would be validated against nothing.
+        static _Atomic int said;
+        if (!atomic_exchange(&said, 1)) sqlite3_log(SQLITE_MISUSE, "multiwriter: a commit without a snapshot: a VFS stacked above does not forward xShmMap/xShmLock to it");
+        return SQLITE_IOERR;
+    }
     mw_memwal *w = &lane->wal;
     size_t fs = (size_t)w->pgsz + 24;
     const uint8_t **imgs = malloc((size_t)lane->ws_n * sizeof(uint8_t *));

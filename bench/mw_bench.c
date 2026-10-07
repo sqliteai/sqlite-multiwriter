@@ -548,12 +548,12 @@ int main (int argc, char **argv) {
     }
     printf("JSON {\"mode\":\"%s\",\"workload\":\"%s\",\"agents\":%d,\"threads\":%d,\"duration\":%.2f,\"sync\":\"%s\",\"rebase\":%d,\"seed\":%d,\"valid\":%d,\"tx_per_s\":%.1f,\"writes_per_s\":%.1f,\"reads_per_s\":%.1f,"
            "\"busy\":%llu,\"errors\":%llu,\"p50_us\":%.1f,\"p95_us\":%.1f,\"p99_us\":%.1f,\"p999_us\":%.1f,\"max_us\":%.1f,\"cpu_s\":%.2f,\"rss_mb\":%.0f,\"db_mb\":%.2f,\"wal_mb\":%.2f,\"log_mb\":%.2f,"
-           "\"wait_mean_us\":%.1f,\"wait_p50_us\":%.1f,\"wait_p99_us\":%.1f,\"wait_max_us\":%.1f,\"mw_fast\":%llu,\"mw_page_conflicts\":%llu,\"mw_read_conflicts\":%llu,\"mw_rebases\":%llu,\"mw_rebase_retries\":%llu,\"mw_versions\":%llu,\"mw_retained_mb\":%.2f,\"mw_reclaimed\":%llu,\"mw_gc_ms\":%.2f,\"mw_pages_per_commit\":%.2f,\"committed\":%llu}\n",
+           "\"wait_mean_us\":%.1f,\"wait_p50_us\":%.1f,\"wait_p99_us\":%.1f,\"wait_max_us\":%.1f,\"mw_fast\":%llu,\"mw_page_conflicts\":%llu,\"mw_read_conflicts\":%llu,\"mw_rebase_ms\":%.1f,\"mw_rebases\":%llu,\"mw_rebase_retries\":%llu,\"mw_versions\":%llu,\"mw_retained_mb\":%.2f,\"mw_reclaimed\":%llu,\"mw_gc_ms\":%.2f,\"mw_pages_per_commit\":%.2f,\"committed\":%llu}\n",
            mode_name[cfg.mode], wl_name[cfg.wl], cfg.agents, cfg.threads, secs, cfg.sync, cfg.rebase, cfg.seed, valid, (double)(reads + writes) / secs, (double)writes / secs, (double)reads / secs,
            (unsigned long long)busy, (unsigned long long)errors, PCT(0.50), PCT(0.95), PCT(0.99), PCT(0.999), total ? all[total - 1] / 1000.0 : 0.0, cpu, rss_mb,
            (double)db_bytes / 1048576.0, (double)wal_size / 1048576.0, (double)log_size / 1048576.0,
            w_mean, w_p50, w_p99, w_max, (unsigned long long)(m1.fast_commits - m0.fast_commits), (unsigned long long)(m1.page_conflicts - m0.page_conflicts), (unsigned long long)(m1.read_conflicts - m0.read_conflicts),
-           (unsigned long long)(m1.rebases - m0.rebases), (unsigned long long)(m1.rebase_retries - m0.rebase_retries), (unsigned long long)m1.page_versions, (double)m1.bytes_retained / 1048576.0,
+           (double)(m1.rebase_ns - m0.rebase_ns) / 1e6, (unsigned long long)(m1.rebases - m0.rebases), (unsigned long long)(m1.rebase_retries - m0.rebase_retries), (unsigned long long)m1.page_versions, (double)m1.bytes_retained / 1048576.0,
            (unsigned long long)(m1.versions_reclaimed - m0.versions_reclaimed), (double)(m1.gc_ns - m0.gc_ns) / 1e6, dcommits ? (double)(m1.pages_published - m0.pages_published) / (double)dcommits : 0.0, (unsigned long long)expect);
     if (cfg.csv) {
         bool fresh = access(cfg.csv, F_OK) != 0;

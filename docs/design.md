@@ -177,13 +177,13 @@ Summary (16 writers, tx/s: SQLite / engine without rebase / engine with rebase):
 | workload | threads | processes |
 |---|---|---|
 | bulk | 8.5k / 46k / 46k | 8.4k / 24k / 24k |
-| groups | 10k / 33k (6 retries per 100 tx) / 51k (0) | 13k / 43k (85) / 47k (0) |
-| same page | 17k / 33k (15) / 62k (0) | 13k / 43k (96) / 35k (0) |
-| hot rows | 15k / 27k (16) / 28k (30) | 13k / 42k (95) / 43k (87) |
+| groups | 10k / 33k (8 retries per 100 tx) / 51k (0) | 13k / 43k (106) / 47k (0) |
+| same page | 17k / 33k (19) / 62k (0) | 13k / 43k (119) / 35k (0) |
+| hot rows | 15k / 27k (21) / 28k (39) | 13k / 42k (119) / 43k (108) |
 
-What the rebase does, measured. Where the conflicts are on pages and not on rows (groups, same page) the application sees **no retry at all**, 55-71% of the commits are saved by a merge, and with threads the throughput is higher
-(same page 16 threads 62k against 33k; 64 threads 38k against 32k). With 4 threads it can be slower (groups 29k against 40k): a replay costs a decode, a replay and a second commit. With processes on one single page it is lower (16 processes 35k against 43k, 0 retries against 96 per 100 tx),
-because the batches are serialised across processes. Where the conflicts are on the same rows (hot rows, columns) it cannot save them (it refuses, correctly); the back-off that skips the replay after a refusal limits the loss, but with 64 threads on hot rows it is still lower (22k against 28k) and has more retries (125 against 79 per 100 tx). It is for an application that cannot retry, or whose retries are costly.
+What the rebase does, measured. Where the conflicts are on pages and not on rows (groups, same page) the application sees **no retry at all**, 68-86% of the commits with threads (19-31% with processes) are saved by a merge, and with threads the throughput is higher
+(same page 16 threads 62k against 33k; 64 threads 38k against 32k). With 4 threads it can be slower (groups 29k against 40k): a replay costs a decode, a replay and a second commit. With processes on one single page it is lower (16 processes 35k against 43k, 0 retries against 119 per 100 tx),
+because the batches are serialised across processes. Where the conflicts are on the same rows (hot rows, columns) it cannot save them (it refuses, correctly); the back-off that skips the replay after a refusal limits the loss, but with 64 threads on hot rows it is still lower (22k against 28k) and has more retries (156 against 101 per 100 tx). It is for an application that cannot retry, or whose retries are costly.
 
 **The group replay, and why the replays are not parallel (measured).** The first version, a mutex per database around each replay, was 13.7k tx/s at 64 threads on one page against 31k for the engine without the rebase. Two of the causes were not the mutex: (1) an `UPDATE` that named
 every column rewrote the index of an indexed column that had not changed, so every reader of that index page was refused (the replay now sets only the columns that changed: read conflicts 254 thousand -> 0); (2) a rebased conflict granted the connection a turn of hot-spot serialisation
@@ -192,3 +192,8 @@ What can run together is the decoding of the pages (it does) and, for the commit
 
 **Lost replays.** A helper replay used to lose its race to an ordinary commit 97% of the time (the snapshot is always older than the page heads, see above). Closing the gate after the first lost attempt (it stops the other committers only for the length of one replay, and `mw_gate_enter` spins with `sched_yield` before it sleeps)
 brought the lost replays to about 5% for the mixed workloads (the table above shows 0.0-1.3 lost replays per merged commit, the high ones on hot rows where the true conflicts are replayed and refused too).
+
+**The replay on one page with processes (measured, 2026-10-07, 16 processes, no change made).** 8.5-9k merges a second, 1.77 attempts per merge, each attempt about 12 us of begin, replay and decode and about 32 us of commit (it queues for the publication lock like any other commit); the waiting for the rebase lock is 700 us per attempt (16 processes queue). Tried and not kept:
+(1) closing the gate in the shared mode is no use because the gate is per process: the other processes keep committing, and 77% of the first attempts lose; (2) taking the publication lock from before the `BEGIN` of the helper (the replay then cannot lose, 0 lost attempts) made it 18k tx/s against 35k: every ordinary commit of the other processes
+conflicts too and becomes a merge, and the merges are serialised (55 us each); (3) the rebase lock in the shared header (spinning, or sleeping 20 us) instead of the `fcntl` lock: 22-27k against 35k (the waiters that poll take the cores of the ones that work; the kernel's lock keeps them asleep).
+What is left is the cost of one commit through the publication lock for each merged commit; only a batch that spans the processes (the leader replaying the requests of other processes) would remove it, and it needs a record in the log that tells a requester whose leader died whether its request committed.

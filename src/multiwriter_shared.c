@@ -109,7 +109,9 @@ int mw_shared_open (mw_db *db) {
 
 int mw_shared_open_finish (mw_db *db) {
     mw_shm *sh = db->shm;
-    if (db->mp_stale_owner) { db->mp_stale_owner = false; mw_mp_lock(db); mw_shared_repair(db); mw_mp_unlock(db); }       // (the publisher that died had our pid: what it left half done is finished or undone)
+    // A commit that a process that is gone had in flight is finished or undone before this open returns, not when some publisher happens to find the lock of the dead one: whoever opens the
+    // database (a restarted process, which then asks what became of the commit that it was making) must see its fate decided, and not decided after it has looked.
+    if (db->mp_stale_owner || (!db->mp_first && atomic_load(&sh->pend_epoch))) { db->mp_stale_owner = false; mw_mp_lock(db); mw_shared_repair(db); mw_mp_unlock(db); }       // (the publisher that died had our pid: what it left half done is finished or undone)
     if (db->mp_first) {
         atomic_store(&sh->log_pos, MW_LOG_POS(atomic_load(&sh->sl_seg), atomic_load(&sh->sl_end)));
         atomic_store(&sh->committed_epoch, atomic_load(&db->epoch));

@@ -113,6 +113,11 @@ WAL cannot be checkpointed) but lets the WAL grow without slowing down. Removing
 
 ## Tests
 
+**`mw_serial` under load (2026-10-07).** A run on an idle machine passes; with 14 copies of it at once (`test/serial_stress.sh`) 36 of 70 runs failed. What it showed:
+- 30 of the failures were `SQLITE_FULL` in the scenario with a small index of versions: the collection of the index does not keep up when the machine is loaded (not examined further; the check `full_errors == 0` is a timing assumption).
+- The rest, violations of the serial order, were all with processes that die at a publication point (not with `SIGKILL` from outside alone, not without deaths): 40-55% of the runs when the death is at "record complete, nothing installed" or "installed, not visible". Cause: the commit that a dead process had in flight is finished by whoever finds the lock of the dead one; a process that is started afterwards and looks at once saw it absent, went on (a restarted client asks what became of its commit and takes the answer for good) and the commit appeared afterwards. Now `mw_shared_open_finish` repairs the pending commit of a dead process before an open returns. 16 and 23 failures in 42 runs became 1 and 0. Test `mw_openrepair` (it fails on the old code).
+- What remains (a few percent, only with the rebase and with a `SIGKILL` at any moment, or a death inside a collection of the index): not found yet.
+
 `make test` (about 35 programs: the page store, lanes, relocation, merge, read dependencies, DDL, savepoints, the log and its recovery, compaction, garbage collection, the shared mode, crashes at every point of the publication, I/O errors,
 the relocation prepared before the lock, the rebase (`mw_rebase`: what is replayed, what is refused and what is never rebased, case by case), the serializability test), `make test-mp` (the transaction tests with `mw_mp=1`), `make test-io` (minutes), `test/sanitize.sh asan|ubsan|tsan [tests]`, a Linux container for all of it
 (`docker run --rm -v "$PWD":/src gcc:14 ...`, `--privileged` for the size-limited tmpfs of `mw_diskfull`), and `test/power/` (loss of power).

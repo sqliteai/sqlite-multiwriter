@@ -134,9 +134,9 @@ static void slot_loop (int slot, int generation, int arm_crash) {
     if (sqlite3_step(q) != SQLITE_ROW) _exit(2);
     c.seq = (uint64_t)sqlite3_column_int64(q, 0); sqlite3_finalize(q);
     put_rec(fd, REC_RESOLVE, slot, c.seq, 0, 0, NULL, 0);
-    if (arm_crash && rnd(&c.rng) % 3 != 0) {                                                         // most incarnations also die on their own at a point of the publication (inside the lock, mid-record, just after it): the repair of a dead publisher
+    if (arm_crash && !getenv("MW_SERIAL_NO_CRASH") && rnd(&c.rng) % 3 != 0) {                                                         // most incarnations also die on their own at a point of the publication (inside the lock, mid-record, just after it): the repair of a dead publisher
         static const mw_fault_t pts[] = { MW_CRASH_MID_LOG, MW_CRASH_BEFORE_LOG, MW_CRASH_SHARED_APPENDED, MW_CRASH_SHARED_INSTALLED, MW_CRASH_AFTER_LOG, MW_CRASH_AFTER_VISIBLE, MW_CRASH_SHARED_GC, MW_CRASH_SHARED_GC };       // (twice: the collection runs every 16 commits, and a dead holder in it is a case of its own)
-        mw_fault_arm(pts[rnd(&c.rng) % (sizeof pts / sizeof *pts)], 20 + (int)(rnd(&c.rng) % 800));
+        { size_t pi = rnd(&c.rng) % (sizeof pts / sizeof *pts); if (getenv("MW_SERIAL_PT")) pi = (size_t)atoi(getenv("MW_SERIAL_PT")); mw_fault_arm(pts[pi], 20 + (int)(rnd(&c.rng) % 800)); }
     }
     for (;;) {
         int got;
@@ -285,7 +285,7 @@ static void procs_run (const char *path, int keys, int nprocs, double secs, int 
         for (int i = 0; i < nprocs; i++) {                                                           // a process that died by itself (a crash point): replaced
             int st; if (waitpid(pid[i], &st, WNOHANG) == pid[i]) { crashes++; gen[i]++; pid[i] = fork(); if (pid[i] == 0) child_main(i, gen[i]); }
         }
-        if (el > next_kill) {                                                                        // and now and then one is killed from outside, at whatever moment it is in
+        if (el > next_kill && !getenv("MW_SERIAL_NO_KILL")) {                                                                        // and now and then one is killed from outside, at whatever moment it is in
             int v = (int)(rnd(&rng) % (uint64_t)nprocs); kill(pid[v], SIGKILL); int st; waitpid(pid[v], &st, 0); kills++;
             gen[v]++; pid[v] = fork(); if (pid[v] == 0) child_main(v, gen[v]);
             next_kill = el + (double)(kill_ms / 2 + (int)(rnd(&rng) % (uint64_t)kill_ms)) / 1000.0;

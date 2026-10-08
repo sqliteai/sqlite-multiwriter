@@ -72,7 +72,7 @@ clean:
 	rm -rf $(BUILD) $(DIST)
 
 # the transaction tests with the shared multi-process mode (mw_mp=1) in place of the thread mode
-MP_TESTS := mw_serial mw_relocprep mw_shared
+MP_TESTS := mw_rebase mw_rebasefk mw_rebaseskew mw_serial mw_relocprep mw_shared
 .PHONY: test-mp
 test-mp: $(addprefix $(DIST)/,$(MP_TESTS))
 	@set -e; for t in $(MP_TESTS); do echo "== $$t (mw_mp=1)"; MW_TEST_MP=1 ./$(DIST)/$$t; done

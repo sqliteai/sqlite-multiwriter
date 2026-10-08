@@ -4,7 +4,7 @@
 #include "multiwriter.h"
 
 static int open_mw (const char *path, sqlite3 **db, int fk) {
-    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_rebase=1&mw_rebase_backoff=0", path);
+    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_rebase=1&mw_rebase_backoff=0%s", path, getenv("MW_TEST_MP") ? "&mw_mp=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); if (fk) mw_exec(*db, "PRAGMA foreign_keys=ON"); }
     return rc;

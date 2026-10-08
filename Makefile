@@ -68,6 +68,39 @@ $(DIST)/mw_bench: $(BUILD)/b_mw_bench.o $(LIB_OBJ)
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LDFLAGS)
 
+# ---- the loadable extension (dist/multiwriter.so|dylib): the engine without SQLite, every sqlite3_* call through the host's table of routines (sqlite3ext.h) ----
+HOSTOS := $(shell uname -s)
+ifeq ($(HOSTOS),Darwin)
+EXT_SUFFIX := dylib
+EXT_LDFLAGS := -dynamiclib -framework Security
+else
+EXT_SUFFIX := so
+EXT_LDFLAGS := -shared -lpthread -lm -ldl
+endif
+EXT := $(DIST)/multiwriter.$(EXT_SUFFIX)
+EXT_OBJ := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/ext/%.o,$(ENGINE_SRC))
+$(BUILD)/ext/%.o: $(SRC_DIR)/%.c $(HEADERS)
+	@mkdir -p $(BUILD)/ext
+	$(CC) $(CFLAGS) -DMW_LOADABLE -fPIC -c $< -o $@
+$(EXT): $(EXT_OBJ)
+	@mkdir -p $(DIST)
+	$(CC) $^ -o $@ $(EXT_LDFLAGS)
+.PHONY: extension
+extension: $(EXT)
+# SQLite as it is in a host (no engine) for the test of the loaded extension
+$(BUILD)/sqlite3_plain.o: $(SQLITE_DIR)/sqlite3.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -DSQLITE_THREADSAFE=1 -w -c $< -o $@
+$(BUILD)/t_loadable.o: test/loadable.c test/mw_test.h $(HEADERS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(DIST)/loadable: $(BUILD)/t_loadable.o $(BUILD)/sqlite3_plain.o
+	@mkdir -p $(DIST)
+	$(CC) $^ -o $@ -lpthread -lm -ldl
+.PHONY: test-loadable
+test-loadable: $(EXT) $(DIST)/loadable
+	./$(DIST)/loadable ./$(EXT)
+
 clean:
 	rm -rf $(BUILD) $(DIST)
 

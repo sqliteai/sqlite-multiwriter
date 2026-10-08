@@ -11,11 +11,24 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#ifdef MW_LOADABLE                    // built as a loadable extension: every sqlite3_* call goes through the host's table of routines (sqlite3ext.h)
+#include "sqlite3ext.h"
+SQLITE_EXTENSION_INIT3
+#else
 #include "sqlite3.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// The version of the extension: the single place it is written (the Makefile, the packages and the release read it from here).
+#define MW_VERSION "0.5.0"
+#define MW_VERSION_MAJOR 0
+#define MW_VERSION_MINOR 5
+#define MW_VERSION_PATCH 0
+#define MW_VERSION_NUMBER (MW_VERSION_MAJOR * 1000000 + MW_VERSION_MINOR * 1000 + MW_VERSION_PATCH)
+const char *mw_version (void);                // "0.5.0"
 
 #define MW_VFS_NAME "multiwriter"
 

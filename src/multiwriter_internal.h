@@ -186,7 +186,7 @@ struct mw_lane {
     bool        rebase_on;      // URI mw_rebase=1: a commit that conflicts on pages only is replayed at the latest snapshot (multiwriter_rebase.c)
     bool        rb_nobackoff;   // URI mw_rebase_backoff=0 (tests): replay every conflict, whatever happened to the last ones
     sqlite3_stmt *rd_cur;   // the statement that is running (mw_rebase=1 connections; set by the statement hook), and what the transaction did before it:
-    int         rd_cur_kind, rd_cache_next; bool rd_dep; void *rd_cache;   // rd_dep: it read rows that it may not have changed (see mw_lane_reads_unchanged)
+    int         rd_cur_kind, rd_cache_next; bool rd_dep; void *rd_cache; sqlite3 *rd_db;   // rd_dep: it read rows that it may not have changed (see mw_lane_reads_unchanged)
     int         rb_streak, rb_skip;  // refused replays in a row, and conflicts to refuse without trying (a hot row: the replay would fail again at the cost of decoding the pages)
     sqlite3    *rb_db;          // the helper connection that replays (opened at the first rebase)
     void       *rb_state;       // what the helper caches: catalog, statements (multiwriter_rebase.c)

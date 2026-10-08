@@ -20,6 +20,8 @@ static void make (const char *path) {
     sqlite3_close(s);
 }
 
+static int own_trace (unsigned t, void *c, void *p, void *x) { (void)t; (void)c; (void)p; (void)x; return 0; }
+
 int main (void) {
     char path[256];
     for (int rebase = 0; rebase <= 1; rebase++) {
@@ -84,6 +86,19 @@ int main (void) {
     CHECK_RC(mw_exec(a, "COMMIT"), SQLITE_OK);
     CHECK(stats(a).rebases == 1);
     sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+
+    // 4. an application that installs its own trace callback replaces the engine's statement hook: nothing is seen, so nothing is rebased (even a blind write), and the skew is still refused
+    for (int mode = 0; mode < 2; mode++) {
+        mw_tmpdb(path, sizeof path, "skew4"); make(path);
+        CHECK_RC(open_mw(path, &a, 1), SQLITE_OK); CHECK_RC(open_mw(path, &b, 1), SQLITE_OK);
+        if (mode == 0) sqlite3_trace_v2(a, SQLITE_TRACE_STMT, own_trace, NULL); else sqlite3_trace_v2(a, 0, NULL, NULL);
+        CHECK_RC(mw_exec(a, "BEGIN; UPDATE t SET a = 5 WHERE id = 1"), SQLITE_OK);
+        CHECK_RC(mw_exec(b, "BEGIN; UPDATE t SET a = 5 WHERE id = 2"), SQLITE_OK);
+        CHECK_RC(mw_exec(b, "COMMIT"), SQLITE_OK);
+        CHECK(is_conflict(mw_exec(a, "COMMIT"))); mw_exec(a, "ROLLBACK");
+        CHECK(stats(a).rebases == 0);
+        sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+    }
 
     MW_DONE();
 }

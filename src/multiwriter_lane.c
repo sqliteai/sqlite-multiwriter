@@ -143,17 +143,28 @@ void mw_lane_stmt_note (mw_lane *lane, mw_stmt_note *n) {
     if (!n->ending) {
         if (n->autocommit) lane->rd_dep = false;                                   // (this statement starts a transaction)
         const char *sql = sqlite3_sql(st);
+        if (sql && sqlite3_strnicmp(sql, "EXPLAIN", 7) == 0) return;               // (our own: the bytecode of a statement is looked at from inside the hook)
+        lane->rd_db = sqlite3_db_handle(st);
         if (stmt_reads(sql)) lane->rd_dep = true;
         lane->rd_cur = st; lane->rd_cur_kind = stmt_kind(sql);
         if (lane->rd_cur_kind == RD_DML && !stmt_is_point(lane, st, sql)) lane->rd_dep = true;
         return;
     }
-    if (lane->rd_cur != st) return;
+    if (lane->rd_cur != st) return;                                              // (also the EXPLAIN of the hook itself)
     lane->rd_cur = NULL;
     if (lane->rd_cur_kind == RD_DML && !sqlite3_stmt_readonly(st) && sqlite3_changes64(sqlite3_db_handle(st)) == 0) lane->rd_dep = true;       // (an UPDATE or DELETE that found nothing has read that the row is absent)
 }
 // (A statement that changed nothing writes no page, so the one that is committing now has no such read.)
-bool mw_lane_reads_unchanged (mw_lane *lane) { return lane->rd_dep; }
+// The hook is the connection's one trace callback. SQLite has no way to read the current one, so it cannot be saved and put back, or chained: an application that installs its own sqlite3_trace_v2
+// replaces it, and then no statement is seen. A commit happens inside a statement (COMMIT, or the write itself in autocommit mode), and the hook has seen that one if it is the statement that is running
+// now on the connection. If it is not, the hook was replaced (at any time: even in the middle of the transaction the statement that commits is not seen): the transaction is treated as one that
+// read, no rebase, never a wrong one.
+bool mw_lane_reads_unchanged (mw_lane *lane) {
+    if (lane->rd_dep) return true;
+    if (!lane->rd_cur || !lane->rd_db) return true;
+    for (sqlite3_stmt *st = sqlite3_next_stmt(lane->rd_db, NULL); st; st = sqlite3_next_stmt(lane->rd_db, st)) if (st == lane->rd_cur && sqlite3_stmt_busy(st)) return false;
+    return true;
+}
 
 // A conflicting transaction can be rebased (multiwriter_rebase.c: its row changes are replayed at the latest snapshot) only if the connection asked for it (URI mw_rebase=1), it is not itself a
 // rebase helper, it is the first commit of its snapshot (a later one would be missing the pages of the earlier one) and it changed no schema (its page 1 carries the snapshot's cookie).

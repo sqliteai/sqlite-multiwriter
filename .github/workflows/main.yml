@@ -25,7 +25,6 @@ jobs:
     timeout-minutes: 45
     env:
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      TMPDIR: ${{ runner.temp }}          # (where the tests make their databases; a native Windows program has no /tmp)
     strategy:
       fail-fast: false
       matrix:
@@ -106,6 +105,9 @@ jobs:
         shell: ${{ matrix.container && 'sh' || (matrix.name == 'windows' && 'msys2 {0}' || 'bash') }}
 
     steps:
+      - name: where the tests make their databases (a native Windows program has no /tmp)
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
       - name: alpine - install the tools
         if: matrix.container
         run: apk add --no-cache git gcc make musl-dev linux-headers

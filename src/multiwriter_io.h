@@ -6,13 +6,8 @@
 
 #include <stdatomic.h>
 #include <errno.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/uio.h>
-#include <sys/mman.h>
+#include "multiwriter_os.h"
 #include <stdio.h>
-#include <fcntl.h>
-#include <sys/stat.h>
 #if defined(__linux__)
 #include <linux/falloc.h>
 #endif
@@ -75,6 +70,8 @@ static inline int mw_io_reserve (int fd, uint64_t from, uint64_t to) {
 #elif defined(__linux__)
     if (fallocate(fd, FALLOC_FL_KEEP_SIZE, (off_t)from, (off_t)(to - from)) == 0) return 0;
     return (errno == EOPNOTSUPP || errno == ENOSYS) ? 0 : errno;
+#elif defined(_WIN32)
+    return mw_win_reserve(fd, to);
 #else
     (void)fd; return 0;
 #endif

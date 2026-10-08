@@ -28,16 +28,10 @@
 #define MW_HAVE_BACKTRACE 1
 #endif
 #endif
-#include <fcntl.h>
+#include "multiwriter_os.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
-#include <sys/mman.h>
-#include <sys/uio.h>
-#include <sched.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include "multiwriter_io.h"
 #include "multiwriter_internal.h"
 #include "multiwriter_seglog.h"

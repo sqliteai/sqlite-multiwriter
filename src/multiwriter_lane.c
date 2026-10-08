@@ -21,7 +21,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
-#include <sys/stat.h>
+#include "multiwriter_os.h"
 #include "multiwriter_io.h"
 #include "multiwriter_internal.h"
 #include "multiwriter_seglog.h"

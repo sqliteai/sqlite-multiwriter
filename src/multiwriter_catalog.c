@@ -6,6 +6,7 @@
 #include <string.h>
 #include <strings.h>
 #include "multiwriter_internal.h"
+#include "multiwriter_os.h"
 #include "multiwriter_catalog.h"
 
 static uint32_t be32 (const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }

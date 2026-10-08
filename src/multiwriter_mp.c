@@ -28,15 +28,10 @@
 //
 
 #include <errno.h>
-#include <fcntl.h>
+#include "multiwriter_os.h"
 #include <signal.h>
-#include <sched.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <sys/file.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <stdio.h>
 #include <time.h>
 #include "multiwriter_io.h"

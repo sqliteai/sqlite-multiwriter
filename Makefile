@@ -17,13 +17,14 @@ CFLAGS += -DMW_EXPERIMENTS      # (make EXPERIMENTS=1: the knobs of measurement)
 endif
 CFLAGS += -O2 -g -Wall -Wno-unused-function -I$(SRC_DIR) -I$(SQLITE_DIR) -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS
 SQLITE_FLAGS := -DSQLITE_EXTRA_INIT=mw_extra_init -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_RTREE -DSQLITE_CORE
+include mk/platform.mk
 LDFLAGS += -lpthread -lm
-ifeq ($(shell uname -s),Darwin)
-LDFLAGS += -framework Security
-endif
-ifeq ($(shell uname -s),Linux)
+ifeq ($(PLATFORM),linux)
 CFLAGS += -D_GNU_SOURCE
 LDFLAGS += -ldl
+endif
+ifeq ($(PLATFORM),linux-musl)
+CFLAGS += -D_GNU_SOURCE
 endif
 
 ENGINE_SRC := $(wildcard $(SRC_DIR)/*.c)

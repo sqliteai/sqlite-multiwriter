@@ -13,13 +13,11 @@
 //  Compaction, snapshots registration (the floor under which versions may be freed) and process liveness are those of the other multi-process mode.
 //
 
-#include <sys/file.h>
+#include "multiwriter_os.h"
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <time.h>
 #include "multiwriter_io.h"
 #include "multiwriter_internal.h"

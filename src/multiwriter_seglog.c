@@ -6,16 +6,11 @@
 //
 
 #include <errno.h>
-#include <dirent.h>
-#include <fcntl.h>
+#include "multiwriter_os.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <time.h>
-#include <sched.h>
 #include "multiwriter_io.h"
 #include "multiwriter_seglog.h"
 #include "multiwriter_wait.h"

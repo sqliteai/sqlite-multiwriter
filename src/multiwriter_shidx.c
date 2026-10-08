@@ -9,11 +9,7 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/file.h>
+#include "multiwriter_os.h"
 #include "multiwriter_io.h"
 #include "multiwriter_shidx.h"
 

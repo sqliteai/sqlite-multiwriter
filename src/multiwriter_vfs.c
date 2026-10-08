@@ -236,6 +236,14 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         if (mpmode == 1) mpmode = getenv("MW_MP_PRIVATE") ? 3 : 2;       // shared version index + segmented log is the default; MW_MP_PRIVATE=1 selects the private-store mode (docs §44)
         if (mpmode == 3) mpmode = 1;
         if (mpmode < 0 || mpmode > 2) mpmode = mpmode ? 1 : 0;
+#ifdef _WIN32
+        if (mpmode != 0) {                                               // the log is a mapped file that every process appends to and truncates: Windows does not allow that (docs/windows.md)
+            sqlite3_log(SQLITE_CANTOPEN, "multiwriter: mw_mp (several processes) is not available on Windows: threads of one process only");
+            f->real->pMethods->xClose(f->real);
+            f->base.pMethods = NULL;
+            return SQLITE_CANTOPEN;
+        }
+#endif
         mw_db *db = mw_db_acquire(name, mode, mpmode);
         mw_lane *lane = db ? sqlite3_malloc(sizeof(mw_lane)) : NULL;
         if (!lane) {

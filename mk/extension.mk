@@ -17,23 +17,6 @@ VERSION := $(shell sed -n 's/^\#define MW_VERSION[[:space:]]*"\([^"]*\)".*/\1/p'
 version:
 	@echo $(VERSION)
 
-HOSTOS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
-ifeq ($(OS),Windows_NT)
-HOSTOS := windows
-endif
-ifneq (,$(findstring mingw,$(HOSTOS))$(findstring msys,$(HOSTOS)))
-HOSTOS := windows
-endif
-ifndef PLATFORM
-ifeq ($(HOSTOS),darwin)
-PLATFORM := macos
-else ifeq ($(HOSTOS),windows)
-PLATFORM := windows
-else
-PLATFORM := linux
-endif
-endif
-
 EXT_BASE := multiwriter
 EXT_CFLAGS := $(CFLAGS) -DMW_LOADABLE -fPIC -fvisibility=hidden
 EXT_LDFLAGS :=
@@ -105,8 +88,9 @@ EXT_LDFLAGS += -shared -Wl,-z,max-page-size=16384 -Wl,--build-id=none -lm -ldl -
 EXT_STRIP = $(NDK_BIN)/llvm-strip --strip-unneeded $@
 else ifeq ($(PLATFORM),windows)
 EXT_SUFFIX := dll
-EXT_CFLAGS := $(filter-out -fPIC -fvisibility=hidden,$(EXT_CFLAGS))
-EXT_LDFLAGS += -shared -lws2_32 -lbcrypt
+EXT_CFLAGS := $(filter-out -fPIC -fvisibility=hidden,$(EXT_CFLAGS)) -D_FILE_OFFSET_BITS=64 -D__USE_MINGW_ANSI_STDIO=1
+CFLAGS += -D_FILE_OFFSET_BITS=64 -D__USE_MINGW_ANSI_STDIO=1
+EXT_LDFLAGS += -shared -static-libgcc -Wl,-Bstatic -lpthread -Wl,-Bdynamic
 EXT_STRIP = strip --strip-unneeded $@
 else ifeq ($(PLATFORM),linux-musl)
 EXT_CFLAGS += -D_GNU_SOURCE

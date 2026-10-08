@@ -9,10 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-#include <unistd.h>
-#include <sys/mman.h>
+#include "multiwriter_os.h"
 #include <stdio.h>
-#include <unistd.h>
 #include "multiwriter_internal.h"
 
 static mw_db *mw_dbs = NULL;                 // protected by the SQLITE_MUTEX_STATIC_MAIN mutex

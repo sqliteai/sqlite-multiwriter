@@ -22,7 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sched.h>
+#include "multiwriter_os.h"
 #include "multiwriter_internal.h"
 
 #define MW_REBASE_MAX_ATTEMPTS 200

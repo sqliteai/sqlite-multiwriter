@@ -15,7 +15,37 @@ The project builds and tests on its own: SQLite 3.53.4 is vendored in `third_par
 The application retries a transaction that fails with `SQLITE_BUSY_SNAPSHOT` (the whole transaction, not the last statement). Isolation: snapshot isolation with first-committer-wins and validation of the pages read; not serializable
 (write skew is possible: `docs/design.md`, "What is guaranteed").
 
-Status: macOS and Linux (arm64 tested). `docs/design.md` is the design, its guarantees and its limits; `docs/history-crdt-design.md` and `docs/engine-history.md` are history (an earlier version captured the CRDT metadata of sqlite-sync: removed).
+Version 0.5.0 (`MW_VERSION` in `src/multiwriter.h`; `make version`). Status: macOS and Linux (arm64 and x86_64), iOS, Android, Windows (threads of one process): see Platforms. `docs/design.md` is the design, its guarantees and its limits; `docs/history-crdt-design.md` and `docs/engine-history.md` are history (an earlier version captured the CRDT metadata of sqlite-sync: removed).
+
+## Install: the loadable extension
+
+Every release has the extension for each platform (GitHub releases; `make extension` builds it for the machine you are on). Load it into a SQLite that allows extensions, then open the database with the VFS:
+
+    .load ./multiwriter                              -- the sqlite3 shell (the file is multiwriter.so, .dylib or .dll)
+    SELECT mw_version();                             -- 0.5.0
+    -- from C: sqlite3_load_extension(db, "./multiwriter", "sqlite3_multiwriter_init", &err)
+    sqlite3_open_v2("file:app.db?vfs=multiwriter&mw=2&mw_rebase=1", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+
+`sqlite3_multiwriter_default_init` (as the entry point) also makes it the default VFS. The extension is the engine alone: it calls SQLite through the table of routines of the host (SQLite 3.14 or later; tested with the 3.53 of `third_party/sqlite`),
+and exports nothing but its entry points and `mw_version`. Built with the engine and SQLite in one (the default `make`), the VFS registers itself when SQLite initialises, and the URI needs no `vfs=`.
+
+## Platforms
+
+| Platform | Files of a release | Notes |
+|---|---|---|
+| Linux glibc, x86_64 and arm64 | `multiwriter-linux-<arch>-<version>.tar.gz` | the whole engine, threads and processes |
+| Linux musl (Alpine), x86_64 and arm64 | `multiwriter-linux-musl-<arch>-...` | the same |
+| macOS | `multiwriter-macos-universal-...` (x86_64 + arm64), and each alone | the same |
+| iOS, iOS simulator, Mac Catalyst | `multiwriter-ios-...`, `-ios-sim-...`, `-mac-catalyst-...` | the same (an app has one process: the threads) |
+| Apple XCFramework | `multiwriter-apple-xcframework-<version>.zip`, and `Package.swift` (Swift Package Manager) | frameworks for iOS, simulator, Catalyst and macOS |
+| Android arm64-v8a, armeabi-v7a, x86_64, x86 | `multiwriter-android-<abi>-...`, and the AAR `multiwriter-android-aar-<version>.aar` | API 26 or later; 16 KB pages |
+| Windows x86_64 | `multiwriter-windows-x86_64-<version>.zip` | threads of one process; `mw_mp` (several processes) is refused: `docs/windows.md` |
+
+Build one yourself: `make extension [PLATFORM=macos|ios|ios-sim|mac-catalyst|android|linux|linux-musl|windows] [ARCH=...]`, `make xcframework`, `make aar`, `make package`; `make help` lists them (`mk/extension.mk`, `mk/package.mk`).
+
+## Releases
+
+The version is `MW_VERSION` in `src/multiwriter.h`. A push to the main branch builds and tests every platform (`.github/workflows/main.yml`); if the version has no release yet, the same run tags it with the version and publishes the release with the archives, the XCFramework and the AAR (and puts the checksum of the XCFramework in `Package.swift`). To release, change `MW_VERSION`.
 
     git clone <url> && cd sqlite-multiwriter
     make test           # the test suite (about 40 programs, a few minutes)

@@ -12,7 +12,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <time.h>
-#include <unistd.h>
+#include "multiwriter_os.h"
 
 #include "multiwriter_internal.h"
 

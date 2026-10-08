@@ -20,11 +20,10 @@
 //
 
 #include <errno.h>
-#include <fcntl.h>
+#include "multiwriter_os.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 #include "multiwriter_io.h"
 #include "multiwriter_internal.h"
 

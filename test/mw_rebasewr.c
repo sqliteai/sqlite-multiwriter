@@ -57,7 +57,7 @@ int main (void) {
     sqlite3_finalize(st);
     int ok = 0; sqlite3_prepare_v2(c, "PRAGMA integrity_check", -1, &st, NULL); if (sqlite3_step(st) == SQLITE_ROW) ok = strcmp((const char *)sqlite3_column_text(st, 0), "ok") == 0; sqlite3_finalize(st);
     printf("rebase on a WITHOUT ROWID table: rebases %llu, refused to replay %llu; %ld transactions committed, %ld refused; rows %ld (model %ld), wrong %ld; integrity %s\n", (unsigned long long)g_rebases, (unsigned long long)g_unreb, committed, refused, rows, expected, wrong, ok ? "ok" : "BAD");
-    CHECK(rows == expected); CHECK(wrong == 0); CHECK(ok);
+    CHECK(rows == expected); CHECK(wrong == 0); CHECK(ok); CHECK(g_rebases > 0);
     sqlite3_close(c); mw_rmdb(path);
     MW_DONE();
 }

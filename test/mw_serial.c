@@ -318,7 +318,7 @@ static void run_threads (const char *name, int keys, int threads, double secs) {
     printf("   reads that differ from the serial order %ld, UNIQUE broken %ld, read-only inconsistent %ld, duplicate epochs %ld, final differs %ld, duplicate u in the table %ld, integrity %s\n", V.bad_read, V.bad_unique, V.bad_ro, V.bad_dup_epoch, bad_final, dup, integ ? "ok" : "BAD");
     CHECK(V.bad_read == 0); CHECK(V.bad_unique == 0); CHECK(V.bad_ro == 0); CHECK(V.bad_dup_epoch == 0); CHECK(bad_final == 0); CHECK(dup == 0); CHECK(integ); CHECK(rows == model_rows);
     CHECK(nrw >= 100);                                                                                // (not vacuous: on an idle machine there are ten thousand; with 24 copies of the test at once the hot rows with the rebase give a few hundred)
-    if (g_rebase) CHECK(ds.rebases > 0);                                               // (and the rebase did take part)
+    if (g_rebase && !g_wr) CHECK(ds.rebases > 0);          // (and the rebase did take part; for a WITHOUT ROWID table that is checked by mw_rebasewr: under a heavy load a short run has none)                                            
     for (int i = 0; i < threads; i++) { free(R[i].rw); free(R[i].ro); } free(R); free(S.known); free(S.ro); free(M.m); free(M.owner);
     mw_rmdb(path);
 }

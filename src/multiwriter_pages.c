@@ -299,7 +299,6 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     const bool adopt = v && v->adopt_images;                    // the caller hands over its images (individually malloc'ed): they become the store's copies, or are freed
     #define ADOPT_FREE_ALL(from) do { if (adopt) for (int _i = (from); _i < n; _i++) free((void *)images[_i]); } while (0)
     if (atomic_load(&db->failed)) { ADOPT_FREE_ALL(0); return SQLITE_IOERR; }          // sticky failure: recover by reopening
-    if (db->mp) { uint64_t tcu = MW_T0(); rc = mw_mp_catchup_locked(db); MW_T1(MW_ST_MP_APPLY, tcu); if (rc != SQLITE_OK) { ADOPT_FREE_ALL(0); return rc; } }     // (multi-process) validate against everybody's commits
 
     // allocate and copy the images, and resolve the chains, outside any lock
     uint8_t *copies_stack[16]; mw_chain *chains_stack[16];                           // (small commits: no heap allocation for the bookkeeping arrays)
@@ -542,9 +541,6 @@ int mw_db_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uint32_
         if (rc == SQLITE_OK && out_epoch) *out_epoch = my_epoch;
         return rc;
     }
-    uint64_t tm0 = MW_T0();
-    mw_mp_catchup(db);                                           // apply the others' commits *before* taking the lock: inside it only the last few remain
-    MW_T1(MW_ST_MP_CATCH, tm0);
     // A doomed attempt must not use the lock: if a page we wrote has a newer committed version than our snapshot, the validation inside would refuse us. With 32 processes
     // that was 4-5 of every 5-6 lock rounds (a growing transaction always writes page 1, which every commit changes).
     for (int i = 0; i < n; i++) {
@@ -555,7 +551,7 @@ int mw_db_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uint32_
         }
     }
     mw_gate_enter(db, lane);                                     // gate first, then the lock: a starving rebase closes the gate and its helper needs the lock
-    tm0 = MW_T0();
+    uint64_t tm0 = MW_T0();
     mw_mp_lock(db);                                              // multi-process: one publisher at a time across all processes
     MW_T1(MW_ST_MP_WAIT, tm0);
     tm0 = MW_T0();

@@ -1214,6 +1214,8 @@ Every run is verified after the fact (`count(*)` equals 100 x acknowledged trans
 
 **Limits.** macOS only (the fsync-versus-mapping interference in particular); 18 cores (`ncpu/3` and 1.5 x ncpu are derived from it, not tuned elsewhere); the benchmark is a short-transaction insert load, slow transactions scale differently (§36).
 
+*(Note: the private-store mode of several processes, with `MW_MP_PRIVATE`/`mw_mp=3`/`MW_MP_LAZY`, described in this and the older sections, was removed in 0.5.0; only the shared mode is left.)*
+
 ## 40. Lazy versions read from the shared log (implemented, correct, slower: opt-in `MW_MP_LAZY=1`)
 
 **Idea.** In multi-process mode every process copies the ~7 pages of every commit of every other process into its private store (N copies per commit). With *lazy* versions the catch-up only registers a pointer to the page image inside the shared log mapping (`mw_pv.lazy` = file offset + 1, `data == NULL`); a page is read straight from the mapping (`mw_pv_data`) and is copied only if somebody needs a private copy.

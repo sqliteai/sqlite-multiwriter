@@ -357,7 +357,6 @@ struct mw_db {
     struct mw_seglog *sl;                  // the segmented log (shared mode)
     shidx            *ix;                  // the shared version index (shared mode)
     bool              mp_stale_owner;      // the header said that the publication lock was held by our own pid when we registered: a process that died with it (repaired once the database is open)
-    bool              mp_lazy;             // multi-process catch-up installs lazy versions (set once the database is open; MW_MP_LAZY enables, off by default)
     bool              mp_first;            // this process initialised the shared state
     bool              orphaned;            // inherited through fork(): the child must not use (or tear down) the parent's state; it opens its own
     bool              mp_recheck;          // we stole the publication lock from a dead process: verify the log file is still the one the header describes
@@ -521,8 +520,6 @@ void      mw_log_fill_release (mw_db *db);
 void      mw_log_prefill_bg (mw_db *db);               // multi-process: keep the log file written ahead of its end, outside the publication lock
 int       mw_mp_admit (mw_lane *lane);                 // wait for an admission slot (bounded); the slot is released by mw_mp_admit_release
 void      mw_mp_admit_release (mw_lane *lane);
-int       mw_mp_catchup (mw_db *db);                   // apply other processes' commits (takes mp_mu)
-int       mw_mp_catchup_locked (mw_db *db);
 void      mw_mp_publish_header (mw_db *db, uint64_t epoch);   // after the record is durable: make it visible to other processes
 int       mw_mp_slot_alloc (mw_db *db);
 void      mw_mp_slot_free (mw_db *db, int slot);
@@ -545,11 +542,7 @@ uint64_t  mw_mp_compaction_target (mw_db *db);
 void      mw_mp_reap_dead_slots (mw_db *db);          // frees the registry slots of dead processes (their snapshots no longer hold anything back)
 uint64_t  mw_log_scan_after (mw_db *db, uint64_t epoch, uint64_t end);
 uint64_t  mw_log_header_base (mw_db *db);
-int       mw_log_reopen (mw_db *db);
 void      mw_store_flush (mw_store *st, uint32_t base_dbsize, uint64_t epoch);
-void      mw_mp_rewrite_log (mw_db *db, uint64_t T);
-void      mw_log_remap_ro (mw_db *db, uint64_t need_end);            // remap without growing the file (readers)
-int       mw_log_apply_at (mw_db *db, uint64_t off, uint64_t *out_size, uint64_t *out_epoch);   // install the record at `off` (checksummed)
 
 // registry
 mw_db  *mw_db_acquire (const char *path, int mode, int mpmode);   // mpmode: 0 single process, 1 multi-process (private stores), 2 multi-process shared mode   // NULL on OOM or if the file is already open in another mode
@@ -630,7 +623,7 @@ static inline uint64_t mw_log_limit (const mw_db *db) {
     int mb = mw_knob_int(&ovr, "MW_LOG_LIMIT_MB", 0);
     if (mb > 0) return (uint64_t)mb << 20;
     uint64_t m = db->log_max_bytes;
-    return (db->mp && !db->shared && m > (8ull << 20) && atomic_load_explicit(&db->mp_nprocs, memory_order_relaxed) > 16) ? (8ull << 20) : m;       // (the private-store mode keeps its working set small; the shared mode compacts by size like the others, and fewer, bigger compactions cost less)
+    return m;
 }
 
 #endif

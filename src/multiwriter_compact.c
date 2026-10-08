@@ -45,24 +45,12 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
     uint64_t t0 = now_ns();
     int rc = SQLITE_OK;
 
-    bool mp_locked = false;
-    uint64_t T, base;
-    if (db->mp) {                                                   // one compactor at a time across processes; target from the shared registry
-        if (!mw_mp_compaction_lock(db)) goto done;
-        mp_locked = true;
-        mw_mp_catchup(db);
-        uint64_t visible_mp = atomic_load(&db->epoch);
-        T = mw_mp_compaction_target(db);
-        if (T > visible_mp) T = visible_mp;
-        base = atomic_load(&db->shm->base_epoch);
-    } else {
-        uint64_t visible = atomic_load(&db->epoch);
-        uint64_t oldest = mw_db_oldest_active_snapshot(db);
-        T = oldest < visible ? oldest : visible;
-        base = db->base_epoch;
-    }
+    uint64_t visible = atomic_load(&db->epoch);
+    uint64_t oldest = mw_db_oldest_active_snapshot(db);
+    uint64_t T = oldest < visible ? oldest : visible;
+    uint64_t base = db->base_epoch;
     if (T <= base) goto done;                                      // nothing new to materialise (or pinned by an old reader)
-    if (!db->mp && db->has_log) {                                  // (commits with synchronous < FULL are visible before they are on the disk: the log has them there before their pages go into the file, or a power failure leaves the file ahead of the log)
+    if (db->has_log) {                                  // (commits with synchronous < FULL are visible before they are on the disk: the log has them there before their pages go into the file, or a power failure leaves the file ahead of the log)
         uint64_t du; pthread_mutex_lock(&db->log_mu); du = db->synced_upto; pthread_mutex_unlock(&db->log_mu);
         if (du < T) { rc = mw_log_sync(db, T, MW_LOG_OFF(db)); if (rc != SQLITE_OK) goto done; }
     }
@@ -121,7 +109,7 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
     if (rc == SQLITE_OK) mw_fault_hit(MW_CRASH_COMPACT_PAGES);
 
     // 2. durable new base
-    if (rc == SQLITE_OK) { rc = mw_log_set_base(db, T); if (rc == SQLITE_OK) { if (db->mp) atomic_store(&db->shm->base_epoch, T); mw_fault_hit(MW_CRASH_COMPACT_BASE); } }
+    if (rc == SQLITE_OK) { rc = mw_log_set_base(db, T); if (rc == SQLITE_OK) { mw_fault_hit(MW_CRASH_COMPACT_BASE); } }
 
     // 3. settle the dirty list: clean pages drop out, pages with newer versions (or everything, on failure) are re-pushed
     for (uint32_t h = detached; h; ) {
@@ -151,10 +139,7 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
     int drop = 0;                                                  // size records <= T are subsumed by base_dbsize
     while (drop < st->nsizes && st->sizes[drop].epoch <= T) drop++;
     if (drop) { memmove(st->sizes, st->sizes + drop, (size_t)(st->nsizes - drop) * sizeof(mw_sizerec)); st->nsizes -= drop; }
-    if (db->mp) {
-        mw_log_rewrite_abort(prep); prep = NULL;
-        /* handled after seq_mu is released (needs the publication lock) */
-    } else if (atomic_load(&db->next_epoch) == T && atomic_load(&db->epoch) == T) {
+    if (atomic_load(&db->next_epoch) == T && atomic_load(&db->epoch) == T) {
         mw_log_rewrite_abort(prep); prep = NULL;
         if (mw_io_ftruncate(db->logfd, 64) == 0) { __atomic_store_n(&db->log_off, 64, __ATOMIC_RELAXED); mw_log_stage_reset(db, 64); mw_log_remap(db); }
     } else if (MW_LOG_OFF(db) > 8 * 4096) {
@@ -162,14 +147,12 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
     }
     mw_log_rewrite_abort(prep);                                    // (not used: the log was small, or the other branch ran)
     pthread_mutex_unlock(&st->seq_mu);
-    if (db->mp) mw_mp_rewrite_log(db, T);
     out->target_epoch = T;
     out->versions_freed = mw_db_gc(db);
     atomic_fetch_add(&db->n_compactions, 1);
     atomic_fetch_add(&db->n_compacted_pages, out->pages_written);
 
 done:
-    if (mp_locked) mw_mp_compaction_unlock(db);
     out->duration_ns = now_ns() - t0;
     atomic_fetch_add(&db->n_compaction_ns, out->duration_ns);
     pthread_mutex_unlock(&db->compact_mu);

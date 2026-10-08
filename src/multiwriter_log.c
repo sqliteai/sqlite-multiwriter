@@ -435,55 +435,6 @@ void mw_log_remap (mw_db *db) {
     mw_log_reserve_space(db);
 }
 
-// Readers (other processes' commits): map what exists, never grow or shrink the file.
-void mw_log_remap_ro (mw_db *db, uint64_t need_end) {
-    if (db->logmap && need_end <= db->logfile_size) return;
-    struct stat sb;
-    db->logfile_size = fstat(db->logfd, &sb) == 0 ? log_usable(db, (uint64_t)sb.st_size) : 0;
-    if (db->logmap) return;                          // (the mapping always spans LOG_MAP_BYTES: only the file size changed, and other threads may be using the mapping)
-    void *m = mw_io_mmap(NULL, LOG_MAP_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, db->logfd, 0);
-    log_mapped(db, m);
-}
-
-// Installs the epoch-contiguous record at `off` of the mapped log into the local store. Records below log_end were
-// published by a process that finished writing them (the header is updated last, inside the publication lock), so
-// they are complete by construction: no checksum on this hot path (recovery of an unclean log still verifies).
-int mw_log_apply_at (mw_db *db, uint64_t off, uint64_t *out_size, uint64_t *out_epoch) {
-    static _Atomic int dbg_c = MW_KNOB_UNSET;
-    const bool dbg = mw_knob_flag(&dbg_c, "MW_DEBUG");
-    if (!db->logmap || off + REC_HDR_SIZE > db->logfile_size) return SQLITE_IOERR_SHORT_READ;
-    const uint8_t *base = db->logmap + off;
-    rec_hdr r;
-    memcpy(&r, base, sizeof r);
-    size_t pgsz = (size_t)db->store->pgsz;
-    if (r.magic != REC_MAGIC || r.pgsz != (uint32_t)pgsz || r.npages == 0 || r.npages > (1u << 24)) { if (dbg) fprintf(stderr, "apply_at: bad header at %llu (magic %x npages %u)\n", (unsigned long long)off, r.magic, r.npages); return SQLITE_CORRUPT; }
-    size_t body = (size_t)r.npages * (4 + pgsz) + r.ext_len;
-    if (off + REC_HDR_SIZE + body > db->logfile_size) { if (dbg) fprintf(stderr, "apply_at: record at %llu beyond mapped size %llu\n", (unsigned long long)off, (unsigned long long)db->logfile_size); return SQLITE_IOERR_SHORT_READ; }
-    if (r.epoch != atomic_load(&db->epoch) + 1) { if (dbg) fprintf(stderr, "apply_at: epoch %llu after %llu\n", (unsigned long long)r.epoch, (unsigned long long)atomic_load(&db->epoch)); return SQLITE_CORRUPT; }
-    uint32_t pg_small[16]; const uint8_t *im_small[16];
-    uint32_t *pgnos = r.npages <= 16 ? pg_small : malloc((size_t)r.npages * sizeof(uint32_t));
-    const uint8_t **imgs = r.npages <= 16 ? im_small : malloc((size_t)r.npages * sizeof(uint8_t *));
-    if (!pgnos || !imgs) { if (r.npages > 16) { free(pgnos); free((void *)imgs); } return SQLITE_NOMEM; }
-    for (uint32_t i = 0; i < r.npages; i++) {
-        const uint8_t *e = base + REC_HDR_SIZE + (size_t)i * (4 + pgsz);
-        memcpy(&pgnos[i], e, 4);
-        imgs[i] = e + 4;
-    }
-    int rc;
-    if (db->mp && db->mp_lazy) {                                      // multi-process catch-up: point at the images in the mapping instead of copying them
-        uint64_t off_small[16]; uint64_t *offs = r.npages <= 16 ? off_small : malloc((size_t)r.npages * sizeof(uint64_t));
-        if (!offs) { if (r.npages > 16) { free(pgnos); free((void *)imgs); } return SQLITE_NOMEM; }
-        for (uint32_t i = 0; i < r.npages; i++) offs[i] = off + REC_HDR_SIZE + (uint64_t)i * (4 + pgsz) + 4;
-        rc = mw_store_install_lazy(db->store, r.epoch, r.dbsize, (int)r.npages, pgnos, offs);
-        if (r.npages > 16) free(offs);
-    } else rc = mw_store_install_recovered(db->store, r.epoch, r.dbsize, (int)r.npages, pgnos, imgs);
-    if (rc == SQLITE_OK) db->store->sizes[db->store->nsizes - 1].log_off = off;
-    if (r.npages > 16) { free(pgnos); free((void *)imgs); }
-    *out_size = REC_HDR_SIZE + body;
-    *out_epoch = r.epoch;
-    return rc;
-}
-
 // Multi-process mapped log: the file is extended with *written zeros*, not with ftruncate. Appending a record through the mapping into a hole makes the file system
 // allocate blocks while another process's fsync of the same file is running, and the append then stalls on it (measured in isolation, 30 KB record: 40-65 us with a
 // concurrent fsync into a sparse file, 3-8 us into a file whose blocks were written, and the same 6-10 us without any fsync). shm->log_ready is the written extent:
@@ -1218,20 +1169,3 @@ uint64_t mw_log_header_base (mw_db *db) {
     return memcmp(h.magic, LOG_MAGIC, 8) == 0 ? h.base_epoch : 0;
 }
 
-// Switches to the log file currently at db->logpath (another process replaced it), keeping a shared lock on it.
-int mw_log_reopen (mw_db *db) {
-    int nfd = open(db->logpath, O_RDWR);
-    if (nfd < 0) return SQLITE_CANTOPEN;
-    if (flock(nfd, LOCK_SH | LOCK_NB) != 0) { close(nfd); return SQLITE_BUSY; }
-    sync_quiesce(db);
-    db->logsync_off = 0; db->logsync_low1 = 0;
-    log_unmap(db, true);
-    if (db->logfd >= 0) { flock(db->logfd, LOCK_UN); close(db->logfd); }
-    db->logfd = nfd;
-    struct stat sb;
-    db->logfile_size = fstat(nfd, &sb) == 0 ? (uint64_t)sb.st_size : 0;     // (a new file: the caller of the replacement publishes its size as shm->log_ready)
-    void *m = mw_io_mmap(NULL, LOG_MAP_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, nfd, 0);
-    log_mapped(db, m);
-    sync_resume(db);
-    return db->logmap ? SQLITE_OK : SQLITE_IOERR;
-}

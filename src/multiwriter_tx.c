@@ -104,7 +104,6 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
         MW_T1(MW_ST_TURN, tturn0);
     }
     for (;;) {
-        if (db->mp) mw_mp_catchup(db);           // see the other processes' commits
         sqlite3_mutex_enter(db->mu);
         lane->tx.snapshot_epoch = mw_db_visible_epoch(db);
         lane->next_active = db->active;

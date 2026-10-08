@@ -165,11 +165,9 @@ int mw_mp_finish_open (mw_db *db) {
         atomic_store(&sh->compact_T, db->base_epoch);
         atomic_store(&sh->schema_epoch, 1);
         atomic_store(&sh->dbv_counter, 0);
-        if (!db->shared) { atomic_store(&sh->ready, 1); flock(db->mp_lockfd, LOCK_SH); }       // downgrade: others may proceed (the shared mode does it at the end of mw_shared_open_finish: it still has the header to complete, and a process that commits meanwhile must not have its epoch overwritten)
     }
     if (db->mp_first) { db->mp_gen = MW_LOG_GEN(atomic_load(&sh->log_pos)); db->mp_base_seen = atomic_load(&sh->base_epoch); }
     atomic_store(&sh->procs[db->mp_proc].applied, atomic_load(&db->epoch));
-    db->mp_lazy = getenv("MW_MP_LAZY") != NULL;                         // opt-in: the catch-up installs versions that point into the shared log (measured slower, see docs §40)
     return SQLITE_OK;
 }
 
@@ -200,7 +198,6 @@ void mw_mp_close (mw_db *db, bool *sole) {
 // end (log_end/committed_epoch), so a holder that died earlier left nothing but unpublished bytes.
 // Waiting for the publication lock: after a short spin, sleep this many microseconds between polls (MW_MP_SLEEP_US, default 50; 0 = sched_yield). Yielding keeps every
 // waiting process runnable and 16-32 processes on 18 cores then fight for the cores the holder needs (measured: 16 processes 5.7k -> 8.0k tx/s with 50 us, 8 processes 8.1k -> 10.4k).
-int mw_mp_catchup_locked (mw_db *db);
 static int mp_sleep_us (void) { static _Atomic int c = MW_KNOB_UNSET; return mw_knob_int(&c, "MW_MP_SLEEP_US", 50); }
 
 // Sleeping between polls pays only when many processes compete (with 2-4 the hand-off latency of a sleep costs more than the yields: 4 processes 13-15k -> 11-12k).
@@ -250,8 +247,6 @@ void mw_mp_lock (mw_db *db) {
             }
             uint64_t ahead = s < t ? t - s : 0;
             if (polls == 3000 && getenv("MW_DEBUG")) fprintf(stderr, "pid %d: lock stuck: ticket %llu serving %llu owner %d tk_pid[s] %d shared %d\n", (int)me, (unsigned long long)t, (unsigned long long)s, (int)atomic_load(&sh->pub_owner), (int)atomic_load(&sh->pub_tk_pid[s % 1024]), (int)db->shared);
-            // (only near the head of the queue: every waiter applying every commit as it appears is N times the work of a commit, and past ~64 processes that work is what the cores are spent on)
-            if (ahead <= 4 && atomic_load_explicit(&sh->committed_epoch, memory_order_acquire) != atomic_load_explicit(&db->epoch, memory_order_acquire) && atomic_load(&db->failed) == 0) mw_mp_catchup_locked(db);
             static _Atomic int fast_c = MW_KNOB_UNSET, per_c = MW_KNOB_UNSET, cap_c = MW_KNOB_UNSET;
             const int fast = mw_knob_int(&fast_c, "MW_MP_FAST", 2); (void)per_c; (void)cap_c;
             if (ahead <= (uint64_t)fast) { if (polls < 400) MP_RELAX(); else sched_yield(); }
@@ -266,7 +261,6 @@ void mw_mp_lock (mw_db *db) {
             if (owner != 0 && owner != me && !pid_alive(db, owner) && atomic_compare_exchange_strong(&sh->pub_owner, &owner, me)) { db->mp_recheck = true; if (db->shared) mw_shared_repair(db); }     // steal from a dead process
             if (atomic_load(&sh->pub_owner) == me) return;
         }
-        if (atomic_load_explicit(&sh->committed_epoch, memory_order_acquire) != atomic_load_explicit(&db->epoch, memory_order_acquire) && atomic_load(&db->failed) == 0) mw_mp_catchup_locked(db);
         if (spin < 400) MP_RELAX();
         else if (mp_sleep_us() > 0 && mp_crowded(db)) { struct timespec ts = { 0, (long)mp_sleep_us() * 1000 }; nanosleep(&ts, NULL); }
         else sched_yield();
@@ -285,94 +279,6 @@ void mw_mp_unlock (mw_db *db) {
 }
 
 bool mw_mp_pid_alive (mw_db *db, int32_t pid) { return pid_alive(db, pid); }
-
-int mw_mp_catchup_locked_impl (mw_db *db);
-int mw_mp_catchup_locked (mw_db *db) { uint64_t t0 = MW_T0(); int rc = mw_mp_catchup_locked_impl(db); MW_T1(MW_ST_MP_CATCH, t0); return rc; }
-int mw_mp_catchup_locked_impl (mw_db *db) {
-    if (db->shared) return SQLITE_OK;
-    mw_shm *sh = db->shm;
-    if (db->mp_recheck && atomic_load(&sh->pub_owner) == (int32_t)getpid()) {
-        // The previous holder died with the lock. If it was replacing the log (rename done, header not yet updated) the path now names a different
-        // file than the header describes, and the offsets in the header are those of the old one: adopt the new file and publish a new generation.
-        db->mp_recheck = false;
-        if (mw_same_file(db->logfd, db->logpath) == 0) {
-            uint64_t old = atomic_load(&sh->log_pos);
-            if (mw_log_reopen(db) == SQLITE_OK) {
-                mw_log_remap_ro(db, 0);
-                uint64_t vend = mw_log_scan_after(db, ~(uint64_t)0, db->logfile_size);       // end of the valid records of the new file
-                atomic_store_explicit(&sh->log_ready, db->logfile_size, memory_order_release);
-                db->mp_gen = MW_LOG_GEN(old) + 1;
-                atomic_store_explicit(&sh->log_pos, MW_LOG_POS(db->mp_gen, vend), memory_order_release);
-                db->mp_gen = MW_LOG_GEN(old);                                             // (the normal path below repositions us on the new generation)
-            }
-        }
-    }
-    uint64_t pos = atomic_load_explicit(&sh->log_pos, memory_order_acquire);           // (generation, end) in one word: always a consistent pair
-    uint64_t gen = MW_LOG_GEN(pos), end = MW_LOG_END(pos);
-    uint64_t tgen0 = MW_T0();
-    if (gen != db->mp_gen) {                                              // the log was reset or rewritten by another process
-        for (;;) {
-            db->mp_gen = gen;
-            uint64_t tro0 = MW_T0();
-            int rrc = mw_log_reopen(db);
-            MW_T1(MW_ST_MP_REOPEN, tro0);
-            if (rrc != SQLITE_OK) { if (getenv("MW_DEBUG")) fprintf(stderr, "pid %d: catch-up: log reopen failed rc=%d errno=%d (gen %llu)\n", (int)getpid(), rrc, errno, (unsigned long long)gen); atomic_store(&db->failed, 1); return rrc; }
-            uint64_t B = mw_log_header_base(db);
-            uint64_t e = atomic_load(&db->epoch);
-            if (e < B) {                                                  // the records we still need are gone: the real file has them
-                struct stat sb;
-                uint32_t pages = stat(db->path, &sb) == 0 ? (uint32_t)((uint64_t)sb.st_size / (uint64_t)db->store->pgsz) : db->store->base_dbsize;
-                mw_store_flush(db->store, pages, B);
-                atomic_store(&db->epoch, B); atomic_store(&db->next_epoch, B);
-                db->written_upto = db->synced_upto = B;
-                e = B;
-            }
-            // The header may already say "everything up to B is in the real file" while the compactor has not restarted the log yet (the old records are
-            // still there), or it may have restarted it: the first record newer than what we have is where to continue in both cases (not necessarily offset 64).
-            uint64_t pos2 = atomic_load_explicit(&sh->log_pos, memory_order_acquire);
-            if (MW_LOG_GEN(pos2) != gen) { gen = MW_LOG_GEN(pos2); end = MW_LOG_END(pos2); continue; }      // reset again meanwhile: start over on the new generation
-            end = MW_LOG_END(pos2);                                       // (`end` read before the reopen may be stale: the log only grows within a generation)
-            uint64_t tsc0 = MW_T0();
-            db->log_off = mw_log_scan_after(db, e, end);
-            MW_T1(MW_ST_MP_SCAN, tsc0);
-            break;
-        }
-        MW_T1(MW_ST_MP_GEN, tgen0);
-    }
-    int rc = SQLITE_OK;
-    if (db->log_off < end) {
-        mw_log_remap_ro(db, end);
-        while (db->log_off < end) {
-            uint64_t size = 0, epoch = 0;
-            rc = mw_log_apply_at(db, db->log_off, &size, &epoch);
-            if (rc != SQLITE_OK) { if (getenv("MW_DEBUG")) fprintf(stderr, "pid %d: catch-up: apply_at failed rc=%d at off=%llu end=%llu epoch=%llu gen=%llu\n", (int)getpid(), rc, (unsigned long long)db->log_off, (unsigned long long)end, (unsigned long long)atomic_load(&db->epoch), (unsigned long long)gen); atomic_store(&db->failed, 1); return rc; }
-            db->log_off += size;
-            atomic_store(&db->next_epoch, epoch);
-            db->written_upto = db->synced_upto = epoch;
-            atomic_store_explicit(&db->epoch, epoch, memory_order_release);
-        }
-    }
-    uint64_t base = atomic_load(&sh->base_epoch);
-    if (base > db->mp_base_seen) {                                        // another process compacted: our copies <= base are redundant
-        db->mp_base_seen = base;
-        pthread_mutex_lock(&db->store->seq_mu); if (base > db->store->compacted_epoch) db->store->compacted_epoch = base; pthread_mutex_unlock(&db->store->seq_mu);
-        mw_store_drop_dirty_upto(db->store, base);
-    }
-    uint64_t sc = atomic_load(&sh->schema_epoch);
-    if (sc > atomic_load(&db->last_schema_epoch)) atomic_store(&db->last_schema_epoch, sc);
-    atomic_store(&sh->procs[db->mp_proc].applied, atomic_load(&db->epoch));
-    return SQLITE_OK;
-}
-
-int mw_mp_catchup (mw_db *db) {
-    if (db->shared) return SQLITE_OK;                                  // (shared mode: nothing to apply, the index is shared)
-    if (atomic_load_explicit(&db->shm->committed_epoch, memory_order_acquire) == atomic_load_explicit(&db->epoch, memory_order_acquire) &&
-        MW_LOG_GEN(atomic_load(&db->shm->log_pos)) == db->mp_gen && atomic_load(&db->shm->base_epoch) == db->mp_base_seen) return SQLITE_OK;   // fast path
-    pthread_mutex_lock(&db->mp_mu);
-    int rc = mw_mp_catchup_locked(db);
-    pthread_mutex_unlock(&db->mp_mu);
-    return rc;
-}
 
 void mw_mp_publish_header (mw_db *db, uint64_t epoch) {
     atomic_store_explicit(&db->shm->log_pos, MW_LOG_POS(db->mp_gen, db->log_off), memory_order_release);
@@ -511,32 +417,6 @@ void mw_mp_writing (mw_lane *lane, bool on) {
     if (lane->mp_slot >= 0) atomic_store(&lane->db->shm->slots[lane->mp_slot].writing, on ? 1 : 0);
 }
 
-// Keeps the shared log bounded under continuous load: replace it by a file holding only the records newer than T
-// (the compactor already made everything <= T durable in the real file). Other processes notice log_gen, reopen the
-// path and reposition (mw_mp_catchup_locked). Needs the publication lock: no append may run meanwhile.
-void mw_mp_rewrite_log (mw_db *db, uint64_t T) {
-    uint64_t trw0 = MW_T0();
-    mw_mp_lock(db);
-    MW_T1(MW_ST_MP_REWRITE_WAIT, trw0);
-    trw0 = MW_T0();
-    mw_shm *sh = db->shm;
-    if (mw_mp_catchup_locked(db) == SQLITE_OK && atomic_load(&sh->base_epoch) >= T && db->log_off > 8 * 4096 &&
-        db->log_off > (uint64_t)db->store->pgsz * 64) {
-        mw_store_materialize_lazy(db->store);                        // (before seq_mu: lock order; the old mapping goes away)
-        mw_log_fill_hold(db);                                        // (no prefiller writes into the old file with the new file's extent)
-        pthread_mutex_lock(&db->store->seq_mu);
-        int rc = mw_log_rewrite_tail(db, T, NULL);                       // new file (header base = T) + tail, atomically renamed; we switch to it
-        pthread_mutex_unlock(&db->store->seq_mu);
-        if (rc == SQLITE_OK) {
-            db->mp_gen++;
-            atomic_store_explicit(&sh->log_ready, db->logfile_size, memory_order_release);      // (a new file: its written extent)
-            atomic_store_explicit(&sh->log_pos, MW_LOG_POS(db->mp_gen, db->log_off), memory_order_release);
-        }
-        mw_log_fill_release(db);
-    }
-    MW_T1(MW_ST_MP_REWRITE, trw0);
-    mw_mp_unlock(db);
-}
 
 // MARK: - admission control (many processes) -
 //

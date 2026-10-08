@@ -125,15 +125,6 @@ void mw_db_release (mw_db *db) {
             mw_log_close(db, false);
             goto shared_cleanup;
         }
-        if (db->mp) {
-            mw_mp_close(db, &sole);                                     // *sole: we are the last process (and hold the lock exclusively)
-            if (sole) {
-                pthread_mutex_lock(&db->mp_mu); mw_mp_catchup_locked(db); pthread_mutex_unlock(&db->mp_mu);
-                db->base_epoch = atomic_load(&db->shm->base_epoch);
-                db->mp = false;                                          // from here on: the ordinary single-process close
-                mw_store_materialize_lazy(db->store);                     // (the ordinary close truncates the log in place; lazy versions point into it)
-            }
-        }
         if (sole && db->store && db->logfd >= 0 && !atomic_load(&db->failed)) {
             mw_compact_result r;
             clean = mw_db_compact(db, &r) == SQLITE_OK && db->base_epoch == atomic_load(&db->epoch) && atomic_load(&db->next_epoch) == atomic_load(&db->epoch);

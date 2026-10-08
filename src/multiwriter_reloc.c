@@ -285,7 +285,6 @@ int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgno
             MW_T1(MW_ST_RELOCLOCK, trl0);
             lane->reloc_t0 = MW_T0();
             lane->holds_reloc = true;
-            if (db->mp) { if (lane->mp_held) mw_mp_catchup_locked(db); else mw_mp_catchup(db); }      // (multi-process: lane_publish holds the publication lock for the whole commit)
             uint64_t th0 = MW_T0();
             // Page 1 (the newest version): the previous relocation left its installed image in db->p1_cache; if nobody wrote page 1 since, that *is* the newest
             // version and there is no need to take page 1's stripe (which every transaction's header read also wants) and copy it again.

@@ -1,8 +1,7 @@
 # Windows
 
 The whole engine runs on Windows (MinGW-w64, `make extension PLATFORM=windows` in MSYS2): the threads of one process (`mw=2`) and the processes mode (`mw_mp=1`, the shared mode: one version index and segmented log shared by all the processes).
-What a Windows build does not have is the processes mode with private stores (`MW_MP_PRIVATE`, a legacy mode): its single log file is mapped by every process and truncated by the compaction, and Windows does not truncate a file
-that has a mapped view. A database opened with it is refused with `SQLITE_CANTOPEN` (and a line in the SQLite log).
+There is only one processes mode, on every platform (the private-store mode that mapped a single log file was removed in 0.5.0).
 
 ## What the Windows build does
 

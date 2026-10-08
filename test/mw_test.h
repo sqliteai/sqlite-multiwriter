@@ -1,7 +1,7 @@
 // Minimal helpers shared by the Multi-Writer test programs.
 #ifndef MW_TEST_H
 #define MW_TEST_H
-#include <glob.h>
+#include <dirent.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -11,7 +11,7 @@
 #include "sqlite3.h"
 
 
-#ifdef __linux__
+#if defined(__GLIBC__)       // (glibc only: musl and bionic have no execinfo.h)
 // kill -USR1 <pid> prints the stack of every thread (a hung test in a container with no debugger)
 #include <execinfo.h>
 #include <signal.h>
@@ -48,20 +48,28 @@ static inline int64_t mw_scalar (sqlite3 *db, const char *sql) {
     return v;
 }
 
+// removes the files of a directory whose name starts with `prefix` (opendir: glob.h is not in every libc this runs on)
+static inline void mw_unlink_prefix (const char *dir, const char *prefix) {
+    DIR *d = opendir(dir); if (!d) return;
+    size_t pl = strlen(prefix); struct dirent *e; char p[1200];
+    while ((e = readdir(d))) if (strncmp(e->d_name, prefix, pl) == 0) { snprintf(p, sizeof p, "%s/%s", dir, e->d_name); unlink(p); }
+    closedir(d);
+}
 // every file that belongs to a database: it, SQLite's own and the engine's (log, segments, index, locks, owner maps): a log that outlives its database is replayed on the next one of the same name
 static inline void mw_rmfiles (const char *path) {
     char p[600]; const char *sfx[] = {"", "-wal", "-shm", "-journal"};
     for (int i = 0; i < 4; i++) { snprintf(p, sizeof p, "%s%s", path, sfx[i]); unlink(p); }
-    glob_t g; snprintf(p, sizeof p, "%s-mw*", path);
-    if (glob(p, 0, NULL, &g) == 0) { for (size_t i = 0; i < g.gl_pathc; i++) unlink(g.gl_pathv[i]); globfree(&g); }
+    const char *slash = strrchr(path, '/'); char dir[600];
+    if (slash) { snprintf(dir, sizeof dir, "%.*s", (int)(slash - path) ? (int)(slash - path) : 1, path); snprintf(p, sizeof p, "%s-mw", slash + 1); } else { snprintf(dir, sizeof dir, "."); snprintf(p, sizeof p, "%s-mw", path); }
+    mw_unlink_prefix(dir, p);
 #ifdef __linux__
     { uint64_t h = 1469598103934665603ull; for (const char *c = path; *c; c++) { h ^= (unsigned char)*c; h *= 1099511628211ull; }          // (the files of the shared mode live in /dev/shm there: mw_sidecar_path)
-      snprintf(p, sizeof p, "/dev/shm/mw-%016llx-*", (unsigned long long)h);
-      if (glob(p, 0, NULL, &g) == 0) { for (size_t i = 0; i < g.gl_pathc; i++) unlink(g.gl_pathv[i]); globfree(&g); } }
+      snprintf(p, sizeof p, "mw-%016llx-", (unsigned long long)h);
+      mw_unlink_prefix("/dev/shm", p); }
 #endif
 }
 static inline char *mw_tmpdb (char *buf, size_t n, const char *tag) {
-    snprintf(buf, n, "/tmp/mw_%s_%d.db", tag, (int)getpid());
+    const char *dir = getenv("TMPDIR"); snprintf(buf, n, "%s/mw_%s_%d.db", (dir && *dir) ? dir : "/tmp", tag, (int)getpid());
     mw_rmfiles(buf);
     return buf;
 }

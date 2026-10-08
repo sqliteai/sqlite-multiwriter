@@ -28,7 +28,8 @@ int main (int argc, char **argv) {
     CHECK_RC(sqlite3_enable_load_extension(db, 1), SQLITE_OK);
     CHECK(sqlite3_vfs_find("multiwriter") == NULL);                                           // (not there until the extension is loaded)
     CHECK_RC(sqlite3_load_extension(db, argv[1], "sqlite3_multiwriter_init", &err), SQLITE_OK);
-    if (err) { printf("load: %s\n", err); sqlite3_free(err); }
+    if (err) { printf("load: %s\n", err); sqlite3_free(err); err = NULL; }
+    if (mw_failures) { printf("%s: %d failure(s)\n", __FILE__, mw_failures); return 1; }                // (nothing below makes sense if it did not load)
     sqlite3_stmt *st; CHECK_RC(sqlite3_prepare_v2(db, "SELECT mw_version(), mw_version_number()", -1, &st, NULL), SQLITE_OK);
     CHECK_RC(sqlite3_step(st), SQLITE_ROW);
     printf("mw_version() = %s, mw_version_number() = %d\n", (const char *)sqlite3_column_text(st, 0), sqlite3_column_int(st, 1));

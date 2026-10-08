@@ -1,5 +1,8 @@
 build/
 dist/
+packages/android/build/
+packages/android/.gradle/
+packages/android/src/main/jniLibs/
 *.o
 *.dSYM/
 .DS_Store

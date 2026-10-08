@@ -22,7 +22,12 @@
 //
 
 #include <errno.h>
-#include <execinfo.h>
+#if defined(__has_include)
+#if __has_include(<execinfo.h>)
+#include <execinfo.h>         // (debugging aid of the fault injection; musl and old Android have none)
+#define MW_HAVE_BACKTRACE 1
+#endif
+#endif
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,7 +118,9 @@ int mw_io_fault (int kind, size_t *partial) {
     if (atomic_load(&io_fired)) return atomic_load(&io_sticky) ? (kind == MW_IO_MAP ? ENOMEM : atomic_load(&io_err)) : 0;
     if (atomic_fetch_sub(&io_left, 1) != 1) return 0;
     atomic_store(&io_fired, 1);
+#ifdef MW_HAVE_BACKTRACE
     if (getenv("MW_IO_TRACE")) { void *bt[24]; int n = backtrace(bt, 24); fprintf(stderr, "io fault fires (kind %d):\n", kind); backtrace_symbols_fd(bt, n, 2); }
+#endif
     if (partial && atomic_load(&io_short)) *partial = 1;
     return kind == MW_IO_MAP ? ENOMEM : atomic_load(&io_err);
 }

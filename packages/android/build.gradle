@@ -1,0 +1,71 @@
+// The Android library of sqlite-multiwriter: the extension for the four ABIs (jniLibs, put there by `make aar`) and nothing else.
+// `make aar` builds it: dist/multiwriter.aar. The extension is loaded with sqlite3_load_extension from the directory of the native libraries of the app:
+//     String path = context.getApplicationInfo().nativeLibraryDir + "/libmultiwriter.so";
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.5.2'
+    }
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'maven-publish'
+
+android {
+    namespace 'io.sqlitecloud.multiwriter'
+    compileSdk 34
+
+    defaultConfig {
+        minSdk 26
+        targetSdk 34
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                groupId = 'io.sqlitecloud'
+                artifactId = 'multiwriter'
+                version = project.hasProperty('VERSION') ? project.VERSION : '0.0.0'
+                artifact("$buildDir/outputs/aar/android-release.aar")
+                pom {
+                    name = 'sqlite-multiwriter'
+                    description = 'SQLite with more writers: many threads and processes write one database at the same time, as a loadable extension.'
+                    url = 'https://github.com/sqlitecloud/sqlite-multiwriter'
+                    licenses {
+                        license {
+                            name = 'Apache License 2.0'
+                            url = 'https://www.apache.org/licenses/LICENSE-2.0'
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

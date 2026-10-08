@@ -28,7 +28,14 @@ extern "C" {
 #define MW_VERSION_MINOR 5
 #define MW_VERSION_PATCH 0
 #define MW_VERSION_NUMBER (MW_VERSION_MAJOR * 1000000 + MW_VERSION_MINOR * 1000 + MW_VERSION_PATCH)
-const char *mw_version (void);                // "0.5.0"
+#if defined(MW_LOADABLE) && defined(_WIN32)
+#define MW_API __declspec(dllexport)         // the loadable extension exports its entry points and nothing else
+#elif defined(MW_LOADABLE)
+#define MW_API __attribute__((visibility("default")))
+#else
+#define MW_API
+#endif
+MW_API const char *mw_version (void);        // "0.5.0"
 
 #define MW_VFS_NAME "multiwriter"
 

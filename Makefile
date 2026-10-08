@@ -1,7 +1,8 @@
-# sqlite-multiwriter: multi-writer SQLite as a wrapper VFS (macOS and Linux).
+# sqlite-multiwriter: multi-writer SQLite as a wrapper VFS.
 #   make            build the engine objects and the test programs
 #   make test       run the test suite
 #   make bench      build the benchmark   (dist/mw_bench)
+#   make extension [PLATFORM=..] [ARCH=..]   the loadable extension (dist/multiwriter.so|dylib|dll): see mk/extension.mk, `make help`
 # SQLite (the amalgamation) is vendored in third_party/sqlite; nothing else is needed to build and test. The engine registers its VFS from inside sqlite3_initialize()
 # through the compile option SQLITE_EXTRA_INIT (sqlite3.c itself is not modified).
 
@@ -55,6 +56,12 @@ $(DIST)/mw_%: $(BUILD)/t_mw_%.o $(LIB_OBJ)
 test: $(FAST_BIN)
 	@set -e; for t in $(FAST_BIN); do echo "== $$t"; ./$$t; done; echo "== mw_rebase (a WITHOUT ROWID table)"; MW_TEST_WR=1 ./$(DIST)/mw_rebase
 
+# the suite of the CI legs that run it on shared machines: without mw_serial (about a minute and a half of stress, which has a threshold of events that a loaded machine can miss); `make test` runs everything
+CI_BIN := $(filter-out $(DIST)/mw_serial,$(FAST_BIN))
+.PHONY: test-ci
+test-ci: $(CI_BIN)
+	@set -e; for t in $(CI_BIN); do echo "== $$t"; ./$$t; done; echo "== mw_rebase (a WITHOUT ROWID table)"; MW_TEST_WR=1 ./$(DIST)/mw_rebase
+
 # errors of the file system: a fault at every n-th file call of a workload, and a real full disk (a small disk image)
 .PHONY: test-io
 test-io: $(IO_TESTS)
@@ -68,38 +75,8 @@ $(DIST)/mw_bench: $(BUILD)/b_mw_bench.o $(LIB_OBJ)
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LDFLAGS)
 
-# ---- the loadable extension (dist/multiwriter.so|dylib): the engine without SQLite, every sqlite3_* call through the host's table of routines (sqlite3ext.h) ----
-HOSTOS := $(shell uname -s)
-ifeq ($(HOSTOS),Darwin)
-EXT_SUFFIX := dylib
-EXT_LDFLAGS := -dynamiclib -framework Security
-else
-EXT_SUFFIX := so
-EXT_LDFLAGS := -shared -lpthread -lm -ldl
-endif
-EXT := $(DIST)/multiwriter.$(EXT_SUFFIX)
-EXT_OBJ := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/ext/%.o,$(ENGINE_SRC))
-$(BUILD)/ext/%.o: $(SRC_DIR)/%.c $(HEADERS)
-	@mkdir -p $(BUILD)/ext
-	$(CC) $(CFLAGS) -DMW_LOADABLE -fPIC -c $< -o $@
-$(EXT): $(EXT_OBJ)
-	@mkdir -p $(DIST)
-	$(CC) $^ -o $@ $(EXT_LDFLAGS)
-.PHONY: extension
-extension: $(EXT)
-# SQLite as it is in a host (no engine) for the test of the loaded extension
-$(BUILD)/sqlite3_plain.o: $(SQLITE_DIR)/sqlite3.c
-	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSQLITE_THREADSAFE=1 -w -c $< -o $@
-$(BUILD)/t_loadable.o: test/loadable.c test/mw_test.h $(HEADERS)
-	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
-$(DIST)/loadable: $(BUILD)/t_loadable.o $(BUILD)/sqlite3_plain.o
-	@mkdir -p $(DIST)
-	$(CC) $^ -o $@ -lpthread -lm -ldl
-.PHONY: test-loadable
-test-loadable: $(EXT) $(DIST)/loadable
-	./$(DIST)/loadable ./$(EXT)
+include mk/extension.mk
+include mk/package.mk
 
 clean:
 	rm -rf $(BUILD) $(DIST)

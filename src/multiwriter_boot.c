@@ -16,7 +16,7 @@
 #include "multiwriter.h"
 #include <stdlib.h>
 
-const char *mw_version (void) { return MW_VERSION; }
+MW_API const char *mw_version (void) { return MW_VERSION; }
 
 #ifdef MW_LOADABLE
 SQLITE_EXTENSION_INIT1
@@ -33,14 +33,8 @@ static int load (sqlite3 *db, char **err, const sqlite3_api_routines *api, int m
     if (rc == SQLITE_OK) rc = sqlite3_create_function(db, "mw_version_number", 0, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_version_number, NULL, NULL);
     return rc == SQLITE_OK ? SQLITE_OK_LOAD_PERMANENTLY : rc;    // (the VFS lives in this library: it must never be unloaded)
 }
-#ifdef _WIN32
-__declspec(dllexport)
-#endif
-int sqlite3_multiwriter_init (sqlite3 *db, char **err, const sqlite3_api_routines *api) { return load(db, err, api, 0); }
-#ifdef _WIN32
-__declspec(dllexport)
-#endif
-int sqlite3_multiwriter_default_init (sqlite3 *db, char **err, const sqlite3_api_routines *api) { return load(db, err, api, 1); }
+MW_API int sqlite3_multiwriter_init (sqlite3 *db, char **err, const sqlite3_api_routines *api) { return load(db, err, api, 0); }
+MW_API int sqlite3_multiwriter_default_init (sqlite3 *db, char **err, const sqlite3_api_routines *api) { return load(db, err, api, 1); }
 #else
 int mw_extra_init (const char *unused) {
     (void)unused;

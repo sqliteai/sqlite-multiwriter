@@ -15,7 +15,7 @@ static int open_lane (const char *path, sqlite3 **db) {
 }
 int main (void) {
     char path[300]; mw_tmpdb(path, sizeof path, "syfail");
-    { sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    { sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
       CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)"), SQLITE_OK); sqlite3_close(s); }
     sqlite3 *p; CHECK_RC(open_lane(path, &p), SQLITE_OK);
     CHECK_RC(mw_exec(p, "INSERT INTO t VALUES(1, 'a')"), SQLITE_OK);

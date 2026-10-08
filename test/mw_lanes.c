@@ -28,7 +28,7 @@ int main (void) {
 
     // schema + base data through a stock connection on the underlying VFS
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); CREATE TABLE big(id INTEGER PRIMARY KEY, v TEXT);"
                         "INSERT INTO t VALUES(1,'a'),(2,'b'),(3,'c')"), SQLITE_OK);
     sqlite3_close(s);
@@ -106,7 +106,7 @@ int main (void) {
     sqlite3_close(a); sqlite3_close(b);
     CHECK(file_hash(path) != h0);            // the last close compacted the committed state into the real file (phase 18)
     sqlite3 *chk;                             // ... which is an ordinary database again, readable by stock SQLite
-    CHECK_RC(sqlite3_open_v2(path, &chk, SQLITE_OPEN_READONLY, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &chk, SQLITE_OPEN_READONLY, MW_PLAIN_VFS), SQLITE_OK);
     CHECK(mw_scalar(chk, "SELECT count(*) FROM big") == 400);
     CHECK(mw_scalar(chk, "PRAGMA integrity_check") != -1);
     sqlite3_close(chk);

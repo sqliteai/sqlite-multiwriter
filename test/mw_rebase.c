@@ -19,7 +19,7 @@ static int integrity_ok (sqlite3 *db) {
 }
 static int is_conflict (int rc) { return (rc & 0xff) == SQLITE_BUSY; }
 static void make (const char *path, const char *ddl) {
-    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL"), SQLITE_OK);
     CHECK_RC(mw_exec(s, ddl), SQLITE_OK);
     sqlite3_close(s);
@@ -190,7 +190,7 @@ int main (void) {
     // 10. rows written before an ALTER TABLE ADD COLUMN have fewer columns than the table: the missing ones are the defaults, in the comparison and in the replay
     {
         mw_tmpdb(path, sizeof path, "rebase10"); make(path, TBL);
-        sqlite3 *x; CHECK_RC(sqlite3_open_v2(path, &x, SQLITE_OPEN_READWRITE, "unix"), SQLITE_OK);
+        sqlite3 *x; CHECK_RC(sqlite3_open_v2(path, &x, SQLITE_OPEN_READWRITE, MW_PLAIN_VFS), SQLITE_OK);
         CHECK_RC(mw_exec(x, "ALTER TABLE t ADD COLUMN z INTEGER DEFAULT 7; ALTER TABLE t ADD COLUMN s TEXT DEFAULT 'hi'; ALTER TABLE t ADD COLUMN f REAL DEFAULT 2.5; ALTER TABLE t ADD COLUMN k BLOB"), SQLITE_OK);
         sqlite3_close(x);
         sqlite3 *a, *b; CHECK_RC(open_mw(path, &a, 1), SQLITE_OK); CHECK_RC(open_mw(path, &b, 1), SQLITE_OK);

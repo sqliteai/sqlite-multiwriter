@@ -55,7 +55,7 @@ static void run (const char *table, int tracked) {
     mw_tmpdb(path, sizeof path, "rowid");
     g_path = path; g_table = table;
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL;"
         "CREATE TABLE tr(id INTEGER PRIMARY KEY, v TEXT); CREATE TABLE ta(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);"
         "CREATE TABLE tu(id INTEGER PRIMARY KEY, v TEXT);"
@@ -100,7 +100,7 @@ int main (void) {
     {
         char path[256]; mw_tmpdb(path, sizeof path, "rowid0");
         sqlite3 *s, *a;
-        sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix");
+        sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS);
         mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE tr(id INTEGER PRIMARY KEY, v TEXT)");
         close_cs(s);
         open_lane(path, &a);

@@ -33,7 +33,7 @@ static int exec_retry (sqlite3 *db, const char *sql) { for (int i = 0; i < 1000;
 
 #define NROWS 200
 static void make_db (const char *path) {
-    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, s TEXT)"), SQLITE_OK);
     sqlite3_close(s);
     sqlite3 *db; CHECK_RC(open_db(path, &db, false), SQLITE_OK);

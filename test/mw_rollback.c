@@ -12,7 +12,7 @@ static int open_lane (const char *path, sqlite3 **db) {
 }
 int main (void) {
     char path[300]; mw_tmpdb(path, sizeof path, "rollback");
-    { sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    { sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
       CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)"), SQLITE_OK); sqlite3_close(s); }
     sqlite3 *a, *b; CHECK_RC(open_lane(path, &a), SQLITE_OK); CHECK_RC(open_lane(path, &b), SQLITE_OK);
     for (int i = 0; i < 20; i++) { char q[100]; snprintf(q, sizeof q, "INSERT INTO t VALUES(%d, 'x')", i); CHECK_RC(mw_exec(a, q), SQLITE_OK); }

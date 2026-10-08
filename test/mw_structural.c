@@ -61,7 +61,7 @@ int main (void) {
     mw_tmpdb(path, sizeof path, "struct");
     g_path = path;
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE docs(id TEXT PRIMARY KEY NOT NULL, title TEXT, owner INTEGER, body BLOB);"
                         "CREATE INDEX docs_title ON docs(title); CREATE INDEX docs_owner ON docs(owner);"), SQLITE_OK);
     // seed so that splits/merges happen inside an existing tree, not only at the right edge

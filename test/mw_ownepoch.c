@@ -11,7 +11,7 @@ static int open_lane (const char *path, sqlite3 **db) {
 }
 int main (void) {
     char path[300]; mw_tmpdb(path, sizeof path, "ownepoch");
-    { sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    { sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
       CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t1(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER); CREATE TABLE t2(id INTEGER PRIMARY KEY, v INTEGER); CREATE TABLE big(id INTEGER PRIMARY KEY, x TEXT);"
                           "INSERT INTO t1 VALUES(1, 0, 0); INSERT INTO t2 VALUES(1, 0); INSERT INTO big VALUES(1, 'a'), (2, 'b'), (3, 'c')"), SQLITE_OK); sqlite3_close(s); }
     sqlite3 *a, *b; CHECK_RC(open_lane(path, &a), SQLITE_OK); CHECK_RC(open_lane(path, &b), SQLITE_OK);

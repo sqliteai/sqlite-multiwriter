@@ -29,7 +29,18 @@ static void mw_dump_handler (int sig) {
 __attribute__((constructor)) static void mw_dump_init (void) { signal(SIGUSR1, mw_dump_handler); }
 #endif
 
+// the VFS of the platform, to make a database that the engine has not touched
+#ifdef _WIN32
+#define MW_PLAIN_VFS "win32"
+#else
+#define MW_PLAIN_VFS "unix"
+#endif
+
 static int mw_failures = 0;
+
+// MW_LOG=1 prints what SQLite and the engine write to the SQLite log (sqlite3_log), for a test that fails somewhere that its exit codes do not say
+static void mw_log_cb (void *arg, int code, const char *msg) { (void)arg; fprintf(stderr, "[sqlite log %d] %s\n", code, msg); }
+__attribute__((constructor)) static void mw_log_init (void) { if (getenv("MW_LOG")) sqlite3_config(SQLITE_CONFIG_LOG, mw_log_cb, NULL); }
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); mw_failures++; } } while (0)
 #define CHECK_RC(rc, want) do { int _r = (rc); if (_r != (want)) { printf("FAIL %s:%d: %s = %d (want %d)\n", __FILE__, __LINE__, #rc, _r, (int)(want)); mw_failures++; } } while (0)
 

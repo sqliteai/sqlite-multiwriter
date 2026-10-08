@@ -39,7 +39,7 @@ int main (void) {
     mw_tmpdb(path, sizeof path, "gc");
     g_path = path;
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);"
                         "INSERT INTO t VALUES(1,0),(2,0);"
                         "CREATE TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER); INSERT INTO acct VALUES(1,500),(2,500)"), SQLITE_OK);

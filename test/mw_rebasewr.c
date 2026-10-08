@@ -40,13 +40,13 @@ static void *work (void *arg) {
 
 int main (void) {
     char path[256]; mw_tmpdb(path, sizeof path, "rebasewr"); g_path = path;
-    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(k1 INTEGER, k2 TEXT, v INTEGER, pad BLOB, PRIMARY KEY(k1, k2)) WITHOUT ROWID; CREATE INDEX tv ON t(v)"), SQLITE_OK);
     sqlite3_close(s);
     static worker_t w[NT]; pthread_t th[NT];
     for (int i = 0; i < NT; i++) { w[i].id = i; w[i].rng = 77u + 1013u * (unsigned)i; pthread_create(&th[i], NULL, work, &w[i]); }
     for (int i = 0; i < NT; i++) pthread_join(th[i], NULL);
-    sqlite3 *c; CHECK_RC(sqlite3_open_v2(path, &c, SQLITE_OPEN_READWRITE, "unix"), SQLITE_OK);
+    sqlite3 *c; CHECK_RC(sqlite3_open_v2(path, &c, SQLITE_OPEN_READWRITE, MW_PLAIN_VFS), SQLITE_OK);
     long rows = 0, wrong = 0, expected = 0, committed = 0, refused = 0;
     for (int i = 0; i < NT; i++) { committed += w[i].committed; refused += w[i].refused; for (int k = 0; k < KEYS; k++) if (w[i].exists[k]) expected++; }
     sqlite3_stmt *st; sqlite3_prepare_v2(c, "SELECT k1, k2, v FROM t", -1, &st, NULL);

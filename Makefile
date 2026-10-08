@@ -26,6 +26,9 @@ endif
 ifeq ($(PLATFORM),linux-musl)
 CFLAGS += -D_GNU_SOURCE
 endif
+ifeq ($(PLATFORM),windows)
+LDFLAGS += -static          # (no DLL of MinGW next to the programs)
+endif
 
 ENGINE_SRC := $(wildcard $(SRC_DIR)/*.c)
 ENGINE_OBJ := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(ENGINE_SRC))
@@ -35,7 +38,7 @@ LIB_OBJ := $(ENGINE_OBJ) $(BUILD)/sqlite3.o
 TEST_SRC := $(wildcard test/mw_*.c)
 ifeq ($(PLATFORM),windows)
 # the tests that fork, wait for processes, map files or set the environment of a child are not for Windows (docs/windows.md)
-TEST_SRC := $(filter-out $(shell grep -lE 'sys/wait.h|sys/mman.h|fork|setenv' $(TEST_SRC)),$(TEST_SRC))
+TEST_SRC := $(filter-out $(shell grep -lE 'sys/wait.h|sys/mman.h|fork|setenv' $(TEST_SRC)) test/mw_relocprep.c,$(TEST_SRC))
 endif
 TEST_BIN := $(patsubst test/%.c,$(DIST)/%$(EXE),$(TEST_SRC))
 IO_TESTS := $(DIST)/mw_ioerr$(EXE) $(DIST)/mw_diskfull$(EXE)                       # (minutes: make test-io)

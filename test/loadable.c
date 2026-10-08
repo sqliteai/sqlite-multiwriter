@@ -11,12 +11,12 @@ static void *writer (void *arg) {
     long id = (long)arg; sqlite3 *db; char uri[400];
     snprintf(uri, sizeof uri, "file:%s?vfs=multiwriter&mw=2&mw_rebase=1", g_path_db);
     if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { mw_failures++; return NULL; }
-    sqlite3_busy_timeout(db, 0);
+    sqlite3_busy_timeout(db, 0); sqlite3_extended_result_codes(db, 1);
     for (int i = 0; i < ROWS; i++) {
         char sql[200]; snprintf(sql, sizeof sql, "INSERT INTO t(id, w, v) VALUES(%ld, %ld, %d)", id * 100000 + i, id, i);
         int rc; int tries = 0;
         do { rc = mw_exec(db, sql); } while ((rc & 0xff) == SQLITE_BUSY && ++tries < 100000);
-        if (rc != SQLITE_OK) { mw_failures++; break; }
+        if (rc != SQLITE_OK) { printf("writer %ld: insert %d failed: %d %s\n", id, i, rc, sqlite3_errmsg(db)); mw_failures++; break; }
     }
     sqlite3_close(db); return NULL;
 }

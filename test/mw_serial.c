@@ -288,7 +288,7 @@ static int final_check (const char *path, model *M, long *rows_out, long *model_
 
 static void make_db (const char *path, int nslots) {
     { char fn[400]; for (int slot = 0; slot < 32; slot++) { snprintf(fn, sizeof fn, "%s.rec%d", path, slot); unlink(fn); } }      // (the record files of a run that was killed: a process number that is used again gives the same path, and its records would be replayed into this run)
-    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, (g_wr || getenv("MW_SERIAL_WR")) ? "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL, u INTEGER UNIQUE, p BLOB NOT NULL, w INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID; CREATE TABLE txlog(slot INTEGER PRIMARY KEY, seq INTEGER NOT NULL, pad BLOB NOT NULL)"       // (MW_SERIAL_WR: the table is a WITHOUT ROWID table; the rebase replays it by its key)
                                 : "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL, u INTEGER UNIQUE, p BLOB NOT NULL, w INTEGER NOT NULL DEFAULT 0); CREATE TABLE txlog(slot INTEGER PRIMARY KEY, seq INTEGER NOT NULL, pad BLOB NOT NULL)"), SQLITE_OK);
     for (int i = 0; i < nslots; i++) { char q[120]; snprintf(q, sizeof q, "INSERT INTO txlog VALUES(%d, 0, zeroblob(3500))", i); CHECK_RC(mw_exec(s, q), SQLITE_OK); }          // (a row a page: the processes never conflict on it)

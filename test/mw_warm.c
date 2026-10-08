@@ -14,7 +14,7 @@ static int open_lane (const char *path, sqlite3 **db) {
 static void setup (char *path, const char *tag) {
     mw_tmpdb(path, 256, tag);
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL;"
         "CREATE TABLE cells(id INTEGER PRIMARY KEY, v INTEGER, pad BLOB);"
         "INSERT INTO cells VALUES(1,1,zeroblob(3000)),(2,1,zeroblob(3000)),(3,100,zeroblob(3000)),(4,0,zeroblob(3000));"
@@ -54,7 +54,7 @@ int main (void) {
     setup(path, "warm3");
     open_lane(path, &a);
     char dst[300]; mw_tmpdb(dst, sizeof dst, "warm3dst"); sqlite3 *d;
-    CHECK_RC(sqlite3_open_v2(dst, &d, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(dst, &d, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     sqlite3_backup *bk = sqlite3_backup_init(d, "main", a, "main");
     int steps = 0, rc = SQLITE_OK;
     while (bk && steps < 400 && (rc = sqlite3_backup_step(bk, 1)) == SQLITE_OK) steps++;

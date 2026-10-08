@@ -18,7 +18,7 @@ static mw_db_stats stats (sqlite3 *db) { mw_db_stats s; memset(&s, 0, sizeof s);
 static void setup (const char *path) {
     char p[400]; snprintf(p, sizeof p, "%s-mw", path); unlink(p); snprintf(p, sizeof p, "%s-mwlock", path); unlink(p); snprintf(p, sizeof p, "%s-mwlk", path); unlink(p);
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, pad BLOB);"
                         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<64) INSERT INTO t SELECT i, 0, zeroblob(3000) FROM n"), SQLITE_OK);
     sqlite3_close(s);

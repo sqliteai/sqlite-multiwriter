@@ -21,4 +21,13 @@ any of that.
 
 ## What is tested
 
+On a Windows 10 (22H2, build 19045) machine, cross-built with MinGW-w64 and run there: the 31 test programs that do not fork pass (twice in a row), and the extension (`multiwriter.dll`) loads into a stock SQLite, registers the VFS and
+runs four writing threads (`test/loadable.c`). The program `mw_oslayer` checks the calls of `multiwriter_os_win.c` one by one: positional reads and writes, `ftruncate`, a rename over an open file, the delete of an open file and
+the reuse of its name at once, `flock` with its conversion, shared mappings, byte-range locks.
+
+Two things that Windows does differently showed up and are handled: a log that is mapped cannot be truncated (so the log of one process is not mapped on Windows), and `Sleep` rounds to the 15.6 ms tick of the system (the engine waits 50
+microseconds at a time in its back-off, so `nanosleep` and `usleep` use a high resolution waitable timer). The disks have a latency: a commit that is durable waits for `FlushFileBuffers`, tens of milliseconds on the machine used,
+and the tests that count commits in a second have a longer second there.
+
+
 The tests that do not use `fork()` run on Windows (`make test-ci PLATFORM=windows` in MSYS2); the tests of processes, of crashes and of kills (about twenty programs) use `fork`/`waitpid` and are not built there. The CI runs them on `windows-2022`.

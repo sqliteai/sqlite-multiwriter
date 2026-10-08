@@ -140,7 +140,7 @@ $(BUILD)/sqlite3_plain.o: $(SQLITE_DIR)/sqlite3.c
 $(BUILD)/t_loadable.o: test/loadable.c test/mw_test.h $(HEADERS)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
-LOADABLE_LIBS := -lpthread -lm $(if $(filter android,$(PLATFORM)),-ldl,$(if $(filter linux linux-musl,$(PLATFORM)),-ldl))
+LOADABLE_LIBS := $(if $(filter windows,$(PLATFORM)),-static) -lpthread -lm $(if $(filter android,$(PLATFORM)),-ldl,$(if $(filter linux linux-musl,$(PLATFORM)),-ldl))
 $(DIST)/loadable$(EXE): $(BUILD)/t_loadable.o $(BUILD)/sqlite3_plain.o
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LOADABLE_LIBS)

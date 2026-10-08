@@ -20,7 +20,7 @@ static int integrity_ok (sqlite3 *db) {
 }
 static void make_db (const char *path, const char *schema) {
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL"), SQLITE_OK);
     CHECK_RC(mw_exec(s, schema), SQLITE_OK);
     sqlite3_close(s);
@@ -106,7 +106,7 @@ int main (void) {
         CHECK(mw_scalar(b, "SELECT count(*) FROM t") == 36000 + 2 * rows);
         sqlite3_close(a); sqlite3_close(b);
         // a stock connection sees a valid database after everything was compacted into the real file
-        sqlite3 *s2; CHECK_RC(sqlite3_open_v2(path, &s2, SQLITE_OPEN_READWRITE, "unix"), SQLITE_OK);
+        sqlite3 *s2; CHECK_RC(sqlite3_open_v2(path, &s2, SQLITE_OPEN_READWRITE, MW_PLAIN_VFS), SQLITE_OK);
         CHECK(integrity_ok(s2)); CHECK(mw_scalar(s2, "SELECT count(*) FROM t") == 36000 + 2 * rows);
         sqlite3_close(s2);
         mw_rmdb(path);
@@ -159,7 +159,7 @@ int main (void) {
     // every row of every inserted transaction that was not deleted has the right length
     CHECK(mw_scalar(v, "SELECT count(*) FROM t WHERE length(v) < 0") == 0);
     sqlite3_close(v);
-    sqlite3 *s2; CHECK_RC(sqlite3_open_v2(path, &s2, SQLITE_OPEN_READWRITE, "unix"), SQLITE_OK);
+    sqlite3 *s2; CHECK_RC(sqlite3_open_v2(path, &s2, SQLITE_OPEN_READWRITE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK(integrity_ok(s2)); CHECK(mw_scalar(s2, "SELECT count(*) FROM t") == n_rows);
     sqlite3_close(s2);
     mw_rmdb(path);
@@ -211,7 +211,7 @@ int main (void) {
         CHECK(mw_scalar(a, "SELECT count(*) FROM (SELECT id FROM t ORDER BY id) WHERE id > 0") == 12000 + 3 * 40);
         CHECK(integrity_ok(a));
         sqlite3_close(a); sqlite3_close(b); sqlite3_close(c);
-        sqlite3 *s2; CHECK_RC(sqlite3_open_v2(path, &s2, SQLITE_OPEN_READWRITE, "unix"), SQLITE_OK);
+        sqlite3 *s2; CHECK_RC(sqlite3_open_v2(path, &s2, SQLITE_OPEN_READWRITE, MW_PLAIN_VFS), SQLITE_OK);
         CHECK(integrity_ok(s2)); CHECK(mw_scalar(s2, "SELECT count(*) FROM t") == 12000 + 3 * 40);
         sqlite3_close(s2);
         mw_rmdb(path);

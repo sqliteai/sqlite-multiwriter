@@ -43,7 +43,7 @@ static void *worker (void *arg) {
 
 static void run (const char *name, int delay_us, int hot, int need_rewrite) {
     char path[256]; mw_tmpdb(path, sizeof path, "relocprep");
-    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT, v BLOB); CREATE INDEX ik ON t(k); CREATE TABLE hot(id INTEGER PRIMARY KEY, n INTEGER); INSERT INTO hot VALUES(1, 0)"), SQLITE_OK);
     sqlite3_close(s);
     g_path = path; g_delay = delay_us; g_hot = hot; memset(tot, 0, sizeof tot);

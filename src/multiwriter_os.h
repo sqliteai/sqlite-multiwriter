@@ -45,6 +45,9 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <direct.h>
+#include <time.h>
+#include <pthread.h>
+#include <pthread_time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -102,6 +105,14 @@ int mw_win_unlink (const char *path);                      // the name is free a
 #define rename mw_win_rename
 #define unlink mw_win_unlink
 #define mkdir(path, mode) _mkdir(path)
+
+// sleeping: Sleep() rounds up to the 15.6 ms tick of the system, and the engine waits 50 microseconds at a time in its back-off: a high resolution waitable timer instead
+int mw_win_nanosleep (const struct timespec *req, struct timespec *rem);
+int mw_win_usleep (unsigned long us);
+#undef nanosleep
+#undef usleep
+#define nanosleep(req, rem) mw_win_nanosleep(req, rem)
+#define usleep(us) mw_win_usleep(us)
 
 // sysconf: the page size and the number of processors
 #define _SC_PAGESIZE 1

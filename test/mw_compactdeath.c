@@ -18,7 +18,7 @@ static int open_mp (const char *path, int compact_ms, sqlite3 **db) {
 int main (void) {
     setenv("MW_IDX_ENTRIES", "1500", 1);                              // (a small index: it is full 100 ms after the compaction stops)
     char path[256]; mw_tmpdb(path, sizeof path, "compdeath");
-    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)"), SQLITE_OK);
     for (int i = 1; i <= 40; i++) { char q[80]; snprintf(q, sizeof q, "INSERT INTO t VALUES(%d, 0)", i); mw_exec(s, q); }
     sqlite3_close(s);

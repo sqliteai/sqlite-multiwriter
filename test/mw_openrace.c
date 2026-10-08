@@ -12,7 +12,7 @@ static int open_mp (const char *path, sqlite3 **db) {
 
 int main (void) {
     char path[256]; mw_tmpdb(path, sizeof path, "openrace");
-    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v)"), SQLITE_OK); sqlite3_close(s);
     pid_t a = fork();
     if (a == 0) {                                                   // the first process: it takes 600 ms to finish the header

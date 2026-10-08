@@ -52,7 +52,7 @@ int main (void) {
     mw_tmpdb(path, sizeof path, "mpc"); snprintf(lp, sizeof lp, "%s-mw", path); snprintf(mp, sizeof mp, "%s-mwlock", path);
     unlink(lp); unlink(mp);
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, pad BLOB);"
                         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<64) INSERT INTO t SELECT i, 0, zeroblob(3000) FROM n;"
                         "CREATE TABLE items(id INTEGER PRIMARY KEY, n INTEGER); INSERT INTO items VALUES(1,1);"), SQLITE_OK);
@@ -85,7 +85,7 @@ int main (void) {
         total_prev = total;
         sqlite3_close(a);
     }
-    { char uri[300]; snprintf(uri, sizeof uri, "file:%s?immutable=1", path); sqlite3 *c; CHECK_RC(sqlite3_open_v2(uri, &c, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, "unix"), SQLITE_OK);
+    { char uri[300]; snprintf(uri, sizeof uri, "file:%s?immutable=1", path); sqlite3 *c; CHECK_RC(sqlite3_open_v2(uri, &c, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, MW_PLAIN_VFS), SQLITE_OK);
       CHECK(mw_scalar(c, "SELECT sum(v) FROM t") == total_prev); CHECK(integrity_ok(c)); sqlite3_close(c); }
 
     // ---- DDL from this process while three others insert: writers see retryable errors and continue; the index is complete

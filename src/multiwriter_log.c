@@ -427,6 +427,9 @@ void mw_log_remap (mw_db *db) {
     log_unmap(db, true);
     struct stat sb;
     db->logfile_size = fstat(db->logfd, &sb) == 0 ? log_usable(db, (uint64_t)sb.st_size) : 0;
+#ifdef _WIN32
+    if (!db->mp) { log_mapped(db, MAP_FAILED); return; }     // (no mapping of the log of one process: the file with a mapped view cannot be truncated, which compaction does; it is written with pwritev and read with pread)
+#endif
     void *m = mw_io_mmap(NULL, LOG_MAP_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, db->logfd, 0);
     log_mapped(db, m);
     mw_log_reserve_space(db);
@@ -634,7 +637,11 @@ static bool staged_mode (mw_db *db, int sync) {
         pthread_mutex_lock(&db->log_mu);
         m = atomic_load(&db->log_mode);
         if (m == 0) {
-            bool on = !db->mp && db->logfd >= 0 && !getenv("MW_LOG_STAGING_OFF") && stage_alloc(db);      // (every sync level; MW_LOG_STAGING_OFF selects the mapped log)
+            #ifdef _WIN32
+            bool on = !db->mp && db->logfd >= 0 && stage_alloc(db);                                      // (always staged: the mapped log is not there)
+#else
+            bool on = !db->mp && db->logfd >= 0 && !getenv("MW_LOG_STAGING_OFF") && stage_alloc(db);
+#endif      // (every sync level; MW_LOG_STAGING_OFF selects the mapped log)
             m = on ? 2 : 1;
             atomic_store_explicit(&db->log_mode, m, memory_order_release);
         }

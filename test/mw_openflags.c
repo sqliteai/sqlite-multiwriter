@@ -22,7 +22,7 @@ int main (void) {
     CHECK_RC(mw_exec(db, "INSERT INTO t VALUES(3)"), SQLITE_READONLY); sqlite3_close(db); db = NULL;
     mw_rmfiles(path);
     // 5. a rollback-mode file that is opened read-only is not changed (the conversion to WAL writes the file)
-    { sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    { sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
       CHECK_RC(mw_exec(s, "CREATE TABLE t(a); INSERT INTO t VALUES(1)"), SQLITE_OK); sqlite3_close(s); }
     struct stat a0, a1; stat(path, &a0); unsigned char h0[100], h1[100]; { FILE *f = fopen(path, "rb"); size_t n = fread(h0, 1, 100, f); (void)n; fclose(f); }
     int rc = sqlite3_open_v2(uri, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);

@@ -19,7 +19,7 @@ static mw_db_stats stats (sqlite3 *db) { mw_db_stats s; memset(&s, 0, sizeof s);
 static void setup (char *path, const char *tag) {
     mw_tmpdb(path, 256, tag);
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     // rows of `cells` are ~3000 bytes: one per leaf page, so "different rows" means "different pages"
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL;"
         "CREATE TABLE cells(id INTEGER PRIMARY KEY, v INTEGER, pad BLOB);"

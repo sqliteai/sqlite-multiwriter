@@ -26,7 +26,7 @@ static int integrity_ok (sqlite3 *db) {
 // Every transaction inserts 3 rows sharing a tag and bumps a counter: atomicity is checkable afterwards.
 static void make_db (const char *path) {
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE log(id INTEGER PRIMARY KEY, tag INTEGER, k INTEGER, pad BLOB);"
                         "CREATE TABLE ctr(id INTEGER PRIMARY KEY, n INTEGER); INSERT INTO ctr VALUES(1,0);"), SQLITE_OK);
     sqlite3_close(s);
@@ -98,7 +98,7 @@ static void verify (const char *path, int acked, int max_extra, const char *what
     CHECK_RC(mw_exec(db, "INSERT INTO log(tag,k,pad) VALUES(9999,0,zeroblob(10)),(9999,1,zeroblob(10)),(9999,2,zeroblob(10))"), SQLITE_OK);
     sqlite3_close(db);                                                    // clean close: compacts, removes the log
     sqlite3 *chk;
-    CHECK_RC(sqlite3_open_v2(path, &chk, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &chk, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, MW_PLAIN_VFS), SQLITE_OK);
     char q[200]; (void)q;
     CHECK(mw_scalar(chk, "SELECT count(*) FROM log") == rows + 3);         // stock SQLite sees everything
     CHECK(integrity_ok(chk));

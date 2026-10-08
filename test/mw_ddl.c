@@ -44,7 +44,7 @@ int main (void) {
     mw_tmpdb(path, sizeof path, "ddl");
     g_path = path;
     sqlite3 *s, *a, *b;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT); CREATE TABLE other(id INTEGER PRIMARY KEY, v INTEGER);"
                         "INSERT INTO other VALUES(1,0); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<500) INSERT INTO items SELECT i, 'seed'||i FROM n"), SQLITE_OK);
     sqlite3_close(s);

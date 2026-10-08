@@ -24,13 +24,13 @@ static int integrity_ok (sqlite3 *db) {
 static int64_t stock_scalar (const char *path, const char *sql, int *integrity) {         // the database file as an ordinary SQLite file (no Multi-Writer, no log)
     char uri[400]; snprintf(uri, sizeof uri, "file:%s?immutable=1", path);
     sqlite3 *c; int64_t v = -1;
-    if (sqlite3_open_v2(uri, &c, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, "unix") == SQLITE_OK) { v = mw_scalar(c, sql); if (integrity) *integrity = integrity_ok(c); }
+    if (sqlite3_open_v2(uri, &c, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, MW_PLAIN_VFS) == SQLITE_OK) { v = mw_scalar(c, sql); if (integrity) *integrity = integrity_ok(c); }
     sqlite3_close(c);
     return v;
 }
 static void make_db (const char *path, const char *extra_sql) {
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, pad BLOB);"
                         "CREATE TABLE acct(id INTEGER PRIMARY KEY, bal INTEGER); CREATE TABLE log(seq INTEGER PRIMARY KEY, who INTEGER, pad BLOB);"), SQLITE_OK);
     CHECK_RC(mw_exec(s, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<40) INSERT INTO acct SELECT i, 1000 FROM n"), SQLITE_OK);

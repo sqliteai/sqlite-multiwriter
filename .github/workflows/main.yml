@@ -25,6 +25,7 @@ jobs:
     timeout-minutes: 45
     env:
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      TMPDIR: ${{ runner.temp }}          # (where the tests make their databases; a native Windows program has no /tmp)
     strategy:
       fail-fast: false
       matrix:

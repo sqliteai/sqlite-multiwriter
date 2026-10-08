@@ -66,7 +66,7 @@ static void stacked_run (int sect, int pgsz) {
     sector = sect;
     char path[256], uri[400]; mw_tmpdb(path, sizeof path, "stacked");
     snprintf(uri, sizeof uri, "file:%s?mw=2", path);
-    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     char q[100]; snprintf(q, sizeof q, "PRAGMA page_size=%d; PRAGMA journal_mode=WAL;", pgsz);
     CHECK_RC(mw_exec(s, q), SQLITE_OK); CHECK_RC(sqlite3_close(s), SQLITE_OK);
     sqlite3 *db; CHECK_RC(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, "shim"), SQLITE_OK);

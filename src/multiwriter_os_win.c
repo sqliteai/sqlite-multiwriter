@@ -26,6 +26,8 @@
 #undef flock
 #undef fcntl
 #undef sysconf
+#undef nanosleep
+#undef usleep
 
 // ---- errors ----
 static int win_errno (DWORD e) {
@@ -42,7 +44,14 @@ static int win_errno (DWORD e) {
         default: return EIO;
     }
 }
-static int fail (void) { errno = win_errno(GetLastError()); return -1; }
+static int os_trace = -1;
+static int fail_at (const char *what) {
+    DWORD e = GetLastError();
+    if (os_trace < 0) os_trace = getenv("MW_OS_TRACE") != NULL;
+    if (os_trace) fprintf(stderr, "multiwriter os: %s failed, Windows error %lu\n", what, (unsigned long)e);
+    errno = win_errno(e); return -1;
+}
+#define fail() fail_at(__func__)
 
 // ---- names: UTF-8 to UTF-16, with the prefix that lifts the limit of 260 characters on an absolute path ----
 static wchar_t *wide_path (const char *p) {
@@ -69,7 +78,7 @@ int mw_win_open (const char *path, int flags, ...) {
     DWORD disp = (flags & O_CREAT) ? ((flags & O_EXCL) ? CREATE_NEW : OPEN_ALWAYS) : OPEN_EXISTING;
     HANDLE h = CreateFileW(w, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, disp, FILE_ATTRIBUTE_NORMAL, NULL);
     free(w);
-    if (h == INVALID_HANDLE_VALUE) return fail();
+    if (h == INVALID_HANDLE_VALUE) { int r = fail(); if (os_trace > 0) fprintf(stderr, "multiwriter os:   open(%s, flags %#x)\n", path, flags); return r; }
     if ((flags & O_TRUNC) && (access & GENERIC_WRITE)) {
         LARGE_INTEGER z; z.QuadPart = 0;
         if (!SetFilePointerEx(h, z, NULL, FILE_BEGIN) || !SetEndOfFile(h)) { int e = win_errno(GetLastError()); CloseHandle(h); errno = e; return -1; }
@@ -166,7 +175,9 @@ out:
 int mw_win_reserve (int fd, uint64_t to) {
     HANDLE h = HANDLE_OF(fd); if (h == INVALID_HANDLE_VALUE) return EBADF;
     FILE_ALLOCATION_INFO ai; ai.AllocationSize.QuadPart = (LONGLONG)to;
-    return SetFileInformationByHandle(h, FileAllocationInfo, &ai, sizeof ai) ? 0 : win_errno(GetLastError());
+    if (SetFileInformationByHandle(h, FileAllocationInfo, &ai, sizeof ai)) return 0;
+    if (GetLastError() == ERROR_USER_MAPPED_FILE) return 0;   // (a file with a mapped view cannot have its allocation changed: nothing is reserved, as on a system that has no such call)
+    fail(); return errno;
 }
 
 long mw_win_sysconf (int name) {
@@ -175,6 +186,31 @@ long mw_win_sysconf (int name) {
     if (name == _SC_NPROCESSORS_ONLN) return (long)si.dwNumberOfProcessors;
     errno = EINVAL; return -1;
 }
+
+// ---- sleeping ----
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+static DWORD timer_slot = FLS_OUT_OF_INDEXES; static INIT_ONCE timer_once = INIT_ONCE_STATIC_INIT;
+static VOID WINAPI timer_free (PVOID h) { if (h) CloseHandle((HANDLE)h); }
+static BOOL CALLBACK timer_init (PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p; (void)c; timer_slot = FlsAlloc(timer_free); return TRUE; }
+int mw_win_nanosleep (const struct timespec *req, struct timespec *rem) {
+    if (rem) { rem->tv_sec = 0; rem->tv_nsec = 0; }
+    InitOnceExecuteOnce(&timer_once, timer_init, NULL, NULL);
+    HANDLE t = timer_slot == FLS_OUT_OF_INDEXES ? NULL : (HANDLE)FlsGetValue(timer_slot);
+    if (!t) {
+        t = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);      // (Windows 10 1803 and later)
+        if (!t) t = CreateWaitableTimerW(NULL, TRUE, NULL);
+        if (t && timer_slot != FLS_OUT_OF_INDEXES) FlsSetValue(timer_slot, t);
+    }
+    long long ns = (long long)req->tv_sec * 1000000000LL + req->tv_nsec;
+    if (!t) { Sleep((DWORD)((ns + 999999) / 1000000)); return 0; }
+    LARGE_INTEGER due; due.QuadPart = -(ns / 100 > 0 ? ns / 100 : 1);                  // (relative, in 100 ns)
+    if (!SetWaitableTimer(t, &due, 0, NULL, NULL, FALSE)) { Sleep((DWORD)((ns + 999999) / 1000000)); return 0; }
+    WaitForSingleObject(t, INFINITE);
+    return 0;
+}
+int mw_win_usleep (unsigned long us) { struct timespec ts = { (time_t)(us / 1000000UL), (long)(us % 1000000UL) * 1000L }; return mw_win_nanosleep(&ts, NULL); }
 
 // ---- mappings ----
 // A view of a file is released with UnmapViewOfFile(base); memory (MAP_ANON) with VirtualFree: the second kind is remembered.
@@ -199,6 +235,8 @@ void *mw_win_mmap (void *addr, size_t len, int prot, int flags, int fd, off_t of
     HANDLE h = HANDLE_OF(fd); if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return MAP_FAILED; }
     bool wr = (prot & PROT_WRITE) != 0;
     uint64_t maxsz = (uint64_t)off + len;
+    LARGE_INTEGER fsz; if (!GetFileSizeEx(h, &fsz)) { fail(); return MAP_FAILED; }
+    if (maxsz > (uint64_t)fsz.QuadPart) { errno = ENXIO; return MAP_FAILED; }     // (a mapping beyond the end of the file would make the file longer here; POSIX leaves the rest unusable)
     HANDLE m = CreateFileMappingW(h, NULL, wr ? PAGE_READWRITE : PAGE_READONLY, (DWORD)(maxsz >> 32), (DWORD)(maxsz & 0xffffffffu), NULL);
     if (!m) { fail(); return MAP_FAILED; }
     void *p = MapViewOfFile(m, wr ? FILE_MAP_WRITE : FILE_MAP_READ, (DWORD)((uint64_t)off >> 32), (DWORD)((uint64_t)off & 0xffffffffu), len);

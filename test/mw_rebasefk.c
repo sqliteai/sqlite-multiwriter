@@ -13,7 +13,7 @@ static mw_db_stats stats (sqlite3 *db) { mw_db_stats s; memset(&s, 0, sizeof s);
 static int is_conflict (int rc) { return (rc & 0xff) == SQLITE_BUSY; }
 static int64_t violations (sqlite3 *db) { return mw_scalar(db, "SELECT count(*) FROM pragma_foreign_key_check"); }
 static void make (const char *path, const char *ddl) {
-    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL"), SQLITE_OK);
     CHECK_RC(mw_exec(s, ddl), SQLITE_OK);
     sqlite3_close(s);

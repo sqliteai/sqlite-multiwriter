@@ -10,7 +10,7 @@ static int open_lane (const char *path, sqlite3 **db, const char *extra) {
 }
 int main (void) {
     char path[300]; mw_tmpdb(path, sizeof path, "profile");
-    { sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    { sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
       CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"), SQLITE_OK); sqlite3_close(s); }
     sqlite3 *db; CHECK_RC(open_lane(path, &db, "&mw_profile=small&mw_log_max_mb=1"), SQLITE_OK);
     for (int t = 0; t < 300; t++) {

@@ -35,7 +35,7 @@ static int open_db (const char *path, int mp, sqlite3 **db) {
 // a database with 30 commits in its log, left by a process that died (no close: nothing is folded into the file)
 static void make_log (const char *path, int mp) {
     mw_rmfiles(path);
-    sqlite3 *s; sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"); mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v)"); sqlite3_close(s);
+    sqlite3 *s; sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS); mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v)"); sqlite3_close(s);
     pid_t p = fork();
     if (p == 0) { sqlite3 *db; if (open_db(path, mp, &db) != SQLITE_OK) _exit(2); for (int i = 1; i <= 30; i++) { char q[80]; snprintf(q, sizeof q, "INSERT INTO t VALUES(%d, 'x%d')", i, i); if (mw_exec(db, q) != SQLITE_OK) _exit(3); } _exit(0); }
     int st; waitpid(p, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);

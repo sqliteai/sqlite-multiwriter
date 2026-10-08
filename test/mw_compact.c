@@ -21,7 +21,7 @@ static int integrity_ok (sqlite3 *db) {
 static int64_t stock_scalar (const char *path, const char *sql, int *integrity) {
     char uri[400]; snprintf(uri, sizeof uri, "file:%s?immutable=1", path);      // the real file only: no -wal/-shm, no log
     sqlite3 *c; int64_t v = -1;
-    if (sqlite3_open_v2(uri, &c, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, "unix") == SQLITE_OK) {
+    if (sqlite3_open_v2(uri, &c, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, MW_PLAIN_VFS) == SQLITE_OK) {
         v = mw_scalar(c, sql);
         if (integrity) *integrity = integrity_ok(c);
     }
@@ -50,7 +50,7 @@ int main (void) {
     g_path = path;
     char lp[300]; snprintf(lp, sizeof lp, "%s-mw", path); unlink(lp);
     sqlite3 *s;
-    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
+    CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, pad BLOB);"
                         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<64) INSERT INTO t SELECT i, 0, zeroblob(3000) FROM n"), SQLITE_OK);
     sqlite3_close(s);
@@ -101,7 +101,12 @@ int main (void) {
     enum { NT = 6 };
     pthread_t th[NT]; worker_t w[NT];
     for (int i = 0; i < NT; i++) { w[i] = (worker_t){ .id = 1 + i * 10 }; pthread_create(&th[i], NULL, writer, &w[i]); }
-    struct timespec ts = { 1, 0 }; nanosleep(&ts, NULL);
+    #ifdef _WIN32
+    struct timespec ts = { 10, 0 };       // (FlushFileBuffers of a disk takes tens of milliseconds: a second is not enough commits)
+#else
+    struct timespec ts = { 1, 0 };
+#endif
+    nanosleep(&ts, NULL);
     stop_flag = 1;
     long commits = 0;
     for (int i = 0; i < NT; i++) { pthread_join(th[i], NULL); commits += w[i].commits; }

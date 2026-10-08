@@ -750,15 +750,15 @@ int mw_lane_open_main (mw_file *f, mw_lane *lane) {
 
     sqlite3_mutex_enter(db->mu);
     if (!db->store) {
-        db->store = db->shared ? mw_store_create_light(pgsz, (uint32_t)(size / pgsz)) : mw_store_create(pgsz, (uint32_t)(size / pgsz));
+        db->store = db->mp_req ? mw_store_create_light(pgsz, (uint32_t)(size / pgsz)) : mw_store_create(pgsz, (uint32_t)(size / pgsz));
         if (db->store && db->base_cache_bytes) db->store->base_limit = db->base_cache_bytes;
         if (!db->store) rc = SQLITE_NOMEM;
         else {
             db->store->reserved = h[20];
             if (db->mp_req) rc = mw_mp_open(db);                // shared header + lock file (first process initialises it)
-            if (rc == SQLITE_OK) rc = db->shared ? mw_shared_open(db) : mw_log_open(db, pgsz);    // create the commit log or recover committed state from it
+            if (rc == SQLITE_OK) rc = db->mp_req ? mw_shared_open(db) : mw_log_open(db, pgsz);    // create the commit log or recover committed state from it
             if (rc == SQLITE_OK && db->mp) rc = mw_mp_finish_open(db);
-            if (rc == SQLITE_OK && db->shared) rc = mw_shared_open_finish(db);
+            if (rc == SQLITE_OK && db->mp_req) rc = mw_shared_open_finish(db);
             if (rc != SQLITE_OK) { mw_store_free(db->store); db->store = NULL; }
         }
     } else if (db->store->pgsz != pgsz) rc = SQLITE_MISUSE;

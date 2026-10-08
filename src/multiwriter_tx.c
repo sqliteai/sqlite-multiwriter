@@ -275,7 +275,7 @@ void mw_lane_fill_stats (mw_lane *lane, mw_db_stats *st) {
     pthread_mutex_lock(&db->log_mu);
     const uint64_t base_epoch = db->base_epoch;                     // (written under log_mu)
     pthread_mutex_unlock(&db->log_mu);
-    if (db->shared) { st->epoch = atomic_load(&db->shm->committed_epoch); st->base_epoch = atomic_load(&db->shm->base_epoch); }   // (shared mode: the state is the shared one, not this process's)
+    if (db->mp_req) { st->epoch = atomic_load(&db->shm->committed_epoch); st->base_epoch = atomic_load(&db->shm->base_epoch); }   // (shared mode: the state is the shared one, not this process's)
     else st->base_epoch = base_epoch;
     st->compaction_backlog = st->epoch - st->base_epoch;
     st->log_bytes = mw_log_end_locked(db);

@@ -353,7 +353,6 @@ struct mw_db {
     _Atomic bool      open_done;           // the first connection finished opening (a database whose open failed has nothing to flush)
     _Atomic int       mp_nprocs;           // processes registered on this database, as last counted by the admission control
     bool              compact_claimed;     // this process holds the compaction claim (shared mode)
-    bool              shared;              // multi-process in shared mode (mw_mp=2): shared version index + segmented log, no private store
     struct mw_seglog *sl;                  // the segmented log (shared mode)
     shidx            *ix;                  // the shared version index (shared mode)
     bool              mp_stale_owner;      // the header said that the publication lock was held by our own pid when we registered: a process that died with it (repaired once the database is open)
@@ -364,7 +363,6 @@ struct mw_db {
     char             *mp_path, *mp_pubpath;
     mw_shm           *shm;
     pthread_mutex_t   mp_mu;               // serialises publication and catch-up inside this process
-    uint64_t          mp_gen, mp_base_seen;
     _Atomic int       failed;              // sticky I/O failure: no further commits
     _Atomic uint64_t  next_epoch;          // last *assigned* epoch (>= epoch; the difference is in-flight commits)
     _Atomic uint64_t  n_pages_published, n_log_sync_ns;
@@ -515,12 +513,9 @@ void      mw_mp_lock (mw_db *db);                      // publication lock (in-p
 void      mw_mp_unlock (mw_db *db);
 bool      mw_mp_pid_alive (mw_db *db, int32_t pid);
 int       mw_db_publish_finish (mw_db *db, mw_lane *lane, int rc, uint64_t epoch, int sync);   // after a publish with lane->mp_held: unlock, gate exit, cross-process group sync
-void      mw_log_fill_hold (mw_db *db);                // (multi-process) keep the prefiller out while the log file is replaced
-void      mw_log_fill_release (mw_db *db);
 void      mw_log_prefill_bg (mw_db *db);               // multi-process: keep the log file written ahead of its end, outside the publication lock
 int       mw_mp_admit (mw_lane *lane);                 // wait for an admission slot (bounded); the slot is released by mw_mp_admit_release
 void      mw_mp_admit_release (mw_lane *lane);
-void      mw_mp_publish_header (mw_db *db, uint64_t epoch);   // after the record is durable: make it visible to other processes
 int       mw_mp_slot_alloc (mw_db *db);
 void      mw_mp_slot_free (mw_db *db, int slot);
 uint64_t  mw_mp_global_oldest (mw_db *db);             // min snapshot over every live process (compaction target)
@@ -545,7 +540,7 @@ uint64_t  mw_log_header_base (mw_db *db);
 void      mw_store_flush (mw_store *st, uint32_t base_dbsize, uint64_t epoch);
 
 // registry
-mw_db  *mw_db_acquire (const char *path, int mode, int mpmode);   // mpmode: 0 single process, 1 multi-process (private stores), 2 multi-process shared mode   // NULL on OOM or if the file is already open in another mode
+mw_db  *mw_db_acquire (const char *path, int mode, bool mp);   // mp: several processes (shared mode)   // NULL on OOM or if the file is already open in another mode
 void    mw_db_release (mw_db *db);
 
 // snapshots (multiwriter_tx.c)
@@ -591,7 +586,7 @@ static inline bool mw_knob_flag (_Atomic int *cache, const char *name) {        
 uint64_t mw_seglog_bytes (mw_db *db);
 static inline uint64_t mw_log_end_locked (mw_db *db) {
     if (!db->store) return 0;                                       // (no private lanes, no log)
-    if (db->shared) return mw_seglog_bytes(db);                     // (the shared mode keeps its log in segments: log_off is not used there)
+    if (db->mp_req) return mw_seglog_bytes(db);                     // (the shared mode keeps its log in segments: log_off is not used there)
     mw_spinlock(&db->store->seq_mu);
     uint64_t v = db->log_off;
     pthread_mutex_unlock(&db->store->seq_mu);
@@ -613,7 +608,7 @@ int       mw_shared_sync (mw_db *db, mw_lane *lane);
 int       mw_shared_compact (mw_db *db, mw_compact_result *out);
 bool      mw_shared_compact_claim (mw_db *db, bool by_size);        // election: one process (the first to claim) runs the next background compaction
 uint64_t  mw_snap_for (const mw_validate *v, uint32_t pgno);              // the epoch a page is validated against (pages.c)
-static inline uint64_t mw_db_visible_epoch (mw_db *db) { return db->shared ? mw_shared_visible_epoch(db) : atomic_load(&db->epoch); }
+static inline uint64_t mw_db_visible_epoch (mw_db *db) { return db->mp_req ? mw_shared_visible_epoch(db) : atomic_load(&db->epoch); }
 
 // The log size at which compaction is requested. Many processes (> 16): 8 MB instead of the configured size: measured 8 MB vs 32 MB, 32 processes 10.2k -> 11.2k,
 // 64: 7.3k -> 8.2k tx/s (the mapping's working set stays in the caches), but 8 processes -8%.

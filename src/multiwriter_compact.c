@@ -34,7 +34,7 @@ static uint64_t now_ns (void) {
 }
 
 int mw_db_compact (mw_db *db, mw_compact_result *out) {
-    if (db->shared) return mw_shared_compact(db, out);
+    if (db->mp_req) return mw_shared_compact(db, out);
     mw_compact_result local;
     if (!out) out = &local;
     memset(out, 0, sizeof *out);
@@ -182,7 +182,7 @@ static void *compactor_main (void *arg) {
         if (atomic_load(&db->compactor_stop)) break;
         bool by_size = db->log_max_bytes && mw_log_end_locked(db) > mw_log_limit(db);
         if (db->compact_interval_ms > 0 || by_size) {
-            if (db->shared && !mw_shared_compact_claim(db, by_size)) continue;       // another process has the next one
+            if (db->mp_req && !mw_shared_compact_claim(db, by_size)) continue;       // another process has the next one
             mw_db_compact(db, NULL);
         }
     }

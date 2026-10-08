@@ -220,7 +220,7 @@ void mw_gate_close (mw_db *db, mw_lane *owner) {
     while (atomic_load(&db->gate_active) > 0) { sched_yield(); if (!warned && now_ns() - tg0 > 3000000000ull && mw_debug_on()) { warned = true; fprintf(stderr, "gate_close: stuck waiting for publishers (active=%d)\n", atomic_load(&db->gate_active)); } }             // let in-flight publishers finish
     // ... and let every epoch already assigned become visible, so the next snapshot is the final state
     // shared mode: commits are visible in one step under the publication lock; the local epoch counters do not follow other processes'
-    while (!db->shared && atomic_load(&db->epoch) != atomic_load(&db->next_epoch) && !atomic_load(&db->failed)) { sched_yield(); if (!warned && now_ns() - tg0 > 3000000000ull && mw_debug_on()) { warned = true; fprintf(stderr, "gate_close: stuck waiting for epoch %llu to become visible (next_epoch %llu)\n", (unsigned long long)atomic_load(&db->epoch), (unsigned long long)atomic_load(&db->next_epoch)); } }
+    while (!db->mp_req && atomic_load(&db->epoch) != atomic_load(&db->next_epoch) && !atomic_load(&db->failed)) { sched_yield(); if (!warned && now_ns() - tg0 > 3000000000ull && mw_debug_on()) { warned = true; fprintf(stderr, "gate_close: stuck waiting for epoch %llu to become visible (next_epoch %llu)\n", (unsigned long long)atomic_load(&db->epoch), (unsigned long long)atomic_load(&db->next_epoch)); } }
     atomic_fetch_add(&db->n_gate_closures, 1);
 }
 
@@ -470,7 +470,6 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
             return rc;
         }
     }
-    if (db->mp) mw_mp_publish_header(db, epoch);                 // visible to the other processes only now (durable first)
     mw_fault_hit(MW_CRASH_AFTER_LOG);
     uint64_t tv0 = MW_T0();
     rc = mw_db_make_visible(db, epoch);
@@ -537,7 +536,7 @@ int mw_db_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uint32_
     if (db->log_off > (1ull << 30) - (64ull << 20)) { mw_db_compactor_kick(db); return SQLITE_FULL; }   // the shared log must stay inside its mapping
     if (lane && lane->mp_held) {                                 // (relocation: gate and lock are ours already; the caller finishes with mw_db_publish_finish)
         uint64_t my_epoch = 0;
-        int rc = db->shared ? mw_shared_publish(db, lane, v, pgnos, images, n, ws_dbsize, snap_dbsize, sync, &my_epoch) : publish_impl(db, lane, v, pgnos, images, n, ws_dbsize, snap_dbsize, sync, &my_epoch);
+        int rc = db->mp_req ? mw_shared_publish(db, lane, v, pgnos, images, n, ws_dbsize, snap_dbsize, sync, &my_epoch) : publish_impl(db, lane, v, pgnos, images, n, ws_dbsize, snap_dbsize, sync, &my_epoch);
         if (rc == SQLITE_OK && out_epoch) *out_epoch = my_epoch;
         return rc;
     }
@@ -556,7 +555,7 @@ int mw_db_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uint32_
     MW_T1(MW_ST_MP_WAIT, tm0);
     tm0 = MW_T0();
     uint64_t my_epoch = 0;
-    int rc = db->shared ? mw_shared_publish(db, lane, v, pgnos, images, n, ws_dbsize, snap_dbsize, sync, &my_epoch) : publish_impl(db, lane, v, pgnos, images, n, ws_dbsize, snap_dbsize, sync, &my_epoch);
+    int rc = db->mp_req ? mw_shared_publish(db, lane, v, pgnos, images, n, ws_dbsize, snap_dbsize, sync, &my_epoch) : publish_impl(db, lane, v, pgnos, images, n, ws_dbsize, snap_dbsize, sync, &my_epoch);
     MW_T1(MW_ST_MP_HELD, tm0);
     mw_mp_unlock(db);
     mw_gate_exit(db);
@@ -573,7 +572,7 @@ int mw_db_publish_finish (mw_db *db, mw_lane *lane, int rc, uint64_t my_epoch, i
         // (A power failure can therefore lose a commit another process has *read*, never one that was acknowledged.)
         if (sync) {
             uint64_t s0 = now_ns();
-            rc = db->shared ? mw_shared_sync(db, lane) : mw_log_sync(db, my_epoch, 0);
+            rc = db->mp_req ? mw_shared_sync(db, lane) : mw_log_sync(db, my_epoch, 0);
             atomic_fetch_add(&db->n_log_sync_ns, now_ns() - s0);
             if (rc != SQLITE_OK) { atomic_store(&db->failed, 1); mw_db_wake_all_visibility(db); }
         }
@@ -744,7 +743,7 @@ bool mw_store_head_image (mw_store *st, uint32_t pgno, uint8_t *dst, uint64_t *e
 // visible epoch, which is >= any earlier oldest), so a stale value is merely conservative.
 uint64_t mw_db_gc (mw_db *db) {
     mw_store *st = db->store;
-    if (!st || db->shared) return 0;                          // (shared mode: the publisher collects the index, shared_gc)
+    if (!st || db->mp_req) return 0;                          // (shared mode: the publisher collects the index, shared_gc)
     atomic_store(&db->publishes_since_gc, 0);
     uint64_t t0 = now_ns();
     uint64_t oldest = mw_db_oldest_active_snapshot(db);

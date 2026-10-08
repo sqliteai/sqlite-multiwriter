@@ -148,7 +148,6 @@ int mw_mp_open (mw_db *db) {
         }
         if (db->mp_proc < 0) { db->mp = false; db->shm = NULL; munmap(m, len); MP_OPEN_FAIL(SQLITE_FULL); }
         if (!first) mp_drop_own_stale(db);
-        if (!first) { db->mp_gen = MW_LOG_GEN(atomic_load(&db->shm->log_pos)); db->mp_base_seen = atomic_load(&db->shm->base_epoch); }
         return SQLITE_OK;
     }
     return SQLITE_BUSY;
@@ -166,7 +165,6 @@ int mw_mp_finish_open (mw_db *db) {
         atomic_store(&sh->schema_epoch, 1);
         atomic_store(&sh->dbv_counter, 0);
     }
-    if (db->mp_first) { db->mp_gen = MW_LOG_GEN(atomic_load(&sh->log_pos)); db->mp_base_seen = atomic_load(&sh->base_epoch); }
     atomic_store(&sh->procs[db->mp_proc].applied, atomic_load(&db->epoch));
     return SQLITE_OK;
 }
@@ -227,7 +225,7 @@ void mw_mp_lock (mw_db *db) {
             if (s == t) {
                 int32_t exp = 0;
                 if (atomic_compare_exchange_strong_explicit(&sh->pub_owner, &exp, me, memory_order_acquire, memory_order_relaxed)) { return; }
-                if (exp != me && (polls & 31) == 31 && !pid_alive(db, exp) && atomic_compare_exchange_strong(&sh->pub_owner, &exp, me)) { db->mp_recheck = true; if (db->shared) mw_shared_repair(db); return; }   // the holder died
+                if (exp != me && (polls & 31) == 31 && !pid_alive(db, exp) && atomic_compare_exchange_strong(&sh->pub_owner, &exp, me)) { db->mp_recheck = true; if (db->mp_req) mw_shared_repair(db); return; }   // the holder died
             } else if (s > t) {                                                                             // our ticket was skipped (we looked dead for too long): a new one
                 t = atomic_fetch_add(&sh->pub_ticket, 1);
                 atomic_store(&sh->pub_tk_pid[t % 1024], me);
@@ -246,7 +244,7 @@ void mw_mp_lock (mw_db *db) {
                 if (pid > 0 && (pid != me && !pid_alive(db, pid))) { if (getenv("MW_DEBUG")) fprintf(stderr, "pid %d: skipping ticket %llu of pid %d (owner %d)\n", (int)me, (unsigned long long)s, (int)pid, (int)atomic_load(&sh->pub_owner)); if (atomic_compare_exchange_strong(&sh->pub_serving, &s, s + 1)) atomic_store_explicit(&sh->pub_tk_pid[s % 1024], 0, memory_order_relaxed); }   // (slot cleared once its ticket is past: a dead pid left by the ticket 1024 earlier must not get a fresh ticket skipped) a queued process that gave up (-1) or died: skip its ticket
             }
             uint64_t ahead = s < t ? t - s : 0;
-            if (polls == 3000 && getenv("MW_DEBUG")) fprintf(stderr, "pid %d: lock stuck: ticket %llu serving %llu owner %d tk_pid[s] %d shared %d\n", (int)me, (unsigned long long)t, (unsigned long long)s, (int)atomic_load(&sh->pub_owner), (int)atomic_load(&sh->pub_tk_pid[s % 1024]), (int)db->shared);
+            if (polls == 3000 && getenv("MW_DEBUG")) fprintf(stderr, "pid %d: lock stuck: ticket %llu serving %llu owner %d tk_pid[s] %d shared %d\n", (int)me, (unsigned long long)t, (unsigned long long)s, (int)atomic_load(&sh->pub_owner), (int)atomic_load(&sh->pub_tk_pid[s % 1024]), (int)db->mp_req);
             static _Atomic int fast_c = MW_KNOB_UNSET, per_c = MW_KNOB_UNSET, cap_c = MW_KNOB_UNSET;
             const int fast = mw_knob_int(&fast_c, "MW_MP_FAST", 2); (void)per_c; (void)cap_c;
             if (ahead <= (uint64_t)fast) { if (polls < 400) MP_RELAX(); else sched_yield(); }
@@ -258,7 +256,7 @@ void mw_mp_lock (mw_db *db) {
         if (atomic_load_explicit(&sh->pub_owner, memory_order_relaxed) == 0 && atomic_compare_exchange_strong_explicit(&sh->pub_owner, &exp, me, memory_order_acquire, memory_order_relaxed)) return;
         if ((spin & 255) == 255) {
             int32_t owner = atomic_load(&sh->pub_owner);
-            if (owner != 0 && owner != me && !pid_alive(db, owner) && atomic_compare_exchange_strong(&sh->pub_owner, &owner, me)) { db->mp_recheck = true; if (db->shared) mw_shared_repair(db); }     // steal from a dead process
+            if (owner != 0 && owner != me && !pid_alive(db, owner) && atomic_compare_exchange_strong(&sh->pub_owner, &owner, me)) { db->mp_recheck = true; if (db->mp_req) mw_shared_repair(db); }     // steal from a dead process
             if (atomic_load(&sh->pub_owner) == me) return;
         }
         if (spin < 400) MP_RELAX();
@@ -280,11 +278,6 @@ void mw_mp_unlock (mw_db *db) {
 
 bool mw_mp_pid_alive (mw_db *db, int32_t pid) { return pid_alive(db, pid); }
 
-void mw_mp_publish_header (mw_db *db, uint64_t epoch) {
-    atomic_store_explicit(&db->shm->log_pos, MW_LOG_POS(db->mp_gen, db->log_off), memory_order_release);
-    atomic_store_explicit(&db->shm->committed_epoch, epoch, memory_order_release);
-    atomic_store(&db->shm->procs[db->mp_proc].applied, epoch);
-}
 
 // MARK: - slots: snapshots and db_version reservations -
 

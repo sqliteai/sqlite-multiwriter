@@ -23,15 +23,14 @@ static mw_db *mw_dbs = NULL;                 // protected by the SQLITE_MUTEX_ST
 static void mw_atfork_child (void) { for (mw_db *d = mw_dbs; d; d = d->next) d->orphaned = true; }
 static int mw_atfork_done;
 
-mw_db *mw_db_acquire (const char *path, int mode, int mpmode) {
-    const bool mp = mpmode != 0, shared = mpmode == 2;
+mw_db *mw_db_acquire (const char *path, int mode, bool mp) {
     sqlite3_mutex *g = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MAIN);
     sqlite3_mutex_enter(g);
     if (!mw_atfork_done) { pthread_atfork(NULL, NULL, mw_atfork_child); mw_atfork_done = 1; }
     mw_db *db = mw_dbs;
     while (db && (db->orphaned || strcmp(db->path, path) != 0)) db = db->next;
     if (db) {
-        if (db->mode != mode || (mode >= 2 && (db->mp_req != mp || db->shared != shared))) db = NULL;     // one database, one mode (multi-process is a property of the database)
+        if (db->mode != mode || (mode >= 2 && (db->mp_req != mp))) db = NULL;     // one database, one mode (multi-process is a property of the database)
         else db->refs++;
     } else if ((db = sqlite3_malloc(sizeof(*db))) != NULL) {
         memset(db, 0, sizeof(*db));
@@ -46,7 +45,6 @@ mw_db *mw_db_acquire (const char *path, int mode, int mpmode) {
             db->gc_interval = 64;                    // (the default is set here, not by whichever open sees refs == 1: with concurrent first opens none might, and GC would stay off)
             db->mode = mode;
             db->mp_req = mp;
-            db->shared = shared;
             atomic_init(&db->epoch, 1);           // epoch 1 = the state found on disk at first open
             atomic_init(&db->next_tx_id, 1);
             atomic_init(&db->next_writer_id, 1);
@@ -116,7 +114,7 @@ void mw_db_release (mw_db *db) {
         for (int i = 0; i < db->nrext; i++) free(db->rext[i].data);
         free(db->rext); db->rext = NULL; db->nrext = db->caprext = 0;
         bool clean = false, sole = true;
-        if (db->shared) {
+        if (db->mp_req) {
             mw_mp_close(db, &sole);
             // the last process leaves a log that is entirely in the real file (nobody else exists: no snapshot holds the target back)
             for (int tries = 0; sole && tries < 3 && db->store && db->ix && db->sl && !atomic_load(&db->failed) && atomic_load(&db->shm->base_epoch) < atomic_load(&db->shm->committed_epoch); tries++) mw_db_compact(db, NULL);

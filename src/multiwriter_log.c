@@ -308,7 +308,7 @@ int mw_log_open (mw_db *db, int pgsz) {
 
     // ---- recovery: replay the valid, contiguous prefix of records
     mw_store *st = db->store;
-    uint64_t limit = (db->mp && !db->mp_first) ? MW_LOG_END(atomic_load(&db->shm->log_pos)) : UINT64_MAX;   // a later process replays exactly what is committed
+    uint64_t limit = UINT64_MAX;
     uint64_t last = base; off_t off = LOG_HDR_SIZE;
     int rc = log_replay(db, st, pgsz, base, limit, &last, &off);
     if (rc != SQLITE_OK) return rc;
@@ -363,7 +363,7 @@ static void sync_resume (mw_db *db);
 // It runs when the next commit finds the database failed and every other commit has left (a bounded wait); if anything does not fit (the log is not what it was) the database stays
 // failed and the application reopens it, as before.
 int mw_db_recover (mw_db *db) {
-    if (db->mp || db->shared || db->logfd < 0 || !db->store || atomic_load(&db->log_mode) != 2 || db->nretired >= 8) return SQLITE_IOERR;
+    if (db->mp || db->mp_req || db->logfd < 0 || !db->store || atomic_load(&db->log_mode) != 2 || db->nretired >= 8) return SQLITE_IOERR;
     int expect = 0; if (!atomic_compare_exchange_strong(&db->recovering, &expect, 1)) return SQLITE_BUSY;
     int rc = SQLITE_IOERR;
     for (int i = 0; i < 3000 && atomic_load(&db->inflight) > 1; i++) usleep(1000);
@@ -415,12 +415,7 @@ out:
 // the kernel owns the pages), which avoids a write syscall per commit -- profiling showed pwrite was the largest
 // cost of a small commit and serialises on the file inode when many threads commit. The file is grown ahead of
 // the append offset (sparse); records are validated by checksum at recovery, so the unwritten tail is harmless.
-// Multi-process: a record may only go where the file was written ahead (shm->log_ready); the size the file has while somebody is still zero-filling it does not count.
-static uint64_t log_usable (mw_db *db, uint64_t st_size) {
-    if (!db->mp || !db->shm) return st_size;
-    uint64_t r = atomic_load_explicit(&db->shm->log_ready, memory_order_acquire);
-    return r && r < st_size ? r : st_size;
-}
+static uint64_t log_usable (mw_db *db, uint64_t st_size) { (void)db; return st_size; }
 
 void mw_log_remap (mw_db *db) {
     db->logsync_off = 0; db->logsync_low1 = 0;
@@ -435,64 +430,7 @@ void mw_log_remap (mw_db *db) {
     mw_log_reserve_space(db);
 }
 
-// Multi-process mapped log: the file is extended with *written zeros*, not with ftruncate. Appending a record through the mapping into a hole makes the file system
-// allocate blocks while another process's fsync of the same file is running, and the append then stalls on it (measured in isolation, 30 KB record: 40-65 us with a
-// concurrent fsync into a sparse file, 3-8 us into a file whose blocks were written, and the same 6-10 us without any fsync). shm->log_ready is the written extent:
-// records go below it, the prefiller (one process at a time, claimed in shm->log_fill_pid, outside the publication lock) writes zeros above it and then raises it.
-#define LOG_PREFILL_AHEAD (3ull << 20)
-#define LOG_PREFILL_CHUNK (1ull << 20)
-static uint8_t *prefill_zeros (void) {
-    static uint8_t *z;
-    if (!z) z = calloc(1, (size_t)LOG_PREFILL_CHUNK);
-    return z;
-}
-// Writes one chunk above log_ready. The caller owns shm->log_fill_pid.
-static void prefill_chunk (mw_db *db) {
-    mw_shm *sh = db->shm;
-    uint64_t ready = atomic_load(&sh->log_ready);
-    uint8_t *z = prefill_zeros();
-    if (!z || ready + LOG_PREFILL_CHUNK > LOG_MAP_BYTES) return;
-    if (pwrite_all(db->logfd, z, (size_t)LOG_PREFILL_CHUNK, (off_t)ready) == SQLITE_OK) atomic_store_explicit(&sh->log_ready, ready + LOG_PREFILL_CHUNK, memory_order_release);
-}
-static bool prefill_claim (mw_db *db, bool wait) {
-    int32_t me = (int32_t)getpid();
-    for (unsigned spin = 0; ; spin++) {
-        int32_t exp = 0;
-        if (atomic_compare_exchange_strong(&db->shm->log_fill_pid, &exp, me)) return true;
-        if (!wait) return false;
-        if ((spin & 63) == 63 && exp != me && !mw_mp_pid_alive(db, exp) && atomic_compare_exchange_strong(&db->shm->log_fill_pid, &exp, me)) return true;   // the filler died
-        struct timespec ts = { 0, 50000 };
-        nanosleep(&ts, NULL);
-    }
-}
-static void log_prefill (mw_db *db) {                                      // (under the publication lock)
-    mw_shm *sh = db->shm;
-    uint64_t need = MW_LOG_OFF(db) + LOG_PREFILL_AHEAD / 3;                      // the space this record needs, plus a margin for the next ones
-    uint64_t ready = atomic_load_explicit(&sh->log_ready, memory_order_acquire);
-    if (ready < need) {                                                       // the background filler is behind (or nobody filled yet): do it here
-        prefill_claim(db, true);
-        while (atomic_load(&sh->log_ready) < need) { uint64_t before = atomic_load(&sh->log_ready); prefill_chunk(db); if (atomic_load(&sh->log_ready) == before) break; }
-        atomic_store(&sh->log_fill_pid, 0);
-        ready = atomic_load_explicit(&sh->log_ready, memory_order_acquire);
-    }
-    struct stat cur;
-    uint64_t size = fstat(db->logfd, &cur) == 0 ? (uint64_t)cur.st_size : db->logfile_size;
-    db->logfile_size = ready < size ? ready : size;
-}
-void mw_log_prefill_bg (mw_db *db) {
-    if (db->shared) { mw_seglog_prefill_bg(db); return; }
-    mw_shm *sh = db->shm;
-    if (!db->mp || !sh || !db->logmap) return;
-    uint64_t end = MW_LOG_END(atomic_load_explicit(&sh->log_pos, memory_order_relaxed));
-    if (end + LOG_PREFILL_AHEAD <= atomic_load_explicit(&sh->log_ready, memory_order_relaxed)) return;
-    if (!prefill_claim(db, false)) return;
-    // (the generation only changes while the claim is held, see mw_log_fill_hold: if ours is current, the file we write to is the one log_ready describes)
-    if (MW_LOG_GEN(atomic_load(&sh->log_pos)) == db->mp_gen && end + LOG_PREFILL_AHEAD > atomic_load(&sh->log_ready)) prefill_chunk(db);
-    atomic_store(&sh->log_fill_pid, 0);
-}
-// The log is about to be replaced by another file: no prefiller may be writing into the old one with the new file's extent.
-void mw_log_fill_hold (mw_db *db) { prefill_claim(db, true); }
-void mw_log_fill_release (mw_db *db) { atomic_store(&db->shm->log_fill_pid, 0); }
+void mw_log_prefill_bg (mw_db *db) { if (db->mp_req) mw_seglog_prefill_bg(db); }
 
 
 // Staged log: the disk for the records is reserved ahead (in steps of LOG_RES_STEP), before the commit takes its offset. A full disk then fails the commit that asked for the
@@ -522,7 +460,6 @@ void mw_log_reserve_space (mw_db *db) {
     // Only the mapped log grows ahead of time. A staged log grows by append: extending a file with ftruncate and then writing into the hole makes the file system
     // allocate blocks inside every write (measured: group sync 70-290 us against 40-50 us when the file simply grows, 2 writers 5-11k against 17k tx/s).
     if (!db->logmap || atomic_load(&db->log_mode) != 1) return;
-    if (db->mp) { log_prefill(db); return; }
     uint64_t need = MW_LOG_OFF(db) + LOG_GROW_BYTES / 4;
     if (need <= db->logfile_size) return;
     struct stat cur;
@@ -1054,7 +991,7 @@ static int copy_range (int from_fd, int to_fd, uint64_t from, uint64_t to, uint6
 }
 void mw_log_rewrite_abort (mw_log_prep *p) { if (!p) return; if (p->nfd >= 0) close(p->nfd); if (p->tmp) { unlink(p->tmp); sqlite3_free(p->tmp); } free(p); }
 mw_log_prep *mw_log_rewrite_prepare (mw_db *db, uint64_t base_epoch) {
-    if (db->mp || db->shared || db->logfd < 0 || !db->store || atomic_load(&db->log_mode) != 2) return NULL;
+    if (db->mp || db->mp_req || db->logfd < 0 || !db->store || atomic_load(&db->log_mode) != 2) return NULL;
     uint64_t E; pthread_mutex_lock(&db->log_mu); E = db->synced_off; pthread_mutex_unlock(&db->log_mu);          // (everything below is in the file, whole records)
     uint64_t first = 0; uint64_t bound = scan_fd_after(db, base_epoch, LOG_HDR_SIZE, E, &first);
     if (!first) return NULL;

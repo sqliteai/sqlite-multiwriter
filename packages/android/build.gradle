@@ -53,7 +53,7 @@ afterEvaluate {
                 groupId = 'io.sqlitecloud'
                 artifactId = 'multiwriter'
                 version = project.hasProperty('VERSION') ? project.VERSION : '0.0.0'
-                artifact("$buildDir/outputs/aar/android-release.aar")
+                artifact("$buildDir/outputs/aar/multiwriter-release.aar")
                 pom {
                     name = 'sqlite-multiwriter'
                     description = 'SQLite with more writers: many threads and processes write one database at the same time, as a loadable extension.'

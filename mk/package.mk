@@ -100,5 +100,5 @@ aar:
 		cp $(BUILD)/aar/$$abi/$(EXT_BASE).so $(AAR_JNI)/$$abi/lib$(EXT_BASE).so; \
 	done
 	cd packages/android && gradle --no-daemon -PVERSION=$(VERSION) clean assembleRelease
-	mkdir -p $(DIST) && cp packages/android/build/outputs/aar/android-release.aar $(DIST)/$(EXT_BASE).aar
+	mkdir -p $(DIST) && cp packages/android/build/outputs/aar/multiwriter-release.aar $(DIST)/$(EXT_BASE).aar
 	rm -rf $(BUILD)/aar $(AAR_JNI)

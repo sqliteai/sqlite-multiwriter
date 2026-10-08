@@ -16,3 +16,8 @@ else
 PLATFORM := linux
 endif
 endif
+
+EXE :=
+ifeq ($(PLATFORM),windows)
+EXE := .exe
+endif

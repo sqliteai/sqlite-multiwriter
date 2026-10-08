@@ -33,8 +33,12 @@ HEADERS := $(wildcard $(SRC_DIR)/*.h)
 LIB_OBJ := $(ENGINE_OBJ) $(BUILD)/sqlite3.o
 
 TEST_SRC := $(wildcard test/mw_*.c)
-TEST_BIN := $(patsubst test/%.c,$(DIST)/%,$(TEST_SRC))
-IO_TESTS := $(DIST)/mw_ioerr $(DIST)/mw_diskfull                       # (minutes: make test-io)
+ifeq ($(PLATFORM),windows)
+# the tests that fork, wait for processes, map files or set the environment of a child are not for Windows (docs/windows.md)
+TEST_SRC := $(filter-out $(shell grep -lE 'sys/wait.h|sys/mman.h|fork|setenv' $(TEST_SRC)),$(TEST_SRC))
+endif
+TEST_BIN := $(patsubst test/%.c,$(DIST)/%$(EXE),$(TEST_SRC))
+IO_TESTS := $(DIST)/mw_ioerr$(EXE) $(DIST)/mw_diskfull$(EXE)                       # (minutes: make test-io)
 FAST_BIN := $(filter-out $(IO_TESTS),$(TEST_BIN))
 
 .PHONY: all test bench clean test-mp test-io
@@ -49,30 +53,30 @@ $(BUILD)/%.o: $(SRC_DIR)/%.c $(HEADERS)
 $(BUILD)/t_%.o: test/%.c $(HEADERS) test/mw_test.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(DIST)/mw_%: $(BUILD)/t_mw_%.o $(LIB_OBJ)
+$(DIST)/mw_%$(EXE): $(BUILD)/t_mw_%.o $(LIB_OBJ)
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LDFLAGS)
 .PRECIOUS: $(BUILD)/t_%.o
 
 test: $(FAST_BIN)
-	@set -e; for t in $(FAST_BIN); do echo "== $$t"; ./$$t; done; echo "== mw_rebase (a WITHOUT ROWID table)"; MW_TEST_WR=1 ./$(DIST)/mw_rebase
+	@set -e; for t in $(FAST_BIN); do echo "== $$t"; ./$$t; done; echo "== mw_rebase (a WITHOUT ROWID table)"; MW_TEST_WR=1 ./$(DIST)/mw_rebase$(EXE)
 
 # the suite of the CI legs that run it on shared machines: without mw_serial (about a minute and a half of stress, which has a threshold of events that a loaded machine can miss); `make test` runs everything
-CI_BIN := $(filter-out $(DIST)/mw_serial,$(FAST_BIN))
+CI_BIN := $(filter-out $(DIST)/mw_serial$(EXE),$(FAST_BIN))
 .PHONY: test-ci
 test-ci: $(CI_BIN)
-	@set -e; for t in $(CI_BIN); do echo "== $$t"; ./$$t; done; echo "== mw_rebase (a WITHOUT ROWID table)"; MW_TEST_WR=1 ./$(DIST)/mw_rebase
+	@set -e; for t in $(CI_BIN); do echo "== $$t"; ./$$t; done; echo "== mw_rebase (a WITHOUT ROWID table)"; MW_TEST_WR=1 ./$(DIST)/mw_rebase$(EXE)
 
 # errors of the file system: a fault at every n-th file call of a workload, and a real full disk (a small disk image)
 .PHONY: test-io
 test-io: $(IO_TESTS)
 	@set -e; for t in $(IO_TESTS); do echo "== $$t"; ./$$t; done
 
-bench: $(DIST)/mw_bench
+bench: $(DIST)/mw_bench$(EXE)
 $(BUILD)/b_mw_bench.o: bench/mw_bench.c $(HEADERS)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
-$(DIST)/mw_bench: $(BUILD)/b_mw_bench.o $(LIB_OBJ)
+$(DIST)/mw_bench$(EXE): $(BUILD)/b_mw_bench.o $(LIB_OBJ)
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LDFLAGS)
 

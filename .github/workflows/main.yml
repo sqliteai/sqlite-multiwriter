@@ -106,6 +106,7 @@ jobs:
 
     steps:
       - name: where the tests make their databases (a native Windows program has no /tmp)
+        shell: ${{ matrix.container && 'sh' || 'bash' }}
         run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: alpine - install the tools

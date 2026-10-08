@@ -15,7 +15,7 @@ static mw_db_stats stats (sqlite3 *db) { mw_db_stats s; memset(&s, 0, sizeof s);
 static int is_conflict (int rc) { return (rc & 0xff) == SQLITE_BUSY; }
 static void make (const char *path) {
     sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
-    CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);"
+    CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT UNIQUE);"
         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<40) INSERT INTO t SELECT i, 1, 'row'||i FROM n"), SQLITE_OK);
     sqlite3_close(s);
 }
@@ -55,13 +55,14 @@ int main (void) {
     CHECK(stats(a).rebases == 0);
     sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
 
-    // 2b. one statement that reads more than it changes (a condition on other rows, a scan that skips rows) in autocommit mode: refused too; a statement that changes every row it visits is replayed
+    // 2b. one statement that reads more than it changes (a condition on other rows, a scan that skips rows) in autocommit mode: refused too; a point statement (one row by its rowid, no subquery) is replayed; a range or a search by another column is not (the rows it skips are reads)
     const char *bad[] = { "UPDATE t SET a = 0 WHERE id = 1 AND (SELECT sum(a) FROM t WHERE id IN (1,2)) > 1",
                           "UPDATE t SET a = 0 WHERE id <= 3 AND b <> 'row2'",
-                          "UPDATE t SET a = (SELECT max(a) + 1 FROM t) WHERE id = 1" };
-    const char *good[] = { "UPDATE t SET a = a + 1 WHERE id = 1", "UPDATE t SET a = 7 WHERE id BETWEEN 1 AND 3", "DELETE FROM t WHERE id = 1", "INSERT INTO t VALUES(100, 1, 'x')" };
-    for (int k = 0; k < 7; k++) {
-        const char *sql = k < 3 ? bad[k] : good[k - 3];
+                          "UPDATE t SET a = (SELECT max(a) + 1 FROM t) WHERE id = 1",
+                          "UPDATE t SET a = 7 WHERE id BETWEEN 1 AND 3" };
+    const char *good[] = { "UPDATE t SET a = a + 1 WHERE id = 1", "UPDATE t SET a = a + 1 WHERE b = 'row1'", "DELETE FROM t WHERE id = 1", "INSERT INTO t VALUES(100, 1, 'x')" };
+    for (int k = 0; k < 8; k++) {
+        const char *sql = k < 4 ? bad[k] : good[k - 4];
         mw_tmpdb(path, sizeof path, "skew2b"); make(path);
         CHECK_RC(open_mw(path, &a, 1), SQLITE_OK); CHECK_RC(open_mw(path, &b, 1), SQLITE_OK);
         CHECK_RC(mw_exec(b, "BEGIN; UPDATE t SET a = 9 WHERE id = 30"), SQLITE_OK);
@@ -70,7 +71,7 @@ int main (void) {
         CHECK_RC(mw_exec(b, "COMMIT"), SQLITE_OK);
         int rc = mw_exec(a, "COMMIT");
         printf("2b. %s: %s\n", sql, rc == SQLITE_OK ? "replayed" : "refused");
-        if (k < 3) CHECK(is_conflict(rc)); else CHECK_RC(rc, SQLITE_OK);
+        if (k < 4) CHECK(is_conflict(rc)); else CHECK_RC(rc, SQLITE_OK);
         sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
     }
 

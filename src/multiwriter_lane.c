@@ -99,18 +99,39 @@ static uint32_t lane_schema_cookie (mw_lane *lane) {
 // ---- what the transaction read ----
 // The rebase replays the rows that a transaction changed and checks only those. A row that it read and did not change, on a page that somebody else wrote, would go unchecked (write skew), and the pages
 // cannot tell the two apart (a blind UPDATE of one row also reads and writes its page). So the statements say it (the statement hook of a mw_rebase=1 connection): a transaction that ran a SELECT, or a
-// statement that visited more rows than it changed (a scan, a subquery, INSERT ... SELECT) is not rebased: the commit is refused as before and the application retries.
-enum { RD_OTHER = 0, RD_INSERT, RD_UPDEL };
-static int64_t stmt_visits (sqlite3_stmt *st) {
-    int64_t total = 0;
-    for (int i = 0; i < 1000; i++) { sqlite3_int64 v = 0; if (sqlite3_stmt_scanstatus_v2(st, i, SQLITE_SCANSTAT_NVISIT, SQLITE_SCANSTAT_COMPLEX, &v) != 0) break; total += v; }
-    return total;
+// statement that is not a point statement, is not rebased: the commit is refused as before and the application retries. A point statement is an INSERT ... VALUES or an UPDATE/DELETE of one row found by its rowid or by a unique index
+// (the seek of a unique index finds one row; a range or a non-unique index loops), that reads nothing else: its bytecode (EXPLAIN, available in every build of SQLite) has no loop, no cursor opened for
+// reading (another table, a subquery), no trigger, no virtual table. An UPDATE or DELETE that changed no row has read that the row is absent: also a read.
+enum { RD_OTHER = 0, RD_DML };
+typedef struct { char *sql; bool point; } rd_ent;
+enum { RD_CACHE = 32 };
+static bool bytecode_is_point (sqlite3 *db, const char *sql) {
+    char *ex = sqlite3_mprintf("EXPLAIN %s", sql); if (!ex) return false;
+    sqlite3_stmt *e = NULL; int rc = sqlite3_prepare_v2(db, ex, -1, &e, NULL); sqlite3_free(ex);
+    if (rc != SQLITE_OK || !e) { sqlite3_finalize(e); return false; }
+    static const char *const deny[] = { "Rewind", "Last", "Next", "Prev", "SorterSort", "SorterNext", "SeekScan", "OpenRead", "OpenEphemeral", "OpenAutoindex", "OpenPseudo", "Program",
+                                        "VOpen", "VFilter", "VNext", "VUpdate", "VColumn", "Gosub", "BeginSubrtn", "Once", "InitCoroutine", "Yield", "Sort" };
+    bool point = true;
+    while (point && sqlite3_step(e) == SQLITE_ROW) {
+        const char *op = (const char *)sqlite3_column_text(e, 1); if (!op) { point = false; break; }
+        for (size_t i = 0; i < sizeof deny / sizeof *deny; i++) if (strcmp(op, deny[i]) == 0) { point = false; break; }
+    }
+    sqlite3_finalize(e);
+    return point;
+}
+static bool stmt_is_point (mw_lane *lane, sqlite3_stmt *st, const char *sql) {
+    rd_ent *c = lane->rd_cache;
+    if (!c) { c = lane->rd_cache = sqlite3_malloc64(RD_CACHE * sizeof *c); if (!c) return false; memset(c, 0, RD_CACHE * sizeof *c); }
+    for (int i = 0; i < RD_CACHE; i++) if (c[i].sql && strcmp(c[i].sql, sql) == 0) return c[i].point;
+    bool point = bytecode_is_point(sqlite3_db_handle(st), sql);
+    int slot = lane->rd_cache_next++ % RD_CACHE;
+    sqlite3_free(c[slot].sql); c[slot].sql = sqlite3_mprintf("%s", sql); c[slot].point = c[slot].sql ? point : false;
+    return point;
 }
 static int stmt_kind (const char *sql) {
     while (sql && (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r')) sql++;
     if (!sql) return RD_OTHER;
-    if (sqlite3_strnicmp(sql, "INSERT", 6) == 0 || sqlite3_strnicmp(sql, "REPLACE", 7) == 0) return RD_INSERT;
-    if (sqlite3_strnicmp(sql, "UPDATE", 6) == 0 || sqlite3_strnicmp(sql, "DELETE", 6) == 0) return RD_UPDEL;
+    if (sqlite3_strnicmp(sql, "INSERT", 6) == 0 || sqlite3_strnicmp(sql, "REPLACE", 7) == 0 || sqlite3_strnicmp(sql, "UPDATE", 6) == 0 || sqlite3_strnicmp(sql, "DELETE", 6) == 0) return RD_DML;
     return RD_OTHER;
 }
 static bool stmt_reads (const char *sql) {
@@ -120,28 +141,19 @@ static bool stmt_reads (const char *sql) {
 void mw_lane_stmt_note (mw_lane *lane, mw_stmt_note *n) {
     sqlite3_stmt *st = n->stmt;
     if (!n->ending) {
-        if (n->autocommit) { lane->rd_dep = false; lane->rd_prev_chg = 0; }       // (this statement starts a transaction)
+        if (n->autocommit) lane->rd_dep = false;                                   // (this statement starts a transaction)
         const char *sql = sqlite3_sql(st);
         if (stmt_reads(sql)) lane->rd_dep = true;
         lane->rd_cur = st; lane->rd_cur_kind = stmt_kind(sql);
+        if (lane->rd_cur_kind == RD_DML && !stmt_is_point(lane, st, sql)) lane->rd_dep = true;
         return;
     }
     if (lane->rd_cur != st) return;
     lane->rd_cur = NULL;
-    if (lane->rd_cur_kind == RD_OTHER) return;
-    int64_t v = stmt_visits(st), chg = sqlite3_changes64(sqlite3_db_handle(st));
-    if (lane->rd_cur_kind == RD_INSERT ? v > 0 : (v > chg || chg == 0)) lane->rd_dep = true;       // (an UPDATE or DELETE that found nothing has read that the row is absent)
-    lane->rd_prev_chg += chg;
+    if (lane->rd_cur_kind == RD_DML && !sqlite3_stmt_readonly(st) && sqlite3_changes64(sqlite3_db_handle(st)) == 0) lane->rd_dep = true;       // (an UPDATE or DELETE that found nothing has read that the row is absent)
 }
-// The commit is running inside the statement rd_cur (its counters are complete, its row changes are not in sqlite3_changes() yet): the rows it changed are at least `nchanged` (the net changes of the
-// whole transaction, from the pages) minus what the statements before it changed (gross), an underestimate, which can only refuse more.
-bool mw_lane_reads_unchanged (mw_lane *lane, int64_t nchanged) {
-    if (lane->rd_dep) return true;
-    if (!lane->rd_cur || lane->rd_cur_kind == RD_OTHER) return false;
-    int64_t v = stmt_visits(lane->rd_cur);
-    if (lane->rd_cur_kind == RD_INSERT) return v > 0;
-    return v > nchanged - lane->rd_prev_chg;
-}
+// (A statement that changed nothing writes no page, so the one that is committing now has no such read.)
+bool mw_lane_reads_unchanged (mw_lane *lane) { return lane->rd_dep; }
 
 // A conflicting transaction can be rebased (multiwriter_rebase.c: its row changes are replayed at the latest snapshot) only if the connection asked for it (URI mw_rebase=1), it is not itself a
 // rebase helper, it is the first commit of its snapshot (a later one would be missing the pages of the earlier one) and it changed no schema (its page 1 carries the snapshot's cookie).
@@ -438,6 +450,7 @@ void mw_lane_free (mw_lane *lane) {
     sqlite3_free(lane->ws_frame);
     sqlite3_free(lane->own_pg); sqlite3_free(lane->own_ep);
     sqlite3_free(lane->ws_hash);
+    if (lane->rd_cache) { for (int i = 0; i < 32; i++) sqlite3_free(((rd_ent *)lane->rd_cache)[i].sql); sqlite3_free(lane->rd_cache); }
     sqlite3_free(lane->rs_bits);
     sqlite3_free(lane->rs_list);
     mw_lane_rebase_free(lane);

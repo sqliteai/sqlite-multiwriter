@@ -21,8 +21,8 @@
 #include "mw_test.h"
 #include "multiwriter.h"
 
-enum { MAXOPS = 4, ROKEYS = 8 };
-typedef struct { int kind, key, a, b; int sex, sv, su, spl, sw; } op_t;                 // kinds: 0 touch (w += 1: a write that the page really sees), 1 v += a, 2 delete, 3 u = b (-1: NULL), 4 insert (v = a, u = b, payload ins_pl), 5 payload = a bytes
+enum { MAXOPS = 4, ROKEYS = 8, BLIND = -2 };
+typedef struct { int kind, key, a, b; int sex, sv, su, spl, sw; } op_t;                 // sv == BLIND: the row was not read (only whether it exists is known). kinds: 6 an update or delete that found no row (reads that it is absent); 0 touch (w += 1: a write that the page really sees), 1 v += a, 2 delete, 3 u = b (-1: NULL), 4 insert (v = a, u = b, payload ins_pl), 5 payload = a bytes
 typedef struct { uint64_t snap, commit; uint64_t seq; int n; op_t op[MAXOPS]; int ins_pl; int slot; uint32_t order; } rw_t;      // order: among the commits of one epoch (a group replay of the rebase), their place
 typedef struct { uint64_t snap; int n; int key[ROKEYS], ex[ROKEYS], v[ROKEYS], u[ROKEYS], pl[ROKEYS], w[ROKEYS]; } ro_t;
 typedef struct { rw_t *rw; size_t nrw, caprw; ro_t *ro; size_t nro, capro; long busy, constraint, other; } rec_t;
@@ -74,22 +74,31 @@ static void run_rw (ctx_t *c, rw_t *out, int *got) {
     sqlite3 *db = c->db; rec_t *R = c->R;
     if (mw_exec(db, "BEGIN") != SQLITE_OK) return;
     int ok = 1; char sql[200];
+    const int blind = g_rebase && rnd(&c->rng) % 2;                // (the rebase replays only transactions that read nothing: half of them read no row, and learn what they need from the statements)
     for (int i = 0; i < tx.n && ok; i++) {
         op_t *o = &tx.op[i]; int again;
         do { again = 0; o->key = 1 + (int)(rnd(&c->rng) % (uint64_t)g_keys); for (int j = 0; j < i; j++) if (tx.op[j].key == o->key) again = 1; } while (again);       // (distinct keys: the reads and writes of a transaction do not overlap)
-        if (read_row(c->sel, o->key, &o->sex, &o->sv, &o->su, &o->spl, &o->sw) != SQLITE_OK) { ok = 0; break; }
+        if (blind) { o->sex = 1; o->sv = BLIND; o->su = o->spl = o->sw = 0; }
+        else if (read_row(c->sel, o->key, &o->sex, &o->sv, &o->su, &o->spl, &o->sw) != SQLITE_OK) { ok = 0; break; }
         uint64_t r = rnd(&c->rng) % 10;
-        if (!o->sex) { o->kind = 4; o->a = (int)(rnd(&c->rng) % 1000); o->b = ucol(&c->rng); tx.ins_pl = (int)(rnd(&c->rng) % 400);
+        if (!blind && i > 0 && rnd(&c->rng) % 4 == 0) { o->kind = 7; continue; }       // (a row that is only read: its page may be written by others while this transaction writes another row of it; write skew if nothing validates it)
+        if ((blind ? (r == 9 && rnd(&c->rng) % 2) : !o->sex)) { o->kind = 4; o->a = (int)(rnd(&c->rng) % 1000); o->b = ucol(&c->rng); tx.ins_pl = (int)(rnd(&c->rng) % 400);
             if (o->b < 0) snprintf(sql, sizeof sql, "INSERT INTO t(id,v,u,p) VALUES(%d,%d,NULL,zeroblob(%d))", o->key, o->a, tx.ins_pl);
             else snprintf(sql, sizeof sql, "INSERT INTO t(id,v,u,p) VALUES(%d,%d,%d,zeroblob(%d))", o->key, o->a, o->b, tx.ins_pl);
             o->spl = tx.ins_pl; }
         else if (r < 3) { o->kind = 1; o->a = 1 + (int)(rnd(&c->rng) % 9); snprintf(sql, sizeof sql, "UPDATE t SET v = v + %d WHERE id = %d", o->a, o->key); }
         else if (r < 5) { o->kind = 2; snprintf(sql, sizeof sql, "DELETE FROM t WHERE id = %d", o->key); }
         else if (r < 7) { o->kind = 3; do o->b = ucol(&c->rng); while (o->b == o->su);       // (a change that changes nothing writes no page: the row would be read and not written)
-            if (o->b < 0) snprintf(sql, sizeof sql, "UPDATE t SET u = NULL WHERE id = %d", o->key); else snprintf(sql, sizeof sql, "UPDATE t SET u = %d WHERE id = %d", o->b, o->key); }
-        else if (r < 9) { o->kind = 5; do o->a = (int)(rnd(&c->rng) % 600); while (o->a == o->spl); snprintf(sql, sizeof sql, "UPDATE t SET p = zeroblob(%d) WHERE id = %d", o->a, o->key); }
+            if (o->b < 0) snprintf(sql, sizeof sql, "UPDATE t SET u = NULL WHERE id = %d%s", o->key, blind ? " AND u IS NOT NULL" : "");        // (blind: it must really change the row, or it would write no page; the guard reads the row)
+            else if (blind) snprintf(sql, sizeof sql, "UPDATE t SET u = %d WHERE id = %d AND u IS NOT %d", o->b, o->key, o->b);
+            else snprintf(sql, sizeof sql, "UPDATE t SET u = %d WHERE id = %d", o->b, o->key); }
+        else if (r < 9) { o->kind = 5; do o->a = (int)(rnd(&c->rng) % 600); while (o->a == o->spl); snprintf(sql, sizeof sql, "UPDATE t SET p = zeroblob(%d) WHERE id = %d AND length(p) <> %d", o->a, o->key, blind ? o->a : -1); }
         else { o->kind = 0; snprintf(sql, sizeof sql, "UPDATE t SET w = w + 1 WHERE id = %d", o->key); }
         int rc = mw_exec(db, sql);
+        if (blind && rc == SQLITE_OK) {                                  // what a blind statement says: an insert that succeeded found the key free; another one found the row, or did not
+            if (o->kind == 4) { o->sex = 0; o->sv = 0; }
+            else if (sqlite3_changes(db) == 0) { o->sex = (o->kind == 3 || o->kind == 5) ? BLIND : 0; o->kind = 6; o->sv = 0; }       // (a guarded update that changed nothing says nothing: the row was absent or already like that)
+        }
         if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_FULL) put_rec(c->fd, REC_FULL, c->slot, 0, 0, 0, NULL, 0); if ((rc & 0xff) == SQLITE_CONSTRAINT) R->constraint++; else if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else { R->other++; if (getenv("MW_VERBOSE")) printf("  other rc %d on: %s\n", rc, sql); } }
     }
     if (ok && c->slot >= 0) { snprintf(sql, sizeof sql, "UPDATE txlog SET seq = %llu WHERE slot = %d", (unsigned long long)tx.seq, c->slot); int rc = mw_exec(db, sql); if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else R->other++; } }
@@ -153,7 +162,7 @@ static void child_main (int slot, int generation) { slot_loop(slot, generation, 
 static void *slot_thread (void *arg) { slot_loop((int)(intptr_t)arg, 0, 0); return NULL; }
 
 typedef struct { int ex, v, u, pl, w; } mrow;
-static int same (int ex, int v, int u, int pl, int w, const mrow *m) { return ex == m->ex && (!ex || (v == m->v && u == m->u && pl == m->pl && w == m->w)); }
+static int same (int ex, int v, int u, int pl, int w, const mrow *m) { return ex == BLIND || (ex == m->ex && (!ex || v == BLIND || (v == m->v && u == m->u && pl == m->pl && w == m->w))); }
 static int cmp_u64 (const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 
 typedef struct { rw_t **known; size_t nknown; rw_t **doubt; size_t ndoubt; ro_t **ro; size_t nro; } txset;      // known: commit epoch known (sorted by it); doubt: committed, epoch unknown (to be placed in a gap)
@@ -175,6 +184,7 @@ static void apply_rw (const rw_t *t, uint64_t epoch, model *M, viol *V) {
             case 3: if (x->u >= 0 && M->owner[x->u] == o->key) M->owner[x->u] = -1; x->u = o->b; if (o->b >= 0) M->owner[o->b] = o->key; break;
             case 4: x->ex = 1; x->v = o->a; x->u = o->b; x->pl = o->spl; x->w = 0; if (o->b >= 0) M->owner[o->b] = o->key; break;
             case 5: x->pl = o->a; break;
+            case 6: case 7: break;
             default: x->w++; break;
         }
     }

@@ -95,6 +95,54 @@ static uint32_t lane_schema_cookie (mw_lane *lane) {
     return ((uint32_t)c[0] << 24) | ((uint32_t)c[1] << 16) | ((uint32_t)c[2] << 8) | c[3];
 }
 
+
+// ---- what the transaction read ----
+// The rebase replays the rows that a transaction changed and checks only those. A row that it read and did not change, on a page that somebody else wrote, would go unchecked (write skew), and the pages
+// cannot tell the two apart (a blind UPDATE of one row also reads and writes its page). So the statements say it (the statement hook of a mw_rebase=1 connection): a transaction that ran a SELECT, or a
+// statement that visited more rows than it changed (a scan, a subquery, INSERT ... SELECT) is not rebased: the commit is refused as before and the application retries.
+enum { RD_OTHER = 0, RD_INSERT, RD_UPDEL };
+static int64_t stmt_visits (sqlite3_stmt *st) {
+    int64_t total = 0;
+    for (int i = 0; i < 1000; i++) { sqlite3_int64 v = 0; if (sqlite3_stmt_scanstatus_v2(st, i, SQLITE_SCANSTAT_NVISIT, SQLITE_SCANSTAT_COMPLEX, &v) != 0) break; total += v; }
+    return total;
+}
+static int stmt_kind (const char *sql) {
+    while (sql && (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r')) sql++;
+    if (!sql) return RD_OTHER;
+    if (sqlite3_strnicmp(sql, "INSERT", 6) == 0 || sqlite3_strnicmp(sql, "REPLACE", 7) == 0) return RD_INSERT;
+    if (sqlite3_strnicmp(sql, "UPDATE", 6) == 0 || sqlite3_strnicmp(sql, "DELETE", 6) == 0) return RD_UPDEL;
+    return RD_OTHER;
+}
+static bool stmt_reads (const char *sql) {
+    while (sql && (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r' || *sql == '(')) sql++;
+    return sql && (sqlite3_strnicmp(sql, "SELECT", 6) == 0 || sqlite3_strnicmp(sql, "WITH", 4) == 0 || sqlite3_strnicmp(sql, "VALUES", 6) == 0);
+}
+void mw_lane_stmt_note (mw_lane *lane, mw_stmt_note *n) {
+    sqlite3_stmt *st = n->stmt;
+    if (!n->ending) {
+        if (n->autocommit) { lane->rd_dep = false; lane->rd_prev_chg = 0; }       // (this statement starts a transaction)
+        const char *sql = sqlite3_sql(st);
+        if (stmt_reads(sql)) lane->rd_dep = true;
+        lane->rd_cur = st; lane->rd_cur_kind = stmt_kind(sql);
+        return;
+    }
+    if (lane->rd_cur != st) return;
+    lane->rd_cur = NULL;
+    if (lane->rd_cur_kind == RD_OTHER) return;
+    int64_t v = stmt_visits(st), chg = sqlite3_changes64(sqlite3_db_handle(st));
+    if (lane->rd_cur_kind == RD_INSERT ? v > 0 : (v > chg || chg == 0)) lane->rd_dep = true;       // (an UPDATE or DELETE that found nothing has read that the row is absent)
+    lane->rd_prev_chg += chg;
+}
+// The commit is running inside the statement rd_cur (its counters are complete, its row changes are not in sqlite3_changes() yet): the rows it changed are at least `nchanged` (the net changes of the
+// whole transaction, from the pages) minus what the statements before it changed (gross), an underestimate, which can only refuse more.
+bool mw_lane_reads_unchanged (mw_lane *lane, int64_t nchanged) {
+    if (lane->rd_dep) return true;
+    if (!lane->rd_cur || lane->rd_cur_kind == RD_OTHER) return false;
+    int64_t v = stmt_visits(lane->rd_cur);
+    if (lane->rd_cur_kind == RD_INSERT) return v > 0;
+    return v > nchanged - lane->rd_prev_chg;
+}
+
 // A conflicting transaction can be rebased (multiwriter_rebase.c: its row changes are replayed at the latest snapshot) only if the connection asked for it (URI mw_rebase=1), it is not itself a
 // rebase helper, it is the first commit of its snapshot (a later one would be missing the pages of the earlier one) and it changed no schema (its page 1 carries the snapshot's cookie).
 static bool lane_can_rebase (mw_lane *lane, const uint8_t *pg1, uint32_t snapshot_cookie) {
@@ -501,6 +549,7 @@ static int lm_file_control (sqlite3_file *pf, int op, void *arg) {
         return SQLITE_OK;
     }
     if (op == MW_FCNTL_DBSTATS) { mw_lane_fill_stats(lane, (mw_db_stats *)arg); return SQLITE_OK; }
+    if (op == MW_FCNTL_STMT) { mw_lane_stmt_note(lane, (mw_stmt_note *)arg); return SQLITE_OK; }
     if (op == MW_FCNTL_DDL_BEGIN) { mw_lane_ddl_begin(lane); return SQLITE_OK; }
     if (op == MW_FCNTL_DDL_RELEASE_IDLE) { if (lane->ddl_active && !lane->snapshot_held) mw_lane_ddl_end(lane); return SQLITE_OK; }
     if (op == MW_FCNTL_COMPACT) { mw_compact_result *r = (mw_compact_result *)arg; return mw_db_compact(lane->db, r); }

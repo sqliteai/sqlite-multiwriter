@@ -48,9 +48,13 @@ static bool mw_is_ddl_sql (const char *sql) {
     return false;
 }
 static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
-    (void)ctx; (void)x;
+    (void)x;
     if (type != SQLITE_TRACE_STMT && type != SQLITE_TRACE_PROFILE) return 0;
     sqlite3_stmt *st = (sqlite3_stmt *)p;
+    if (ctx) {                                                  // a mw_rebase=1 connection: what the transaction reads (mw_lane_reads_unchanged)
+        mw_stmt_note n = { type == SQLITE_TRACE_PROFILE, sqlite3_get_autocommit(sqlite3_db_handle(st)), st };
+        sqlite3_file_control(sqlite3_db_handle(st), "main", MW_FCNTL_STMT, &n);
+    }
     const char *sql = sqlite3_sql(st);
     if (!sql || !mw_is_ddl_sql(sql)) return 0;
     // at the start of a schema change the barrier is raised; at its end it is given back if no snapshot of the main file is open (a change of a temporary object never opens one, and
@@ -61,7 +65,8 @@ static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
 
 static int mw_connection_init (sqlite3 *db, char **err, const sqlite3_api_routines *api) {
     (void)err; (void)api;
-    sqlite3_trace_v2(db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, mw_trace_cb, NULL);
+    const char *fn = sqlite3_db_filename(db, "main");
+    sqlite3_trace_v2(db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, mw_trace_cb, (fn && *fn && sqlite3_uri_boolean(fn, "mw_rebase", 0)) ? (void *)1 : NULL);
     return SQLITE_OK;
 }
 

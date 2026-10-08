@@ -185,6 +185,8 @@ struct mw_lane {
     bool        norebase;       // this connection is itself a rebase helper: never rebase recursively
     bool        rebase_on;      // URI mw_rebase=1: a commit that conflicts on pages only is replayed at the latest snapshot (multiwriter_rebase.c)
     bool        rb_nobackoff;   // URI mw_rebase_backoff=0 (tests): replay every conflict, whatever happened to the last ones
+    sqlite3_stmt *rd_cur;   // the statement that is running (mw_rebase=1 connections; set by the statement hook), and what the transaction did before it:
+    int         rd_cur_kind; bool rd_dep; int64_t rd_prev_chg;   // rd_dep: it read rows that it may not have changed (see mw_lane_reads_unchanged)
     int         rb_streak, rb_skip;  // refused replays in a row, and conflicts to refuse without trying (a hot row: the replay would fail again at the cost of decoding the pages)
     sqlite3    *rb_db;          // the helper connection that replays (opened at the first rebase)
     void       *rb_state;       // what the helper caches: catalog, statements (multiwriter_rebase.c)
@@ -565,6 +567,8 @@ void     mw_gate_open (mw_db *db);   // multiwriter_rebase.c: replay the logical
 void     mw_rd_result_free (mw_rd_result *r);
 int      mw_lane_rebase (mw_lane *lane, const uint8_t *const *imgs, uint32_t cookie, uint64_t *out_epoch);    // multiwriter_rebase.c: replay the row changes at the latest snapshot
 void     mw_lane_rebase_free (mw_lane *lane);
+void     mw_lane_stmt_note (mw_lane *lane, mw_stmt_note *n);
+bool     mw_lane_reads_unchanged (mw_lane *lane, int64_t nchanged);   // multiwriter_lane.c: did the transaction read rows that it did not change? (then it is not rebased)
 int      mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_cat *cat, mw_rd_result *res);   // multiwriter_rowdiff.c
 bool     mw_rd_snap_page (mw_lane *lane, uint32_t pgno, uint8_t *dst);
 void     mw_shared_repair (mw_db *db);

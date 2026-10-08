@@ -11,8 +11,9 @@
 //    - every row that the transaction changed or deleted is, at the latest snapshot, exactly what it was at the transaction's snapshot (the whole row, not the cells: the transaction may have read
 //      the cells that it did not write). A row that somebody else changed or deleted since is a true conflict: the transaction is refused (SQLITE_BUSY_SNAPSHOT) and the application retries it;
 //    - a row that the transaction inserted is not there yet; the constraints (UNIQUE, CHECK, NOT NULL, the key) are evaluated by SQLite on the rows as they are now: a violation is a conflict.
-//  What is not: the rows that the transaction read and did not change. A page that it only read is validated as before (a change to it refuses the commit), but a row that it read from a page that
-//  it also wrote is not looked at: that is snapshot isolation (write skew is possible there), what a page-level validation did not allow.
+//  What is checked another way: the rows that the transaction read and did not change. A page that it only read is validated as before (a change to it refuses the commit), but a row that it read from a
+//  page that it also wrote cannot be told from a row it changed by the pages. The statements say it (mw_lane_reads_unchanged): a transaction that ran a SELECT, or a statement that visited more rows than
+//  it changed, is not rebased (write skew, test mw_rebaseskew).
 //  Not rebased (refused as before): DDL, a database with a trigger, a foreign key, a virtual table or a WITHOUT ROWID table, a write to an internal table (sqlite_sequence), a page of unknown owner,
 //  a record that does not decode, a row with fewer columns than the table (ALTER TABLE ADD COLUMN), a database that is not UTF-8.
 //
@@ -290,6 +291,7 @@ int mw_lane_rebase (mw_lane *lane, const uint8_t *const *imgs, uint32_t cookie, 
     mw_rd_result res;
     mw_rowdiff_compute(lane, imgs, R->cat, &res);                               // (in parallel: every connection decodes its own pages)
     if (res.unsupported || res.n == 0) { mw_rd_result_free(&res); atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }
+    if (mw_lane_reads_unchanged(lane, res.n)) { mw_rd_result_free(&res); atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }       // (it read rows that it did not change: write skew, the application retries)
     rb_req rq = { .lane = lane, .res = &res, .cookie = cookie };
     pthread_mutex_lock(&db->rb_qmu);
     if (db->rb_qtail) ((rb_req *)db->rb_qtail)->next = &rq; else db->rb_qhead = &rq;

@@ -18,7 +18,8 @@ typedef struct {
     uint32_t root;
     char *name;
     bool ok;                            // false: its CREATE TABLE could not be understood, or it is an internal table (sqlite_*): its rows are not replayed
-    bool without_rowid;                 // the b-tree is an index b-tree holding the whole row
+    bool without_rowid;                 // the b-tree is an index b-tree holding the whole row, the key columns first
+    int npk_rec;                        // (without_rowid) the number of key columns: the first record columns
     bool alias_pk;                      // INTEGER PRIMARY KEY: the key is the rowid (its record column holds NULL)
     int nrec;                           // columns stored in a record
     int alias_rec;                      // the record column of the rowid alias (-1: none)
@@ -35,6 +36,7 @@ typedef struct mw_cat {
     mw_tab *tabs; int n;
     uint32_t cookie;                    // the schema cookie it was built at
     bool rebasable;                     // a database whose transactions can be replayed: no trigger, virtual table or self-referencing or circular foreign key
+    bool has_wr;                        // there is a WITHOUT ROWID table (replayed if ok; its pages look like the pages of an index)
     bool has_fk;                        // some table has a foreign key (the replay then runs with them enforced, if the application's connection does)
     int maxrank;
     const char *why;                    // if not: the reason

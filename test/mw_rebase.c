@@ -26,6 +26,7 @@ static void make (const char *path, const char *ddl) {
 }
 #define FILL "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<40) INSERT INTO t(id, a, b) SELECT i, i, 'row'||i FROM n"
 static const char *TBL = "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, u INTEGER UNIQUE, c TEXT COLLATE NOCASE, r REAL); " FILL;
+static const char *TBL_WR = "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, u INTEGER UNIQUE, c TEXT COLLATE NOCASE, r REAL) WITHOUT ROWID; " FILL;     // (MW_TEST_WR=1: all the cases with a WITHOUT ROWID table)
 
 // A opens a transaction and changes something; B does the same and commits; then A commits: the result of A's commit is returned.
 static int race (sqlite3 *a, sqlite3 *b, const char *sa, const char *sb) {
@@ -52,6 +53,7 @@ static int cmp9 (const void *a, const void *b) { const uint64_t *x = a, *y = b; 
 
 int main (void) {
     char path[256];
+    if (getenv("MW_TEST_WR")) TBL = TBL_WR;
 
     {
         mw_tmpdb(path, sizeof path, "rebase9"); make(path, TBL); g_path9 = path;
@@ -148,12 +150,11 @@ int main (void) {
         CHECK(integrity_ok(a)); sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
     }
 
-    // 7. never rebased (refused as without the rebase, and the database stays right): DDL, a trigger, AUTOINCREMENT, a WITHOUT ROWID table
+    // 7. never rebased (refused as without the rebase, and the database stays right): DDL, a trigger, AUTOINCREMENT
     {
         struct { const char *name, *ddl, *sa, *sb; } cases[] = {
             { "a trigger", "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT); CREATE TRIGGER tg AFTER UPDATE ON t BEGIN SELECT 1; END; " FILL, "UPDATE t SET a = 1000 WHERE id = 3", "UPDATE t SET a = 2000 WHERE id = 30" },
             { "AUTOINCREMENT", "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, a INTEGER, b TEXT); " FILL, "INSERT INTO t(a) VALUES(1)", "INSERT INTO t(a) VALUES(2)" },
-            { "a WITHOUT ROWID table", "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT) WITHOUT ROWID; " FILL, "UPDATE t SET a = 1000 WHERE id = 3", "UPDATE t SET a = 2000 WHERE id = 30" },
         };
         for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
             mw_tmpdb(path, sizeof path, "rebase7"); make(path, cases[i].ddl);

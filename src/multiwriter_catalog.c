@@ -115,9 +115,9 @@ static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
     memset(t, 0, sizeof *t); t->root = r->root; t->name = strdup(r->name); t->alias_rec = -1;
     if (!r->sql || !starts_ci(r->sql, "CREATE TABLE") || starts_ci(r->sql, "CREATE VIRTUAL")) return;
     if (strncasecmp(r->name, "sqlite_", 7) == 0) return;
+    t->without_rowid = strcasestr(r->sql, "WITHOUT ROWID") != NULL;                                       // (a table named so would fool this; the scratch database rejects the statement then)
     char *err = NULL;
     if (sqlite3_exec(scratch, r->sql, NULL, NULL, &err) != SQLITE_OK) { sqlite3_free(err); return; }
-    t->without_rowid = strcasestr(r->sql, "WITHOUT ROWID") != NULL;                                       // (a table named so would fool this; the scratch database rejects the statement then)
     char *q = sqlite3_mprintf("PRAGMA table_xinfo(\"%w\")", r->name); sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(scratch, q, -1, &st, NULL) != SQLITE_OK) { sqlite3_free(q); return; }
     sqlite3_free(q);
@@ -131,15 +131,35 @@ static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
     int npk = 0; for (int i = 0; i < nc; i++) if (cols[i].pk > 0) npk++;
     if (!t->without_rowid && npk == 1) for (int i = 0; i < nc; i++) if (cols[i].pk == 1 && strcasecmp(cols[i].type, "INTEGER") == 0) t->alias_pk = true;
     t->rec_name = calloc((size_t)(nc ? nc : 1), sizeof(char *));
+    // the order of the columns in the record: the declaration order; in a WITHOUT ROWID table the primary key columns come first (in the order of the key), then the others
+    int order[2048], no = 0;
+    if (t->without_rowid) {
+        for (int k = 1; k <= npk; k++) for (int i = 0; i < nc; i++) if (cols[i].pk == k) order[no++] = i;
+        t->npk_rec = no;
+        for (int i = 0; i < nc; i++) if (cols[i].pk <= 0) order[no++] = i;
+        // the key must compare as bytes would: the default collation (BINARY) and ascending, or the pages cannot be walked and the rows cannot be told apart by their key
+        bool plain = npk > 0; char *iq = sqlite3_mprintf("PRAGMA index_list(\"%w\")", r->name); sqlite3_stmt *is = NULL; char *pkname = NULL;
+        if (iq && sqlite3_prepare_v2(scratch, iq, -1, &is, NULL) == SQLITE_OK) while (sqlite3_step(is) == SQLITE_ROW) { const char *org = (const char *)sqlite3_column_text(is, 3); if (org && !strcmp(org, "pk")) pkname = strdup((const char *)sqlite3_column_text(is, 1)); }
+        sqlite3_finalize(is); sqlite3_free(iq);
+        if (!pkname) plain = false;
+        else {
+            char *xq = sqlite3_mprintf("PRAGMA index_xinfo(\"%w\")", pkname); sqlite3_stmt *xs = NULL;
+            if (xq && sqlite3_prepare_v2(scratch, xq, -1, &xs, NULL) == SQLITE_OK) while (sqlite3_step(xs) == SQLITE_ROW) if (sqlite3_column_int(xs, 5)) { const char *co = (const char *)sqlite3_column_text(xs, 4); if (sqlite3_column_int(xs, 3) || !co || strcasecmp(co, "BINARY")) plain = false; }
+            sqlite3_finalize(xs); sqlite3_free(xq);
+        }
+        free(pkname);
+        if (!plain) { for (int i = 0; i < nc; i++) { free(cols[i].name); free(cols[i].type); free(cols[i].dflt); } return; }       // (t->ok stays false: a write to it is not replayed)
+    } else for (int i = 0; i < nc; i++) order[no++] = i;
     int pos = 0;
-    for (int i = 0; i < nc && t->rec_name; i++) {
+    for (int j = 0; j < no && t->rec_name; j++) {
+        int i = order[j];
         if (cols[i].hidden == 2) continue;                                                                   // (generated, virtual: not stored)
         if (t->alias_pk && cols[i].pk == 1) t->alias_rec = pos;
         t->rec_name[pos++] = (cols[i].hidden == 3) ? NULL : strdup(cols[i].name);                            // (generated, stored: in the record, derived)
     }
     t->nrec = pos;
     t->dflt = calloc((size_t)(pos ? pos : 1), sizeof *t->dflt);
-    for (int i = 0, k = 0; i < nc && t->dflt; i++) { if (cols[i].hidden == 2) continue; eval_default(scratch, cols[i].hidden == 3 ? NULL : cols[i].dflt, &t->dflt[k++]); }
+    for (int j = 0, k = 0; j < no && t->dflt; j++) { int i = order[j]; if (cols[i].hidden == 2) continue; eval_default(scratch, cols[i].hidden == 3 ? NULL : cols[i].dflt, &t->dflt[k++]); }
     for (int i = 0; i < nc; i++) if (cols[i].pk > 0) { t->pk_name = realloc(t->pk_name, (size_t)(t->npk + 1) * sizeof(char *)); t->pk_name[t->npk++] = strdup(cols[i].name); }
     {   // foreign keys
         char *fq = sqlite3_mprintf("PRAGMA foreign_key_list(\"%w\")", r->name); sqlite3_stmt *fs = NULL;
@@ -202,7 +222,7 @@ mw_cat *mw_cat_build (mw_lane *lane) {
         if (!strcmp(r->type, "trigger")) { c->rebasable = false; c->why = "the database has a trigger"; continue; }
         if (r->sql && starts_ci(r->sql, "CREATE VIRTUAL")) { c->rebasable = false; c->why = "the database has a virtual table"; }
         tab_parse(scratch, r, &c->tabs[c->n]);
-        if (c->tabs[c->n].without_rowid) { c->rebasable = false; c->why = "the database has a WITHOUT ROWID table"; }
+        if (c->tabs[c->n].without_rowid) c->has_wr = true;
         c->n++;
     }
     if (!c->tabs || !scratch) { c->rebasable = false; c->why = "no memory"; }

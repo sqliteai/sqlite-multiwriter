@@ -27,9 +27,10 @@ typedef struct { uint64_t snap, commit; uint64_t seq; int n; op_t op[MAXOPS]; in
 typedef struct { uint64_t snap; int n; int key[ROKEYS], ex[ROKEYS], v[ROKEYS], u[ROKEYS], pl[ROKEYS], w[ROKEYS]; } ro_t;
 typedef struct { rw_t *rw; size_t nrw, caprw; ro_t *ro; size_t nro, capro; long busy, constraint, other; } rec_t;
 
+static int g_wr;      // the table t is a WITHOUT ROWID table (its interior pages hold rows)
 static const char *g_path; static int g_keys; static double g_secs; static int g_procs_mode, g_threadmode, g_rebase;      // g_threadmode: the "processes" of the power-loss run are threads of one process (the engine's single-process mode)
 static int open_db (const char *path, sqlite3 **db) {
-    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=%d%s%s", path, getenv("MW_SERIAL_GC") ? atoi(getenv("MW_SERIAL_GC")) : 16, ((g_procs_mode && !g_threadmode) || getenv("MW_TEST_MP")) ? "&mw_mp=1" : "", g_rebase ? "&mw_rebase=1" : "");
+    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=%d%s%s%s", path, getenv("MW_SERIAL_GC") ? atoi(getenv("MW_SERIAL_GC")) : 16, ((g_procs_mode && !g_threadmode) || getenv("MW_TEST_MP")) ? "&mw_mp=1" : "", g_rebase ? "&mw_rebase=1" : "", getenv("MW_SERIAL_NOROUTE") ? "&mw_noroute=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;
@@ -289,7 +290,8 @@ static int final_check (const char *path, model *M, long *rows_out, long *model_
 static void make_db (const char *path, int nslots) {
     { char fn[400]; for (int slot = 0; slot < 32; slot++) { snprintf(fn, sizeof fn, "%s.rec%d", path, slot); unlink(fn); } }      // (the record files of a run that was killed: a process number that is used again gives the same path, and its records would be replayed into this run)
     sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix"), SQLITE_OK);
-    CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL, u INTEGER UNIQUE, p BLOB NOT NULL, w INTEGER NOT NULL DEFAULT 0); CREATE TABLE txlog(slot INTEGER PRIMARY KEY, seq INTEGER NOT NULL, pad BLOB NOT NULL)"), SQLITE_OK);
+    CHECK_RC(mw_exec(s, (g_wr || getenv("MW_SERIAL_WR")) ? "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL, u INTEGER UNIQUE, p BLOB NOT NULL, w INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID; CREATE TABLE txlog(slot INTEGER PRIMARY KEY, seq INTEGER NOT NULL, pad BLOB NOT NULL)"       // (MW_SERIAL_WR: the table is a WITHOUT ROWID table; the rebase replays it by its key)
+                                : "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL, u INTEGER UNIQUE, p BLOB NOT NULL, w INTEGER NOT NULL DEFAULT 0); CREATE TABLE txlog(slot INTEGER PRIMARY KEY, seq INTEGER NOT NULL, pad BLOB NOT NULL)"), SQLITE_OK);
     for (int i = 0; i < nslots; i++) { char q[120]; snprintf(q, sizeof q, "INSERT INTO txlog VALUES(%d, 0, zeroblob(3500))", i); CHECK_RC(mw_exec(s, q), SQLITE_OK); }          // (a row a page: the processes never conflict on it)
     sqlite3_close(s);
 }
@@ -469,6 +471,11 @@ int main (void) {
             run_procs("processes, hot + rebase", 12, 6, 6.0, 250, NULL);
             run_procs("processes, medium + rebase", 300, 6, 6.0, 250, NULL);
         }
+        g_wr = 1;                                                                                          // the same with a WITHOUT ROWID table (the rows are in the interior pages too: a read of one is not covered by the routes of the children)
+        snprintf(nm, sizeof nm, "WITHOUT ROWID, medium%s", suffix); run_threads(nm, 200, 8, 3.0);
+        snprintf(nm, sizeof nm, "WITHOUT ROWID, wide%s", suffix); run_threads(nm, 3000, 8, 3.0);
+        snprintf(nm, sizeof nm, "processes, WITHOUT ROWID, medium%s", suffix); run_procs(nm, 300, 6, 6.0, 250, NULL);
+        g_wr = 0;
     }
     MW_DONE();
 }

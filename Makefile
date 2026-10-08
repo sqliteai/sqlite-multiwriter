@@ -53,7 +53,7 @@ $(DIST)/mw_%: $(BUILD)/t_mw_%.o $(LIB_OBJ)
 .PRECIOUS: $(BUILD)/t_%.o
 
 test: $(FAST_BIN)
-	@set -e; for t in $(FAST_BIN); do echo "== $$t"; ./$$t; done
+	@set -e; for t in $(FAST_BIN); do echo "== $$t"; ./$$t; done; echo "== mw_rebase (a WITHOUT ROWID table)"; MW_TEST_WR=1 ./$(DIST)/mw_rebase
 
 # errors of the file system: a fault at every n-th file call of a workload, and a real full disk (a small disk image)
 .PHONY: test-io
@@ -72,7 +72,7 @@ clean:
 	rm -rf $(BUILD) $(DIST)
 
 # the transaction tests with the shared multi-process mode (mw_mp=1) in place of the thread mode
-MP_TESTS := mw_rebase mw_rebasefk mw_rebaseskew mw_serial mw_relocprep mw_shared
+MP_TESTS := mw_rebase mw_rebasefk mw_rebaseskew mw_rebasewr mw_serial mw_relocprep mw_shared
 .PHONY: test-mp
 test-mp: $(addprefix $(DIST)/,$(MP_TESTS))
 	@set -e; for t in $(MP_TESTS); do echo "== $$t (mw_mp=1)"; MW_TEST_MP=1 ./$(DIST)/$$t; done

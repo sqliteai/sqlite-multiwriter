@@ -107,14 +107,17 @@ enum { RD_OTHER = 0, RD_DML };
 typedef struct { char *sql; bool point; } rd_ent;
 enum { RD_CACHE = 32 };
 enum { BC_MAX = 400 };
-typedef struct { char op[24]; int p1; } bc_op;
+typedef struct { char op[24]; int addr, p1, p2; } bc_op;
 static bool bc_in (const char *op, const char *const *set, size_t n) { for (size_t i = 0; i < n; i++) if (strcmp(op, set[i]) == 0) return true; return false; }
 static bool bytecode_is_point (sqlite3 *db, const char *sql) {
     char *ex = sqlite3_mprintf("EXPLAIN %s", sql); if (!ex) return false;
     sqlite3_stmt *e = NULL; int rc = sqlite3_prepare_v2(db, ex, -1, &e, NULL); sqlite3_free(ex);
     if (rc != SQLITE_OK || !e) { sqlite3_finalize(e); return false; }
     static const char *const deny[] = { "SorterSort", "SorterNext", "SeekScan", "OpenEphemeral", "OpenAutoindex", "OpenPseudo", "VOpen", "VFilter", "VNext", "VUpdate", "VColumn", "Gosub",
-                                        "BeginSubrtn", "Once", "InitCoroutine", "Yield", "Sort" };
+                                        "BeginSubrtn", "InitCoroutine", "Yield", "Sort" };
+    // a constant expression that is computed once (zeroblob(100), abs(-1)) is a block guarded by Once that touches no table; a subquery that SQLite computes once is one too, but it has a cursor in it
+    static const char *const constop[] = { "Integer", "Int64", "Real", "String8", "String", "Blob", "Null", "Function", "PureFunc", "Copy", "SCopy", "IntCopy", "Variable", "Add", "Subtract", "Multiply", "Divide",
+                                           "Remainder", "Concat", "Cast", "Affinity", "Not", "BitAnd", "BitOr", "ShiftLeft", "ShiftRight", "Negative", "AddImm", "Noop", "MustBeInt", "RealAffinity" };
     // what a foreign key check may do inside a loop that scans the rows of the other table: nothing but compare columns and count
     static const char *const fkbody[] = { "Column", "Ne", "Eq", "Lt", "Le", "Gt", "Ge", "FkCounter", "Integer", "Copy", "SCopy", "Affinity", "IsNull", "NotNull", "Rowid", "IdxGT", "IdxGE", "IdxLT", "IdxLE",
                                           "DeferredSeek", "IdxRowid", "Goto", "MustBeInt", "Null", "String8", "Int64", "Real", "Variable" };
@@ -123,7 +126,7 @@ static bool bytecode_is_point (sqlite3 *db, const char *sql) {
         const char *op = (const char *)sqlite3_column_text(e, 1);
         if (!op || n >= BC_MAX) { point = false; break; }
         if (n > 0 && !strcmp(op, "Init")) break;                       // (EXPLAIN lists the sub-programs after the main one, each starting with its own Init: the actions of foreign keys. They are repeated by the replay.)
-        snprintf(ops[n].op, sizeof ops[n].op, "%s", op); ops[n].p1 = sqlite3_column_int(e, 2); n++;
+        snprintf(ops[n].op, sizeof ops[n].op, "%s", op); ops[n].addr = sqlite3_column_int(e, 0); ops[n].p1 = sqlite3_column_int(e, 2); ops[n].p2 = sqlite3_column_int(e, 3); n++;
     }
     sqlite3_finalize(e); e = NULL;
     int rdcur[64]; int nrd = 0;                                        // the cursors opened for reading
@@ -132,6 +135,10 @@ static bool bytecode_is_point (sqlite3 *db, const char *sql) {
     for (int i = 0; point && i < n; i++) {
         const char *op = ops[i].op;
         if (bc_in(op, deny, sizeof deny / sizeof *deny)) { point = false; break; }
+        if (!strcmp(op, "Once")) {
+            for (int k = i + 1; k < n && ops[k].addr < ops[i].p2; k++) if (!bc_in(ops[k].op, constop, sizeof constop / sizeof *constop)) { point = false; break; }
+            continue;
+        }
         if (!strcmp(op, "Program")) continue;                           // (the actions of a foreign key; a database with a trigger is never rebased)
         bool isread = false; for (int k = 0; k < nrd; k++) if (rdcur[k] == ops[i].p1) isread = true;
         bool start = !strcmp(op, "Rewind") || !strcmp(op, "Last") || (isread && (!strncmp(op, "Seek", 4)));

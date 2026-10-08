@@ -23,6 +23,7 @@ typedef struct {
     uint32_t root; const mw_tab *tab; int64_t rowid;
     const uint8_t *rec; uint32_t reclen;       // the whole record (for a row with overflow: the local part and the chain, copied into `own`)
     uint8_t *own;
+    uint8_t *kbuf; uint32_t klen;              // (WITHOUT ROWID) the key: the serial types and bytes of the key columns, which identifies the row
     bool bad;                                  // the record could not be read in full
     uint32_t *chain; int nchain;               // (new state) the overflow pages of the record
 } rd_row;
@@ -170,12 +171,94 @@ static int rows_of (mw_lane *lane, const uint8_t *const *imgs, bool new_state, c
     return 0;
 }
 
+
+// ---- WITHOUT ROWID tables: their pages are index b-trees (0x0a leaf, 0x02 interior), and the interior cells hold rows too ----
+// A page of this kind belongs to a WITHOUT ROWID table or to an index, and nothing in the page says which. At the snapshot the interior pages of the trees of the WITHOUT ROWID tables are walked (the
+// leaves are not read: the tree is as deep on every path) and every page they list is known (S: page -> root). In the committed state of the transaction a page that one of its written interior pages lists
+// belongs where that page belongs; any other page is where the snapshot had it. A page that is in neither is an index's.
+static int s_build (mw_lane *lane, const mw_cat *cat, ovmap *S, uint8_t *tmp) {
+    uint32_t pgsz = (uint32_t)lane->db->store->pgsz; long reads = 0;
+    for (int t = 0; t < cat->n; t++) {
+        const mw_tab *tab = &cat->tabs[t]; if (!tab->without_rowid || tab->root <= 1) continue;
+        ov_put(S, tab->root, tab->root);
+        int depth = 0;
+        for (uint32_t pg = tab->root; depth < 40; depth++) {                                                    // how many levels of interior pages: down the right edge
+            if (++reads > 200000 || !mw_rd_snap_page(lane, pg, tmp)) return -1;
+            if (tmp[0] == 0x0a) break;
+            if (tmp[0] != 0x02) return -1;
+            pg = be32(tmp + 8);
+        }
+        uint32_t *lvl = malloc(sizeof *lvl), *nxt = NULL; size_t nl = 1, nn = 0, cn = 0; if (!lvl) return -1;
+        lvl[0] = tab->root;
+        for (int d = 0; d < depth; d++) {
+            nn = 0;
+            for (size_t i = 0; i < nl; i++) {
+                if (++reads > 200000 || !mw_rd_snap_page(lane, lvl[i], tmp) || tmp[0] != 0x02) { free(lvl); free(nxt); return -1; }
+                int nc = be16(tmp + 3);
+                for (int c = -1; c < nc; c++) {
+                    uint32_t ch;
+                    if (c < 0) ch = be32(tmp + 8); else { uint32_t off = (uint32_t)be16(tmp + 12 + 2 * c); if (off + 4 > pgsz) { free(lvl); free(nxt); return -1; } ch = be32(tmp + off); }
+                    ov_put(S, ch, tab->root);
+                    if (d + 1 < depth) { if (nn == cn) { cn = cn ? cn * 2 : 64; uint32_t *np = realloc(nxt, cn * sizeof *np); if (!np) { free(lvl); free(nxt); return -1; } nxt = np; } nxt[nn++] = ch; }
+                }
+            }
+            free(lvl); lvl = nxt; nl = nn; nxt = NULL; cn = 0;
+        }
+        free(lvl); free(nxt);
+    }
+    return 0;
+}
+static bool is_wr_root (const mw_cat *cat, uint32_t pg) { const mw_tab *t = mw_cat_by_root(cat, pg); return t && t->without_rowid; }
+
+// Adds the rows of one page of a WITHOUT ROWID table (leaf 0x0a or interior 0x02). The key of a row is the serial types and bytes of its first `npk` columns.
+static int rows_of_index (mw_lane *lane, const uint8_t *const *imgs, bool new_state, const uint8_t *pg, uint32_t pgsz, rowset *rs, uint32_t root, const mw_cat *cat) {
+    const mw_tab *tab = mw_cat_by_root(cat, root);
+    bool interior = pg[0] == 0x02; uint32_t hdr = interior ? 12 : 8;
+    int nc = be16(pg + 3);
+    const uint32_t U = pgsz, M = ((U - 12) * 32 / 255) - 23, X = ((U - 12) * 64 / 255) - 23;
+    if (rs->n + nc > rs->cap) { int ncap = rs->cap ? rs->cap : 64; while (ncap < rs->n + nc) ncap *= 2; rd_row *p = realloc(rs->a, (size_t)ncap * sizeof *p); if (!p) return -1; rs->a = p; rs->cap = ncap; }
+    for (int i = 0; i < nc; i++) {
+        uint32_t off = (uint32_t)be16(pg + hdr + 2 * i);
+        if (off < hdr || off >= pgsz) return -1;
+        const uint8_t *c = pg + off, *end = pg + pgsz;
+        if (interior) c += 4;
+        uint64_t P; int a = varint(c, end, &P); if (!a) return -1;
+        uint32_t local = (uint32_t)P, ovfl = 0;
+        if (P > X) { uint32_t K = M + (uint32_t)((P - M) % (U - 4)); local = K <= X ? K : M; if (c + a + local + 4 > end) return -1; ovfl = be32(c + a + local); }
+        else if (c + a + local > end) return -1;
+        rd_row *r = &rs->a[rs->n++]; memset(r, 0, sizeof *r);
+        r->root = root; r->tab = tab; r->rec = c + a; r->reclen = local;
+        if (ovfl) { if (full_payload(lane, imgs, new_state, r->rec, local, P, ovfl, &r->own, new_state ? &r->chain : NULL, &r->nchain)) { r->rec = r->own; r->reclen = (uint32_t)P; } else r->bad = true; }
+        if (!r->bad) {                                                                                               // the key
+            uint64_t hs; int h = varint(r->rec, r->rec + r->reclen, &hs);
+            if (!h || hs > r->reclen) r->bad = true;
+            else {
+                uint32_t pos = (uint32_t)hs, hp = (uint32_t)h; int col = 0; uint8_t *kb = malloc((size_t)hs * 2 + 16 + r->reclen); uint32_t kl = 0;
+                while (kb && col < tab->npk_rec && hp < hs) {
+                    uint64_t t; int k = varint(r->rec + hp, r->rec + hs, &t); if (!k) { r->bad = true; break; }
+                    uint32_t l = t < 12 ? ((const uint8_t[]){0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0})[t] : (uint32_t)((t - 12) / 2);
+                    if (pos + l > r->reclen) { r->bad = true; break; }
+                    memcpy(kb + kl, r->rec + hp, (size_t)k); kl += (uint32_t)k; memcpy(kb + kl, r->rec + pos, l); kl += l;
+                    hp += (uint32_t)k; pos += l; col++;
+                }
+                if (!kb || col < tab->npk_rec) r->bad = true;
+                r->kbuf = kb; r->klen = kl;
+            }
+        }
+    }
+    return 0;
+}
+
 static int row_cmp (const void *a, const void *b) {
     const rd_row *p = a, *q = b;
     if (p->root != q->root) return p->root < q->root ? -1 : 1;
+    if (p->tab && p->tab->without_rowid) {
+        if (p->klen != q->klen) return p->klen < q->klen ? -1 : 1;
+        int c = memcmp(p->kbuf, q->kbuf, p->klen); return c < 0 ? -1 : c > 0;
+    }
     return p->rowid < q->rowid ? -1 : p->rowid > q->rowid;
 }
-static void rows_free (rowset *rs) { for (int i = 0; i < rs->n; i++) { free(rs->a[i].own); free(rs->a[i].chain); } free(rs->a); }
+static void rows_free (rowset *rs) { for (int i = 0; i < rs->n; i++) { free(rs->a[i].own); free(rs->a[i].chain); free(rs->a[i].kbuf); } free(rs->a); }
 static uint8_t *dup_bytes (const uint8_t *p, uint32_t n) { uint8_t *b = malloc(n ? n : 1); if (b) memcpy(b, p, n); return b; }
 
 // Computes the row changes of the write set. The caller frees the result with mw_rd_result_free. res->unsupported: not NULL when the write set holds something that is not decoded exactly.
@@ -202,6 +285,18 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_cat 
     }
     // owners of the pages of the committed state that the interior pages written by the commit list (a few passes: an interior page may itself be new)
     ovmap ov = {0};
+    ovmap S = {0}, cm = {0};                                                          // WITHOUT ROWID: page -> root at the snapshot (built when first needed), and child -> parent for the interior pages that the transaction wrote
+    bool s_ready = false;
+    if (!why && cat->has_wr) for (int i = 0; i < lane->ws_n; i++) {
+        const uint8_t *pg = imgs[i]; if (lane->ws_pgnos[i] == 1 || (pg[0] != 0x05 && pg[0] != 0x02)) continue;
+        int nc = be16(pg + 3); uint32_t hdr = 12;
+        for (int c = -1; c < nc; c++) {
+            uint32_t ch;
+            if (c < 0) ch = be32(pg + 8); else { uint32_t off = (uint32_t)be16(pg + hdr + 2 * c); if (off + 4 > pgsz) continue; ch = be32(pg + off); }
+            ov_put(&cm, ch, lane->ws_pgnos[i]);
+        }
+    }
+    #define ENSURE_S() do { if (!why && cat->has_wr && !s_ready) { s_ready = true; if (s_build(lane, cat, &S, t1) < 0) why = "the pages of the WITHOUT ROWID tables cannot be listed"; } } while (0)
     own_cache oc[64]; int noc = 0;
     #define OLD_OWNER(pgno, out) do { (out) = 0; for (int _q = 0; _q < noc; _q++) if (oc[_q].pg == (pgno)) (out) = oc[_q].root; if (!(out) && !why) { (out) = old_owner(lane, cat, (pgno), t1, t2); if ((out) && noc < 64) oc[noc++] = (own_cache){ (pgno), (out) }; } } while (0)
     #define NEW_OWNER(pgno, out) do { (out) = 0; if (mw_cat_by_root(cat, (pgno))) (out) = (pgno); else { (out) = ov_get(&ov, (pgno)); if (!(out)) OLD_OWNER((pgno), (out)); } } while (0)
@@ -233,9 +328,35 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_cat 
             const mw_tab *tab = mw_cat_by_root(cat, root); if (!tab || !tab->ok) { why = "a table that cannot be replayed was written"; break; }
             if (rows_of(lane, imgs, true, imgs[i], pgsz, &newr, root, cat) < 0) { why = "a leaf page does not decode"; break; }
         }
+        if (kn == 'I' && cat->has_wr && !in_fn) {                                                                      // a page of a WITHOUT ROWID table, or of an index
+            ENSURE_S(); if (why) break;
+            uint32_t root = 0, cur = pgno;
+            for (int g = 0; g < 64; g++) {
+                if (is_wr_root(cat, cur)) { root = cur; break; }
+                uint32_t par = ov_get(&cm, cur);
+                if (!par) { root = ov_get(&S, cur); break; }
+                const uint8_t *pi = ws_image(lane, imgs, par); if (!pi || pi[0] != 0x02) break;
+                cur = par;
+            }
+            if (root) {
+                const mw_tab *tab = mw_cat_by_root(cat, root); if (!tab || !tab->ok) { why = "a table that cannot be replayed was written"; break; }
+                if (rows_of_index(lane, imgs, true, imgs[i], pgsz, &newr, root, cat) < 0) { why = "a page of a WITHOUT ROWID table does not decode"; break; }
+            }
+        }
         // the same page as the snapshot had it (a page that did not exist yet has no old rows)
         bool have_old = false;
         if (pgno <= lane->dsz_val && mw_rd_snap_page(lane, pgno, oldimg)) have_old = true;
+        if (have_old && cat->has_wr && page_kind(oldimg, pgno) == 'I' && !in_fo) {
+            ENSURE_S(); if (why) break;
+            uint32_t root = ov_get(&S, pgno);
+            if (root) {
+                const mw_tab *tab = mw_cat_by_root(cat, root); if (!tab || !tab->ok) { why = "a table that cannot be replayed was written"; break; }
+                uint8_t *cp = dup_bytes(oldimg, pgsz); uint8_t **nk = cp ? realloc(keeps, (size_t)(nkeeps + 1) * sizeof *keeps) : NULL;
+                if (!nk) { free(cp); why = "no memory"; break; }
+                keeps = nk; keeps[nkeeps++] = cp;
+                if (rows_of_index(lane, imgs, false, cp, pgsz, &oldr, root, cat) < 0) { why = "a page of a WITHOUT ROWID table does not decode"; break; }
+            }
+        }
         if (have_old && page_kind(oldimg, pgno) == 'L' && !in_fo) {
             uint32_t root; OLD_OWNER(pgno, root);
             if (!root) { why = "a page of a table that the transaction wrote has no known owner"; break; }
@@ -252,6 +373,18 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_cat 
         if (nfo && bsearch(&pg, fo, (size_t)nfo, sizeof *fo, cmp_u32)) continue;                                  // already free
         if (ws_image(lane, imgs, pg)) continue;                                                                    // rewritten: handled in the loop above
         if (!mw_rd_snap_page(lane, pg, oldimg)) continue;
+        if (page_kind(oldimg, pg) == 'I' && cat->has_wr) {
+            ENSURE_S(); if (why) break;
+            uint32_t wroot = ov_get(&S, pg);
+            if (wroot) {
+                const mw_tab *tab = mw_cat_by_root(cat, wroot); if (!tab || !tab->ok) { why = "a table that cannot be replayed was written"; break; }
+                uint8_t *cp = dup_bytes(oldimg, pgsz); uint8_t **nk = cp ? realloc(keeps, (size_t)(nkeeps + 1) * sizeof *keeps) : NULL;
+                if (!nk) { free(cp); why = "no memory"; break; }
+                keeps = nk; keeps[nkeeps++] = cp;
+                if (rows_of_index(lane, imgs, false, cp, pgsz, &oldr, wroot, cat) < 0) { why = "a page of a WITHOUT ROWID table does not decode"; break; }
+            }
+            continue;
+        }
         if (page_kind(oldimg, pg) != 'L') continue;
         uint32_t root; OLD_OWNER(pg, root);
         if (!root) { why = "a page that the transaction freed has no known owner"; break; }
@@ -275,7 +408,7 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_cat 
         }
         free(nch);
     }
-    free(fo); free(fn); free(p1old); free(oldimg); free(t1); free(t2); free(ov.pg); free(ov.root);
+    free(fo); free(fn); free(p1old); free(oldimg); free(t1); free(t2); free(ov.pg); free(ov.root); free(S.pg); free(S.root); free(cm.pg); free(cm.root);
     for (int i = 0; i < oldr.n && !why; i++) if (oldr.a[i].bad) why = "a record does not decode";
     for (int i = 0; i < newr.n && !why; i++) if (newr.a[i].bad) why = "a record does not decode";
     if (why) { res->unsupported = why; rows_free(&oldr); rows_free(&newr); for (int k = 0; k < nkeeps; k++) free(keeps[k]); free(keeps); return 0; }

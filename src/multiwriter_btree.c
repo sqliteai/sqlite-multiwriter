@@ -86,7 +86,10 @@ bool mw_interior_routes_same (const uint8_t *old, const uint8_t *nw, int pgsz, i
     inode a, b;
     if (!parse_interior(old, pgsz, reserved, &a)) return false;
     if (!parse_interior(nw, pgsz, reserved, &b)) { free(a.cells); return false; }
-    bool ok = a.type == b.type, any = false;
+    // Only for the interior pages of a *table* b-tree. The cells of an index interior page are entries, not only dividers (for a WITHOUT ROWID table they are whole rows): what a transaction read from one of
+    // them is not covered by the routes of the children it used. That was measured (test mw_serial, a WITHOUT ROWID table in the processes mode): stale reads were accepted, even when every cell of the
+    // old page is still in the new one. So a changed index interior page is a conflict.
+    bool ok = a.type == 0x05 && b.type == 0x05, any = false;
     for (int i = 0; ok && i <= a.n; i++) {
         uint32_t c = i < a.n ? a.cells[i].child : a.right;
         int lo = 0, hi = nused - 1, hit = 0;                          // is this child one the transaction went through?

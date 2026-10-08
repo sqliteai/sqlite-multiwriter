@@ -155,21 +155,44 @@ static uint8_t *rec_pad (const mw_tab *t, const rec_t *r, uint32_t *outlen) {
 
 // ---- the statements of a table ----
 static bool name_is (const char *a, const char *b) { return strcasecmp(a, b) == 0; }
+// the condition that picks a WITHOUT ROWID row by its key: the key columns are the first record columns (the parameters of a column are ?(2 + its place among the writable columns))
+static char *wr_pkconds (const mw_tab *t) {
+    char *c = sqlite3_mprintf(""); int k = 1;
+    for (int i = 0; i < t->nrec; i++) {
+        if (!t->rec_name[i] || i == t->alias_rec) continue;
+        k++;
+        if (i < t->npk_rec) { char *a = sqlite3_mprintf("%s%s\"%w\"=?%d", c, *c ? " AND " : "", t->rec_name[i], k); sqlite3_free(c); c = a; }
+    }
+    return c;
+}
 static int tstmt_prepare (sqlite3 *h, const mw_tab *t, tstmt *s) {
     const char *rid = NULL; static const char *cand[] = { "rowid", "_rowid_", "oid" };
-    for (int c = 0; c < 3 && !rid; c++) { bool used = false; for (int i = 0; i < t->nrec; i++) if (t->rec_name[i] && name_is(t->rec_name[i], cand[c])) used = true; if (!used) rid = cand[c]; }
-    if (!rid) return SQLITE_MISUSE;
+    if (!t->without_rowid) {
+        for (int c = 0; c < 3 && !rid; c++) { bool used = false; for (int i = 0; i < t->nrec; i++) if (t->rec_name[i] && name_is(t->rec_name[i], cand[c])) used = true; if (!used) rid = cand[c]; }
+        if (!rid) return SQLITE_MISUSE;
+    }
     char *cols = sqlite3_mprintf(""), *marks = sqlite3_mprintf(""), *conds = sqlite3_mprintf(""); int k = 1;
     for (int i = 0; i < t->nrec; i++) {
         if (!t->rec_name[i] || i == t->alias_rec) continue;
         k++;
         char *a = sqlite3_mprintf("%s,\"%w\"", cols, t->rec_name[i]); sqlite3_free(cols); cols = a;
         a = sqlite3_mprintf("%s,?%d", marks, k); sqlite3_free(marks); marks = a;
-        a = sqlite3_mprintf("%s AND \"%w\" COLLATE BINARY IS ?%d", conds, t->rec_name[i], k); sqlite3_free(conds); conds = a;
+        if (t->without_rowid && i < t->npk_rec) a = sqlite3_mprintf("%s AND \"%w\"=?%d", conds, t->rec_name[i], k);
+        else a = sqlite3_mprintf("%s AND \"%w\" COLLATE BINARY IS ?%d", conds, t->rec_name[i], k);
+        sqlite3_free(conds); conds = a;
     }
-    char *q[3] = { sqlite3_mprintf("SELECT 1 FROM \"%w\" WHERE %s=?1%s", t->name, rid, conds),
-                   sqlite3_mprintf("INSERT INTO \"%w\"(%s%s) VALUES(?1%s)", t->name, rid, cols, marks),
-                   sqlite3_mprintf("DELETE FROM \"%w\" WHERE %s=?1", t->name, rid) };
+    char *q[3];
+    if (t->without_rowid) {
+        char *pk = wr_pkconds(t);
+        q[0] = sqlite3_mprintf("SELECT 1 FROM \"%w\" WHERE 1%s", t->name, conds);
+        q[1] = sqlite3_mprintf("INSERT INTO \"%w\"(%s) VALUES(%s)", t->name, cols + (*cols ? 1 : 0), marks + (*marks ? 1 : 0));
+        q[2] = sqlite3_mprintf("DELETE FROM \"%w\" WHERE %s", t->name, pk);
+        sqlite3_free(pk);
+    } else {
+        q[0] = sqlite3_mprintf("SELECT 1 FROM \"%w\" WHERE %s=?1%s", t->name, rid, conds);
+        q[1] = sqlite3_mprintf("INSERT INTO \"%w\"(%s%s) VALUES(?1%s)", t->name, rid, cols, marks);
+        q[2] = sqlite3_mprintf("DELETE FROM \"%w\" WHERE %s=?1", t->name, rid);
+    }
     int rc = SQLITE_OK;
     if (q[0] && sqlite3_prepare_v2(h, q[0], -1, &s->sel, NULL) != SQLITE_OK) rc = SQLITE_ERROR;
     if (rc == SQLITE_OK && q[1] && sqlite3_prepare_v2(h, q[1], -1, &s->ins, NULL) != SQLITE_OK) rc = SQLITE_ERROR;
@@ -180,13 +203,15 @@ static int tstmt_prepare (sqlite3 *h, const mw_tab *t, tstmt *s) {
     return rc;
 }
 
-static int bind_row (sqlite3_stmt *st, const mw_tab *t, int64_t rowid, const rec_t *r, bool use_mask, uint64_t only) {      // use_mask: bind just the columns of `only` (an UPDATE)
+enum { BIND_ALL = 0, BIND_MASK, BIND_KEY };                  // BIND_MASK: just the columns of `only` (an UPDATE), and the key of a WITHOUT ROWID row; BIND_KEY: just the key (its DELETE)
+static int bind_row (sqlite3_stmt *st, const mw_tab *t, int64_t rowid, const rec_t *r, int mode, uint64_t only) {
     sqlite3_reset(st); sqlite3_clear_bindings(st);
     sqlite3_bind_int64(st, 1, rowid);
     int k = 1, bit = 0;
     for (int i = 0; i < t->nrec; i++) {
         if (!t->rec_name[i] || i == t->alias_rec) continue;
-        bool take = !use_mask || (bit < 64 && (only >> bit & 1));
+        bool key = t->without_rowid && i < t->npk_rec;
+        bool take = mode == BIND_ALL || (mode == BIND_MASK && ((bit < 64 && (only >> bit & 1)) || key)) || (mode == BIND_KEY && key);
         bit++;
         if (!take) continue;
         k++;
@@ -202,6 +227,7 @@ static bool changed_mask (const mw_tab *t, const rec_t *o, const rec_t *n, uint6
     for (int i = 0; i < t->nrec; i++) {
         if (!t->rec_name[i] || i == t->alias_rec) continue;
         if (bit >= 64) return false;
+        if (t->without_rowid && i < t->npk_rec) { bit++; continue; }                                  // (the key is the identity of the row: it does not change)
         if (o->ty[i] != n->ty[i] || o->len[i] != n->len[i] || (o->len[i] && memcmp(o->rec + o->off[i], n->rec + n->off[i], o->len[i]) != 0)) *mask |= 1ull << bit;
         bit++;
     }
@@ -211,13 +237,16 @@ static sqlite3_stmt *update_stmt (sqlite3 *h, const mw_tab *t, tstmt *ts, uint64
     for (int k = 0; k < ts->nupd; k++) if (ts->upd[k].mask == mask) return ts->upd[k].st;
     const char *rid = "rowid"; static const char *cand[] = { "rowid", "_rowid_", "oid" };
     for (int c = 0; c < 3; c++) { bool used = false; for (int i = 0; i < t->nrec; i++) if (t->rec_name[i] && name_is(t->rec_name[i], cand[c])) used = true; if (!used) { rid = cand[c]; break; } }
-    char *sets = sqlite3_mprintf(""); int bit = 0, k = 1;
+    char *sets = sqlite3_mprintf(""); int bit = 0, k = 1 + (t->without_rowid ? t->npk_rec : 0);       // (a WITHOUT ROWID row is found by its key: ?2.. are the key columns, the new values follow)
     for (int i = 0; i < t->nrec; i++) {
         if (!t->rec_name[i] || i == t->alias_rec) continue;
         if (mask >> bit & 1) { k++; char *a = sqlite3_mprintf("%s%s\"%w\"=?%d", sets, *sets ? "," : "", t->rec_name[i], k); sqlite3_free(sets); sets = a; }
         bit++;
     }
-    char *q = sqlite3_mprintf("UPDATE \"%w\" SET %s WHERE %s=?1", t->name, sets, rid); sqlite3_free(sets);
+    char *q;
+    if (t->without_rowid) { char *pk = wr_pkconds(t); q = sqlite3_mprintf("UPDATE \"%w\" SET %s WHERE %s", t->name, sets, pk); sqlite3_free(pk); }
+    else q = sqlite3_mprintf("UPDATE \"%w\" SET %s WHERE %s=?1", t->name, sets, rid);
+    sqlite3_free(sets);
     sqlite3_stmt *st = NULL; int rc = q ? sqlite3_prepare_v2(h, q, -1, &st, NULL) : SQLITE_NOMEM; sqlite3_free(q);
     if (rc != SQLITE_OK) return NULL;
     int slot;
@@ -247,21 +276,21 @@ static int apply_chg (sqlite3 *h, const mw_tab *lt, tstmt *ts, const mw_chg *c) 
         if (newr.n < lt->nrec) { nb = rec_pad(lt, &newr, &l); if (!nb || !rec_parse(&newr, nb, l)) goto out; }
     }
     if (c->old_rec) {                                                  // it is the row that the transaction saw
-        if (bind_row(ts->sel, lt, c->rowid, &oldr, false, 0) != SQLITE_OK) goto out;
+        if (bind_row(ts->sel, lt, c->rowid, &oldr, BIND_ALL, 0) != SQLITE_OK) goto out;
         src = sqlite3_step(ts->sel); sqlite3_reset(ts->sel);
         if ((src & 0xff) == SQLITE_BUSY) { rc = SQLITE_BUSY; goto out; }
         if (src != SQLITE_ROW) goto out;
     }
-    if (c->kind == 3) { if (bind_row(ts->del, lt, c->rowid, NULL, false, 0) != SQLITE_OK) goto out; src = sqlite3_step(ts->del); sqlite3_reset(ts->del); }
+    if (c->kind == 3) { if (bind_row(ts->del, lt, c->rowid, lt->without_rowid ? &oldr : NULL, BIND_KEY, 0) != SQLITE_OK) goto out; src = sqlite3_step(ts->del); sqlite3_reset(ts->del); }
     else if (c->kind == 2) {
         uint64_t mask; if (!changed_mask(lt, &oldr, &newr, &mask)) goto out;
         if (mask == 0) { rc = SQLITE_OK; goto out; }                                                  // (only a derived column changed)
         if (lt->is_parent && (mask & lt->refmask)) goto out;                                          // (a key that a foreign key refers to changes: the ON UPDATE actions are not replayed)
         sqlite3_stmt *us = update_stmt(h, lt, ts, mask); if (!us) goto out;
-        if (bind_row(us, lt, c->rowid, &newr, true, mask) != SQLITE_OK) goto out;
+        if (bind_row(us, lt, c->rowid, &newr, BIND_MASK, mask) != SQLITE_OK) goto out;
         src = sqlite3_step(us); sqlite3_reset(us);
     }
-    else { if (bind_row(ts->ins, lt, c->rowid, &newr, false, 0) != SQLITE_OK) goto out; src = sqlite3_step(ts->ins); sqlite3_reset(ts->ins); }
+    else { if (bind_row(ts->ins, lt, c->rowid, &newr, BIND_ALL, 0) != SQLITE_OK) goto out; src = sqlite3_step(ts->ins); sqlite3_reset(ts->ins); }
     rc = src == SQLITE_DONE ? SQLITE_OK : (src & 0xff) == SQLITE_BUSY ? SQLITE_BUSY : MW_CONFLICT;
 out:
     free(ob); free(nb);

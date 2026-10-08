@@ -148,11 +148,10 @@ int main (void) {
         CHECK(integrity_ok(a)); sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
     }
 
-    // 7. never rebased (refused as without the rebase, and the database stays right): DDL, a trigger, a foreign key, AUTOINCREMENT, a WITHOUT ROWID table
+    // 7. never rebased (refused as without the rebase, and the database stays right): DDL, a trigger, AUTOINCREMENT, a WITHOUT ROWID table
     {
         struct { const char *name, *ddl, *sa, *sb; } cases[] = {
             { "a trigger", "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT); CREATE TRIGGER tg AFTER UPDATE ON t BEGIN SELECT 1; END; " FILL, "UPDATE t SET a = 1000 WHERE id = 3", "UPDATE t SET a = 2000 WHERE id = 30" },
-            { "a foreign key", "CREATE TABLE p(id INTEGER PRIMARY KEY); CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, p REFERENCES p(id)); " FILL, "UPDATE t SET a = 1000 WHERE id = 3", "UPDATE t SET a = 2000 WHERE id = 30" },
             { "AUTOINCREMENT", "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, a INTEGER, b TEXT); " FILL, "INSERT INTO t(a) VALUES(1)", "INSERT INTO t(a) VALUES(2)" },
             { "a WITHOUT ROWID table", "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT) WITHOUT ROWID; " FILL, "UPDATE t SET a = 1000 WHERE id = 3", "UPDATE t SET a = 2000 WHERE id = 30" },
         };
@@ -185,6 +184,30 @@ int main (void) {
         int64_t suma = mw_scalar(a, "SELECT sum(a) FROM t WHERE id <= 10"), sumb = mw_scalar(a, "SELECT sum(a) FROM t WHERE id BETWEEN 21 AND 30");
         printf("8. 300 rounds of two connections, own rows on shared pages: A committed %d, B %d; sums %lld and %lld; rebases %llu\n", ra, rb, (long long)(suma - 55), (long long)(sumb - 255), (unsigned long long)stats(a).rebases);
         CHECK(suma - 55 == ra); CHECK(sumb - 255 == rb); CHECK(ra == 300);                                          // (disjoint rows: every commit of A is saved by the rebase)
+        CHECK(integrity_ok(a)); sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+    }
+    // 10. rows written before an ALTER TABLE ADD COLUMN have fewer columns than the table: the missing ones are the defaults, in the comparison and in the replay
+    {
+        mw_tmpdb(path, sizeof path, "rebase10"); make(path, TBL);
+        sqlite3 *x; CHECK_RC(sqlite3_open_v2(path, &x, SQLITE_OPEN_READWRITE, "unix"), SQLITE_OK);
+        CHECK_RC(mw_exec(x, "ALTER TABLE t ADD COLUMN z INTEGER DEFAULT 7; ALTER TABLE t ADD COLUMN s TEXT DEFAULT 'hi'; ALTER TABLE t ADD COLUMN f REAL DEFAULT 2.5; ALTER TABLE t ADD COLUMN k BLOB"), SQLITE_OK);
+        sqlite3_close(x);
+        sqlite3 *a, *b; CHECK_RC(open_mw(path, &a, 1), SQLITE_OK); CHECK_RC(open_mw(path, &b, 1), SQLITE_OK);
+        int rc = race(a, b, "UPDATE t SET a = 1000 WHERE id = 3", "UPDATE t SET a = 2000 WHERE id = 30");           // both rows are short; the first becomes full
+        mw_db_stats st = stats(a);
+        printf("10. short rows, update: rc=%d, rebases %llu\n", rc, (unsigned long long)st.rebases);
+        CHECK_RC(rc, SQLITE_OK); CHECK(st.rebases == 1); CHECK(mw_scalar(a, "SELECT a FROM t WHERE id=3") == 1000); CHECK(mw_scalar(a, "SELECT a FROM t WHERE id=30") == 2000);
+        CHECK(mw_scalar(a, "SELECT z FROM t WHERE id=3") == 7 && mw_scalar(a, "SELECT s = 'hi' AND f = 2.5 AND k IS NULL FROM t WHERE id=3") == 1);
+        rc = race(a, b, "DELETE FROM t WHERE id = 5", "UPDATE t SET a = a + 1 WHERE id = 31");                          // a short row deleted
+        printf("10. short rows, delete: rc=%d\n", rc);
+        CHECK_RC(rc, SQLITE_OK); CHECK(mw_scalar(a, "SELECT count(*) FROM t WHERE id=5") == 0); CHECK(mw_scalar(a, "SELECT a FROM t WHERE id=31") == 32);
+        rc = race(a, b, "UPDATE t SET a = 77 WHERE id = 8", "UPDATE t SET z = 8 WHERE id = 8");                          // the other changed a default column of the same short row: a true conflict
+        printf("10. short rows, true conflict: rc=%d\n", rc);
+        CHECK(is_conflict(rc)); CHECK(mw_scalar(a, "SELECT a FROM t WHERE id=8") == 8); CHECK(mw_scalar(a, "SELECT z FROM t WHERE id=8") == 8);
+        rc = race(a, b, "UPDATE t SET a = 66 WHERE id = 9", "UPDATE t SET z = 7, s = 'hi' WHERE id = 10");                // the other writes the defaults explicitly into another row: no conflict
+        CHECK_RC(rc, SQLITE_OK); CHECK(mw_scalar(a, "SELECT a FROM t WHERE id=9") == 66);
+        rc = race(a, b, "INSERT INTO t(id, a, b, z) VALUES(100, 1, 'n', 3)", "UPDATE t SET a = 3 WHERE id = 20");          // a new row beside short ones
+        CHECK_RC(rc, SQLITE_OK); CHECK(mw_scalar(a, "SELECT z FROM t WHERE id=100") == 3);
         CHECK(integrity_ok(a)); sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
     }
     MW_DONE();

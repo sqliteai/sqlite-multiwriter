@@ -68,7 +68,7 @@ static int helper_open (mw_lane *lane) {
     if (rc != SQLITE_OK) { sqlite3_close(h); return rc; }
     sqlite3_busy_timeout(h, 0);
     sqlite3_db_config(h, SQLITE_DBCONFIG_ENABLE_TRIGGER, 0, NULL);                  // (the effects of a trigger are rows of the write set: they are replayed as rows)
-    sqlite3_db_config(h, SQLITE_DBCONFIG_ENABLE_FKEY, 0, NULL);
+    sqlite3_db_config(h, SQLITE_DBCONFIG_ENABLE_FKEY, 0, NULL);                      // (per batch: group_once)
     lane->rb_db = h;
     return SQLITE_OK;
 }
@@ -104,6 +104,53 @@ static int bind_col (sqlite3_stmt *st, int idx, const rec_t *r, int col) {
     if (t >= 12 && (t & 1)) return sqlite3_bind_text(st, idx, l ? (const char *)p : "", (int)l, SQLITE_TRANSIENT);
     if (t >= 12) return sqlite3_bind_blob(st, idx, l ? (const void *)p : (const void *)"", (int)l, SQLITE_TRANSIENT);
     return SQLITE_ERROR;
+}
+
+// A row written before an ALTER TABLE ADD COLUMN has fewer columns than the table: SQLite reads the missing ones as the default of the column. The record is rebuilt with them, in SQLite's own
+// encoding (smallest serial type), so that everything below sees a full record. NULL: no memory.
+static int varint_put (uint8_t *o, uint64_t v) {
+    if (v >> 56) { o[8] = (uint8_t)(v & 0xff); v >>= 8; for (int i = 7; i >= 0; i--) { o[i] = (uint8_t)((v & 0x7f) | 0x80); v >>= 7; } return 9; }
+    int n = 1; for (uint64_t t = v >> 7; t; t >>= 7) n++;
+    for (int i = n - 1; i >= 0; i--) { o[i] = (uint8_t)((v & 0x7f) | (i == n - 1 ? 0 : 0x80)); v >>= 7; }
+    return n;
+}
+static int val_serial (const mw_val *v, uint8_t *data) {          // the serial type of a default and its content in `data` (up to 8 bytes; text and blob are copied by the caller)
+    switch (v->type) {
+        case SQLITE_INTEGER: {
+            int64_t x = v->i; if (x == 0) return 8; if (x == 1) return 9;
+            int nb = (x >= -128 && x <= 127) ? 1 : (x >= -32768 && x <= 32767) ? 2 : (x >= -8388608 && x <= 8388607) ? 3 : (x >= INT32_MIN && x <= INT32_MAX) ? 4 : (x >= -((int64_t)1 << 47) && x < ((int64_t)1 << 47)) ? 5 : 6;
+            int len = nb == 5 ? 6 : nb == 6 ? 8 : nb; uint64_t u = (uint64_t)x;
+            for (int i = len - 1; i >= 0; i--) { data[i] = (uint8_t)(u & 0xff); u >>= 8; }
+            return nb;
+        }
+        case SQLITE_FLOAT: { uint64_t u; memcpy(&u, &v->d, 8); for (int i = 7; i >= 0; i--) { data[i] = (uint8_t)(u & 0xff); u >>= 8; } return 7; }
+        case SQLITE_TEXT: return 13 + 2 * v->n;
+        case SQLITE_BLOB: return 12 + 2 * v->n;
+        default: return 0;
+    }
+}
+static uint8_t *rec_pad (const mw_tab *t, const rec_t *r, uint32_t *outlen) {
+    int n = r->n; size_t datalen = 0; for (int i = 0; i < n; i++) datalen += r->len[i];
+    uint64_t ty[2048]; uint8_t dd[2048][8]; uint32_t dl[2048];
+    for (int i = n; i < t->nrec && i < 2048; i++) {
+        ty[i] = (uint64_t)val_serial(&t->dflt[i], dd[i]);
+        dl[i] = ty[i] < 12 ? ((const uint8_t[]){0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0})[ty[i]] : (uint32_t)((ty[i] - 12) / 2);
+        datalen += dl[i];
+    }
+    uint8_t hb[2048 * 9 + 16]; size_t hp = 0;
+    for (int i = 0; i < t->nrec; i++) hp += (size_t)varint_put(hb + hp, i < n ? r->ty[i] : ty[i]);
+    uint8_t tmp[9]; int hl = 1; while (varint_put(tmp, hp + (size_t)hl) != hl) hl = varint_put(tmp, hp + (size_t)hl);
+    size_t hs = hp + (size_t)hl;
+    uint8_t *buf = malloc(hs + datalen + 1); if (!buf) return NULL;
+    varint_put(buf, hs); memcpy(buf + hl, hb, hp);
+    size_t o = hs;
+    for (int i = 0; i < n; i++) { memcpy(buf + o, r->rec + r->off[i], r->len[i]); o += r->len[i]; }
+    for (int i = n; i < t->nrec; i++) {
+        const mw_val *v = &t->dflt[i];
+        if (v->type == SQLITE_TEXT || v->type == SQLITE_BLOB) memcpy(buf + o, v->p, (size_t)v->n); else memcpy(buf + o, dd[i], dl[i]);
+        o += dl[i];
+    }
+    *outlen = (uint32_t)o; return buf;
 }
 
 // ---- the statements of a table ----
@@ -185,40 +232,71 @@ static sqlite3_stmt *update_stmt (sqlite3 *h, const mw_tab *t, tstmt *ts, uint64
 // the others commit together at one epoch. The requests are replayed in the order they queued, each one checked against the rows as the ones before it left them: the result is a serial execution in that order
 // (mw_tx_info.commit_order says which, among the commits of one epoch). One commit, one install of the pages, one epoch for all, instead of a lost race and a commit for each.
 #define MW_REBASE_BATCH 64
-typedef struct rb_req { mw_lane *lane; const mw_rd_result *res; uint32_t cookie; int state; bool done; uint64_t epoch; uint32_t order; struct rb_req *next; } rb_req;      // state: 0 waiting, 1 committed, 2 refused (the leader's, provisional until done)
+typedef struct rb_req { mw_lane *lane; const mw_rd_result *res; uint32_t cookie; bool fk; int state; bool done; uint64_t epoch; uint32_t order; struct rb_req *next; } rb_req;      // state: 0 waiting, 1 committed, 2 refused (the leader's, provisional until done)
 
-// One request in the open transaction of the helper `h` of the leader: SQLITE_OK replayed, MW_CONFLICT a true conflict (the row changed, a constraint), SQLITE_BUSY lost a race.
+// One row change in the open transaction of the helper: SQLITE_OK replayed, MW_CONFLICT a true conflict (the row changed, a constraint), SQLITE_BUSY lost a race.
+static int apply_chg (sqlite3 *h, const mw_tab *lt, tstmt *ts, const mw_chg *c) {
+    if (!ts->ready && tstmt_prepare(h, lt, ts) != SQLITE_OK) return MW_CONFLICT;
+    rec_t oldr, newr; uint8_t *ob = NULL, *nb = NULL; int rc = MW_CONFLICT, src; uint32_t l;
+    if (c->old_rec) {
+        if (!rec_parse(&oldr, c->old_rec, c->old_len) || oldr.n > lt->nrec) goto out;
+        if (oldr.n < lt->nrec) { ob = rec_pad(lt, &oldr, &l); if (!ob || !rec_parse(&oldr, ob, l)) goto out; }      // (a row written before an ALTER TABLE ADD COLUMN: its missing columns are defaults)
+    }
+    if (c->new_rec) {
+        if (!rec_parse(&newr, c->new_rec, c->new_len) || newr.n > lt->nrec) goto out;
+        if (newr.n < lt->nrec) { nb = rec_pad(lt, &newr, &l); if (!nb || !rec_parse(&newr, nb, l)) goto out; }
+    }
+    if (c->old_rec) {                                                  // it is the row that the transaction saw
+        if (bind_row(ts->sel, lt, c->rowid, &oldr, false, 0) != SQLITE_OK) goto out;
+        src = sqlite3_step(ts->sel); sqlite3_reset(ts->sel);
+        if ((src & 0xff) == SQLITE_BUSY) { rc = SQLITE_BUSY; goto out; }
+        if (src != SQLITE_ROW) goto out;
+    }
+    if (c->kind == 3) { if (bind_row(ts->del, lt, c->rowid, NULL, false, 0) != SQLITE_OK) goto out; src = sqlite3_step(ts->del); sqlite3_reset(ts->del); }
+    else if (c->kind == 2) {
+        uint64_t mask; if (!changed_mask(lt, &oldr, &newr, &mask)) goto out;
+        if (mask == 0) { rc = SQLITE_OK; goto out; }                                                  // (only a derived column changed)
+        if (lt->is_parent && (mask & lt->refmask)) goto out;                                          // (a key that a foreign key refers to changes: the ON UPDATE actions are not replayed)
+        sqlite3_stmt *us = update_stmt(h, lt, ts, mask); if (!us) goto out;
+        if (bind_row(us, lt, c->rowid, &newr, true, mask) != SQLITE_OK) goto out;
+        src = sqlite3_step(us); sqlite3_reset(us);
+    }
+    else { if (bind_row(ts->ins, lt, c->rowid, &newr, false, 0) != SQLITE_OK) goto out; src = sqlite3_step(ts->ins); sqlite3_reset(ts->ins); }
+    rc = src == SQLITE_DONE ? SQLITE_OK : (src & 0xff) == SQLITE_BUSY ? SQLITE_BUSY : MW_CONFLICT;
+out:
+    free(ob); free(nb);
+    return rc;
+}
+
+// One request. Deletes, then updates, then inserts (a key that one frees and another takes). With foreign keys enforced: updates, deletes, inserts (a child that an action would set to NULL is already updated
+// when its parent goes), the deletes from the children to the parents and the inserts from the parents to the children (the rank of the table), so that the rows that the actions would take are already gone,
+// and a child that appeared meanwhile is dealt with by SQLite as it would have been in a serial execution (cascaded, or the delete refused). A parent table in which the request both deletes and inserts is
+// not replayed (a key that changes is a delete and an insert: the ON DELETE action would run), and neither is an update of a key that a foreign key refers to (the ON UPDATE action).
 static int replay_req (sqlite3 *h, rb_state *R, const rb_req *rq) {
-    const mw_rd_result *res = rq->res;
-    const mw_tab *lt_prev = NULL, *lt = NULL; const mw_tab *rt_prev = NULL;
-    for (int phase = 3; phase >= 1; phase--) {                                  // deletes, then updates, then inserts: a key that one frees and another takes
+    const mw_rd_result *res = rq->res; const mw_cat *cat = R->cat;
+    if (rq->fk) {
+        unsigned char *fl = calloc((size_t)cat->n + 1, 1); if (!fl) return MW_CONFLICT;
         for (int i = 0; i < res->n; i++) {
-            const mw_chg *c = &res->chg[i]; if (c->kind != phase) continue;
-            if (c->tab != rt_prev) { lt = mw_cat_by_name(R->cat, c->tab->name); rt_prev = c->tab; lt_prev = lt; } else lt = lt_prev;      // (the leader's own catalog: the same schema, the same cookie)
-            if (!lt || !lt->ok) return MW_CONFLICT;
-            tstmt *ts = &R->ts[lt - R->cat->tabs];
-            if (!ts->ready && tstmt_prepare(h, lt, ts) != SQLITE_OK) return MW_CONFLICT;
-            rec_t oldr, newr;
-            if (c->old_rec && !rec_parse(&oldr, c->old_rec, c->old_len)) return MW_CONFLICT;
-            if (c->new_rec && !rec_parse(&newr, c->new_rec, c->new_len)) return MW_CONFLICT;
-            if ((c->old_rec && oldr.n < lt->nrec) || (c->new_rec && newr.n < lt->nrec)) return MW_CONFLICT;      // (a row written before an ALTER TABLE ADD COLUMN: its missing columns are defaults)
-            int src;
-            if (c->old_rec) {                                                  // it is the row that the transaction saw
-                if (bind_row(ts->sel, lt, c->rowid, &oldr, false, 0) != SQLITE_OK) return MW_CONFLICT;
-                src = sqlite3_step(ts->sel); sqlite3_reset(ts->sel);
-                if ((src & 0xff) == SQLITE_BUSY) return SQLITE_BUSY;
-                if (src != SQLITE_ROW) return MW_CONFLICT;
+            const mw_chg *c = &res->chg[i]; const mw_tab *lt = mw_cat_by_name(cat, c->tab->name); if (!lt) { free(fl); return MW_CONFLICT; }
+            if (lt->is_parent) { fl[lt - cat->tabs] |= c->kind == 3 ? 1 : c->kind == 1 ? 2 : 0; if (fl[lt - cat->tabs] == 3) { free(fl); return MW_CONFLICT; } }
+        }
+        free(fl);
+    }
+    static const int plain[3] = { 3, 2, 1 }, withfk[3] = { 2, 3, 1 };
+    for (int ph = 0; ph < 3; ph++) {
+        int phase = rq->fk ? withfk[ph] : plain[ph];
+        int steps = (rq->fk && phase != 2) ? cat->maxrank : 0;
+        for (int step = 0; step <= steps; step++) {
+            int rank = phase == 3 ? cat->maxrank - step : step;
+            const mw_tab *lt_prev = NULL, *lt = NULL; const mw_tab *rt_prev = NULL;
+            for (int i = 0; i < res->n; i++) {
+                const mw_chg *c = &res->chg[i]; if (c->kind != phase) continue;
+                if (c->tab != rt_prev) { lt = mw_cat_by_name(cat, c->tab->name); rt_prev = c->tab; lt_prev = lt; } else lt = lt_prev;      // (the leader's own catalog: the same schema, the same cookie)
+                if (!lt || !lt->ok) return MW_CONFLICT;
+                if (steps && lt->rank != rank) continue;
+                int r = apply_chg(h, lt, &R->ts[lt - cat->tabs], c);
+                if (r != SQLITE_OK) return r;
             }
-            if (c->kind == 3) { if (bind_row(ts->del, lt, c->rowid, NULL, false, 0) != SQLITE_OK) return MW_CONFLICT; src = sqlite3_step(ts->del); sqlite3_reset(ts->del); }
-            else if (c->kind == 2) {
-                uint64_t mask; if (!changed_mask(lt, &oldr, &newr, &mask)) return MW_CONFLICT;
-                if (mask == 0) continue;                                                                // (only a derived column changed)
-                sqlite3_stmt *us = update_stmt(h, lt, ts, mask); if (!us) return MW_CONFLICT;
-                if (bind_row(us, lt, c->rowid, &newr, true, mask) != SQLITE_OK) return MW_CONFLICT;
-                src = sqlite3_step(us); sqlite3_reset(us);
-            }
-            else { if (bind_row(ts->ins, lt, c->rowid, &newr, false, 0) != SQLITE_OK) return MW_CONFLICT; src = sqlite3_step(ts->ins); sqlite3_reset(ts->ins); }
-            if (src != SQLITE_DONE) return (src & 0xff) == SQLITE_BUSY ? SQLITE_BUSY : MW_CONFLICT;
         }
     }
     return SQLITE_OK;
@@ -228,6 +306,7 @@ static int replay_req (sqlite3 *h, rb_state *R, const rb_req *rq) {
 static int group_once (mw_lane *L, rb_state *R, rb_req **b, int n) {
     sqlite3 *h = L->rb_db;
     for (int i = 0; i < n; i++) b[i]->state = 0;
+    sqlite3_db_config(h, SQLITE_DBCONFIG_ENABLE_FKEY, b[0]->fk ? 1 : 0, NULL);       // (the connections of a batch are replayed as the first one has its foreign keys; the others, if they differ, run again)
     if (sqlite3_exec(h, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) return SQLITE_BUSY;
     int ok = 0, rc = SQLITE_OK; uint32_t cookie = 0;
     sqlite3_stmt *sv = NULL;
@@ -235,7 +314,7 @@ static int group_once (mw_lane *L, rb_state *R, rb_req **b, int n) {
     sqlite3_finalize(sv);
     for (int i = 0; i < n; i++) {
         rb_req *rq = b[i];
-        if (rq->cookie != cookie) { rq->state = 2; continue; }                // (the schema changed meanwhile)
+        if (rq->cookie != cookie || rq->fk != b[0]->fk) { rq->state = 2; continue; }                // (the schema changed meanwhile)
         sqlite3_exec(h, "SAVEPOINT g", NULL, NULL, NULL);
         int r = replay_req(h, R, rq);
         if (r == SQLITE_OK) { sqlite3_exec(h, "RELEASE g", NULL, NULL, NULL); rq->state = 1; ok++; }
@@ -292,7 +371,9 @@ int mw_lane_rebase (mw_lane *lane, const uint8_t *const *imgs, uint32_t cookie, 
     mw_rowdiff_compute(lane, imgs, R->cat, &res);                               // (in parallel: every connection decodes its own pages)
     if (res.unsupported || res.n == 0) { mw_rd_result_free(&res); atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }
     if (mw_lane_reads_unchanged(lane)) { mw_rd_result_free(&res); atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }       // (it read rows that it did not change: write skew, the application retries)
-    rb_req rq = { .lane = lane, .res = &res, .cookie = cookie };
+    bool fk = false;
+    if (R->cat->has_fk) { int on = 1; if (lane->rd_db) sqlite3_db_config(lane->rd_db, SQLITE_DBCONFIG_ENABLE_FKEY, -1, &on); fk = on != 0; }       // (an application that does not enforce them: the replay does not either)
+    rb_req rq = { .lane = lane, .res = &res, .cookie = cookie, .fk = fk };
     pthread_mutex_lock(&db->rb_qmu);
     if (db->rb_qtail) ((rb_req *)db->rb_qtail)->next = &rq; else db->rb_qhead = &rq;
     db->rb_qtail = &rq;

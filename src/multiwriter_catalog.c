@@ -85,7 +85,30 @@ static void schema_collect (mw_lane *lane, uint32_t pgno, uint32_t pgsz, srows *
 
 static bool starts_ci (const char *s, const char *p) { while (*s == ' ' || *s == '\n' || *s == '\t' || *s == '\r') s++; return strncasecmp(s, p, strlen(p)) == 0; }
 
-static void tab_free (mw_tab *t) { free(t->name); for (int i = 0; i < t->nrec; i++) free(t->rec_name[i]); free(t->rec_name); }
+static void tab_free (mw_tab *t) {
+    free(t->name); for (int i = 0; i < t->nrec; i++) { free(t->rec_name[i]); if (t->dflt) free(t->dflt[i].p); }
+    free(t->rec_name); free(t->dflt);
+    for (int i = 0; i < t->nfk; i++) { free(t->fk_parent[i]); free(t->fk_to[i]); }
+    free(t->fk_parent); free(t->fk_to);
+    for (int i = 0; i < t->npk; i++) free(t->pk_name[i]);
+    free(t->pk_name);
+}
+// the value of a default expression, evaluated by SQLite (a constant: ALTER TABLE ADD COLUMN accepts nothing else)
+static void eval_default (sqlite3 *scratch, const char *expr, mw_val *v) {
+    memset(v, 0, sizeof *v); v->type = SQLITE_NULL;
+    if (!expr) return;
+    char *q = sqlite3_mprintf("SELECT %s", expr); sqlite3_stmt *st = NULL;
+    if (q && sqlite3_prepare_v2(scratch, q, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
+        v->type = sqlite3_column_type(st, 0);
+        if (v->type == SQLITE_INTEGER) v->i = sqlite3_column_int64(st, 0);
+        else if (v->type == SQLITE_FLOAT) v->d = sqlite3_column_double(st, 0);
+        else if (v->type == SQLITE_TEXT || v->type == SQLITE_BLOB) {
+            v->n = sqlite3_column_bytes(st, 0); v->p = malloc((size_t)v->n + 1);
+            if (v->p) memcpy(v->p, v->type == SQLITE_TEXT ? (const void *)sqlite3_column_text(st, 0) : sqlite3_column_blob(st, 0), (size_t)v->n); else v->type = SQLITE_NULL;
+        }
+    }
+    sqlite3_finalize(st); sqlite3_free(q);
+}
 
 // understand one table with SQLite's help
 static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
@@ -98,9 +121,10 @@ static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
     char *q = sqlite3_mprintf("PRAGMA table_xinfo(\"%w\")", r->name); sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(scratch, q, -1, &st, NULL) != SQLITE_OK) { sqlite3_free(q); return; }
     sqlite3_free(q);
-    struct col { char *name; char *type; int pk, hidden; } cols[2048]; int nc = 0;
+    struct col { char *name; char *type; char *dflt; int pk, hidden; } cols[2048]; int nc = 0;
     while (sqlite3_step(st) == SQLITE_ROW && nc < 2048) {
         cols[nc].name = strdup((const char *)sqlite3_column_text(st, 1)); const char *ty = (const char *)sqlite3_column_text(st, 2); cols[nc].type = strdup(ty ? ty : "");
+        { const char *d = (const char *)sqlite3_column_text(st, 4); cols[nc].dflt = d ? strdup(d) : NULL; }
         cols[nc].pk = sqlite3_column_int(st, 5); cols[nc].hidden = sqlite3_column_int(st, 6); nc++;
     }
     sqlite3_finalize(st);
@@ -114,8 +138,56 @@ static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
         t->rec_name[pos++] = (cols[i].hidden == 3) ? NULL : strdup(cols[i].name);                            // (generated, stored: in the record, derived)
     }
     t->nrec = pos;
-    for (int i = 0; i < nc; i++) { free(cols[i].name); free(cols[i].type); }
-    t->ok = t->rec_name != NULL;
+    t->dflt = calloc((size_t)(pos ? pos : 1), sizeof *t->dflt);
+    for (int i = 0, k = 0; i < nc && t->dflt; i++) { if (cols[i].hidden == 2) continue; eval_default(scratch, cols[i].hidden == 3 ? NULL : cols[i].dflt, &t->dflt[k++]); }
+    for (int i = 0; i < nc; i++) if (cols[i].pk > 0) { t->pk_name = realloc(t->pk_name, (size_t)(t->npk + 1) * sizeof(char *)); t->pk_name[t->npk++] = strdup(cols[i].name); }
+    {   // foreign keys
+        char *fq = sqlite3_mprintf("PRAGMA foreign_key_list(\"%w\")", r->name); sqlite3_stmt *fs = NULL;
+        if (fq && sqlite3_prepare_v2(scratch, fq, -1, &fs, NULL) == SQLITE_OK)
+            while (sqlite3_step(fs) == SQLITE_ROW) {
+                const char *pt = (const char *)sqlite3_column_text(fs, 2), *to = (const char *)sqlite3_column_text(fs, 4);
+                t->fk_parent = realloc(t->fk_parent, (size_t)(t->nfk + 1) * sizeof(char *)); t->fk_to = realloc(t->fk_to, (size_t)(t->nfk + 1) * sizeof(char *));
+                t->fk_parent[t->nfk] = strdup(pt ? pt : ""); t->fk_to[t->nfk] = to ? strdup(to) : NULL; t->nfk++;
+            }
+        sqlite3_finalize(fs); sqlite3_free(fq);
+    }
+    for (int i = 0; i < nc; i++) { free(cols[i].name); free(cols[i].type); free(cols[i].dflt); }
+    t->ok = t->rec_name != NULL && t->dflt != NULL;
+}
+
+// bit of a column among the writable columns of a table (as changed_mask of the rebase counts them), -1 if it has none
+static int writable_bit (const mw_tab *t, const char *name) {
+    int bit = 0;
+    for (int i = 0; i < t->nrec; i++) { if (!t->rec_name[i] || i == t->alias_rec) continue; if (!strcasecmp(t->rec_name[i], name)) return bit; bit++; }
+    return -1;
+}
+// The foreign keys as a graph: which tables are parents, which of their columns are referred to, and a rank (parents before children). A table that refers to itself, or a cycle, is not replayed
+// (the order of the rows inside a table would matter).
+static void fk_graph (mw_cat *c) {
+    for (int i = 0; i < c->n; i++) c->tabs[i].rank = 0;
+    for (int i = 0; i < c->n; i++) {
+        mw_tab *t = &c->tabs[i];
+        for (int k = 0; k < t->nfk; k++) {
+            c->has_fk = true;
+            mw_tab *p = (mw_tab *)mw_cat_by_name(c, t->fk_parent[k]);
+            if (!p) continue;                                           // (a parent that does not exist: SQLite refuses the statement itself)
+            if (p == t) { c->rebasable = false; c->why = "the database has a table with a foreign key to itself"; return; }
+            p->is_parent = true;
+            if (t->fk_to[k]) { int b = writable_bit(p, t->fk_to[k]); if (b >= 0 && b < 64) p->refmask |= 1ull << b; }
+            else for (int q = 0; q < p->npk; q++) { int b = writable_bit(p, p->pk_name[q]); if (b >= 0 && b < 64) p->refmask |= 1ull << b; }
+        }
+    }
+    for (int round = 0; round <= c->n; round++) {                       // rank = 1 + the highest rank of the parents (a fixed point; a cycle never settles)
+        bool changed = false;
+        for (int i = 0; i < c->n; i++) {
+            mw_tab *t = &c->tabs[i]; int r = 0;
+            for (int k = 0; k < t->nfk; k++) { const mw_tab *p = mw_cat_by_name(c, t->fk_parent[k]); if (p && p->rank + 1 > r) r = p->rank + 1; }
+            if (r != t->rank) { t->rank = r; changed = true; }
+        }
+        if (!changed) break;
+        if (round == c->n) { c->rebasable = false; c->why = "the foreign keys of the database are circular"; return; }
+    }
+    for (int i = 0; i < c->n; i++) if (c->tabs[i].rank > c->maxrank) c->maxrank = c->tabs[i].rank;
 }
 
 mw_cat *mw_cat_build (mw_lane *lane) {
@@ -129,12 +201,12 @@ mw_cat *mw_cat_build (mw_lane *lane) {
         const srow *r = &rows.rows[i];
         if (!strcmp(r->type, "trigger")) { c->rebasable = false; c->why = "the database has a trigger"; continue; }
         if (r->sql && starts_ci(r->sql, "CREATE VIRTUAL")) { c->rebasable = false; c->why = "the database has a virtual table"; }
-        if (r->sql && strcasestr(r->sql, "REFERENCES")) { c->rebasable = false; c->why = "the database has a foreign key"; }
         tab_parse(scratch, r, &c->tabs[c->n]);
         if (c->tabs[c->n].without_rowid) { c->rebasable = false; c->why = "the database has a WITHOUT ROWID table"; }
         c->n++;
     }
     if (!c->tabs || !scratch) { c->rebasable = false; c->why = "no memory"; }
+    else fk_graph(c);
     for (int i = 0; i < rows.n; i++) { free(rows.rows[i].type); free(rows.rows[i].name); free(rows.rows[i].sql); }
     free(rows.rows); sqlite3_close(scratch);
     return c;

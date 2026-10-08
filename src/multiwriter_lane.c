@@ -101,22 +101,55 @@ static uint32_t lane_schema_cookie (mw_lane *lane) {
 // cannot tell the two apart (a blind UPDATE of one row also reads and writes its page). So the statements say it (the statement hook of a mw_rebase=1 connection): a transaction that ran a SELECT, or a
 // statement that is not a point statement, is not rebased: the commit is refused as before and the application retries. A point statement is an INSERT ... VALUES or an UPDATE/DELETE of one row found by its rowid or by a unique index
 // (the seek of a unique index finds one row; a range or a non-unique index loops), that reads nothing else: its bytecode (EXPLAIN, available in every build of SQLite) has no loop, no cursor opened for
-// reading (another table, a subquery), no trigger, no virtual table. An UPDATE or DELETE that changed no row has read that the row is absent: also a read.
+// reading (another table, a subquery), no virtual table. What a foreign key adds is allowed: the lookup of the parent row (a read cursor, one seek), the scan of the child table for a parent that is deleted
+// (a loop on a read cursor that only compares columns and counts), the sub-programs of its actions. They are repeated by SQLite in the replay, which runs with the foreign keys on. An UPDATE or DELETE that changed no row has read that the row is absent: also a read.
 enum { RD_OTHER = 0, RD_DML };
 typedef struct { char *sql; bool point; } rd_ent;
 enum { RD_CACHE = 32 };
+enum { BC_MAX = 400 };
+typedef struct { char op[24]; int p1; } bc_op;
+static bool bc_in (const char *op, const char *const *set, size_t n) { for (size_t i = 0; i < n; i++) if (strcmp(op, set[i]) == 0) return true; return false; }
 static bool bytecode_is_point (sqlite3 *db, const char *sql) {
     char *ex = sqlite3_mprintf("EXPLAIN %s", sql); if (!ex) return false;
     sqlite3_stmt *e = NULL; int rc = sqlite3_prepare_v2(db, ex, -1, &e, NULL); sqlite3_free(ex);
     if (rc != SQLITE_OK || !e) { sqlite3_finalize(e); return false; }
-    static const char *const deny[] = { "Rewind", "Last", "Next", "Prev", "SorterSort", "SorterNext", "SeekScan", "OpenRead", "OpenEphemeral", "OpenAutoindex", "OpenPseudo", "Program",
-                                        "VOpen", "VFilter", "VNext", "VUpdate", "VColumn", "Gosub", "BeginSubrtn", "Once", "InitCoroutine", "Yield", "Sort" };
-    bool point = true;
+    static const char *const deny[] = { "SorterSort", "SorterNext", "SeekScan", "OpenEphemeral", "OpenAutoindex", "OpenPseudo", "VOpen", "VFilter", "VNext", "VUpdate", "VColumn", "Gosub",
+                                        "BeginSubrtn", "Once", "InitCoroutine", "Yield", "Sort" };
+    // what a foreign key check may do inside a loop that scans the rows of the other table: nothing but compare columns and count
+    static const char *const fkbody[] = { "Column", "Ne", "Eq", "Lt", "Le", "Gt", "Ge", "FkCounter", "Integer", "Copy", "SCopy", "Affinity", "IsNull", "NotNull", "Rowid", "IdxGT", "IdxGE", "IdxLT", "IdxLE",
+                                          "DeferredSeek", "IdxRowid", "Goto", "MustBeInt", "Null", "String8", "Int64", "Real", "Variable" };
+    bc_op *ops = malloc(BC_MAX * sizeof *ops); int n = 0; bool point = ops != NULL;
     while (point && sqlite3_step(e) == SQLITE_ROW) {
-        const char *op = (const char *)sqlite3_column_text(e, 1); if (!op) { point = false; break; }
-        for (size_t i = 0; i < sizeof deny / sizeof *deny; i++) if (strcmp(op, deny[i]) == 0) { point = false; break; }
+        const char *op = (const char *)sqlite3_column_text(e, 1);
+        if (!op || n >= BC_MAX) { point = false; break; }
+        if (n > 0 && !strcmp(op, "Init")) break;                       // (EXPLAIN lists the sub-programs after the main one, each starting with its own Init: the actions of foreign keys. They are repeated by the replay.)
+        snprintf(ops[n].op, sizeof ops[n].op, "%s", op); ops[n].p1 = sqlite3_column_int(e, 2); n++;
     }
-    sqlite3_finalize(e);
+    sqlite3_finalize(e); e = NULL;
+    int rdcur[64]; int nrd = 0;                                        // the cursors opened for reading
+    for (int i = 0; point && i < n; i++) if (!strcmp(ops[i].op, "OpenRead")) { if (nrd >= 64) point = false; else rdcur[nrd++] = ops[i].p1; }
+    int verified_to = -1;                                              // ops up to here belong to a loop that was verified
+    for (int i = 0; point && i < n; i++) {
+        const char *op = ops[i].op;
+        if (bc_in(op, deny, sizeof deny / sizeof *deny)) { point = false; break; }
+        if (!strcmp(op, "Program")) continue;                           // (the actions of a foreign key; a database with a trigger is never rebased)
+        bool isread = false; for (int k = 0; k < nrd; k++) if (rdcur[k] == ops[i].p1) isread = true;
+        bool start = !strcmp(op, "Rewind") || !strcmp(op, "Last") || (isread && (!strncmp(op, "Seek", 4)));
+        if (start) {
+            int j = -1; for (int k = i + 1; k < n; k++) if ((!strcmp(ops[k].op, "Next") || !strcmp(ops[k].op, "Prev")) && ops[k].p1 == ops[i].p1) { j = k; break; }
+            if (j < 0) { if (!strncmp(op, "Seek", 4)) continue; point = false; break; }         // (a lookup of one row; a Rewind with no end is not one)
+            if (!isread) { point = false; break; }                                              // (a loop over the table that is written: a scan)
+            bool fkc = false;
+            for (int k = i + 1; k < j; k++) {
+                if (!bc_in(ops[k].op, fkbody, sizeof fkbody / sizeof *fkbody)) { point = false; break; }
+                if (!strcmp(ops[k].op, "FkCounter")) fkc = true;
+            }
+            if (!fkc) point = false;
+            verified_to = j; i = j; continue;
+        }
+        if ((!strcmp(op, "Next") || !strcmp(op, "Prev")) && i > verified_to) { point = false; break; }
+    }
+    free(ops);
     return point;
 }
 static bool stmt_is_point (mw_lane *lane, sqlite3_stmt *st, const char *sql) {

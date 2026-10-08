@@ -164,7 +164,7 @@ Archives and packages are on the [current release](https://github.com/sqliteai/s
 |---|---|---|
 | Linux glibc, x86_64 and arm64 | `multiwriter-linux-<arch>-<version>.tar.gz` | threads and processes |
 | Linux musl (Alpine), x86_64 and arm64 | `multiwriter-linux-musl-<arch>-...` | threads and processes |
-| macOS, x86_64 and arm64 | `multiwriter-macos-universal-...`, and each alone | threads and processes |
+| macOS, x86_64 and arm64 | `multiwriter-macos-<version>` (universal), `multiwriter-macos-x86_64-...`, `multiwriter-macos-arm64-...` | threads and processes |
 | iOS, iOS simulator, Mac Catalyst | `multiwriter-ios-...`, `-ios-sim-...`, `-mac-catalyst-...` | threads |
 | Apple XCFramework | `multiwriter-apple-xcframework-<version>.zip`, and `Package.swift` (Swift Package Manager) | iOS, simulator, Catalyst, macOS |
 | Android arm64-v8a, armeabi-v7a, x86_64, x86 | `multiwriter-android-<abi>-...`, and `multiwriter-android-aar-<version>.aar` | API 26 or later, 16 KB pages |

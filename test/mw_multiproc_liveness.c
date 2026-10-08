@@ -1,5 +1,4 @@
-// Multi-process liveness: a killed process that nobody has reaped (a zombie) must not be treated as alive, and a process that dies right after
-// renaming a rewritten log into place (before the shared header names it) must not leave the others appending to the old, unlinked file.
+// Multi-process liveness: a killed process that nobody has reaped (a zombie) must not be treated as alive.
 #include <signal.h>
 #include <time.h>
 #include <sys/wait.h>
@@ -51,32 +50,5 @@ int main (void) {
     sqlite3_close(a);
     mw_rmdb(path);
 
-    // ---- 2. (the private-store mode: the shared mode has no log to rewrite)
-    setenv("MW_MP_PRIVATE", "1", 1);
-    // ---- 2. a process dies right after renaming the rewritten log into place
-    setup(path);
-    CHECK_RC(open_mp(path, &a), SQLITE_OK);
-    pid_t d = fork();
-    if (d == 0) {
-        sqlite3 *b; if (open_mp(path, &b) != SQLITE_OK) _exit(1);
-        mw_fault_arm(MW_CRASH_LOG_RENAME, 1);
-        for (int i = 0; i < 200000; i++) { char q[80]; snprintf(q, sizeof q, "UPDATE t SET v=v+1 WHERE id=%d", 33 + i % 32); mw_exec(b, q); }
-        _exit(3);                                                                           // (the crash point never fired)
-    }
-    int status = 0; waitpid(d, &status, 0);
-    printf("rewriter child status: %s %d\n", WIFEXITED(status) ? "exit" : "signal", WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
-    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 9);                                    // died at the crash point
-    int64_t before = mw_scalar(a, "SELECT sum(v) FROM t");
-    int good = 0;
-    for (int i = 0; i < 500; i++) { char q[80]; snprintf(q, sizeof q, "UPDATE t SET v=v+1 WHERE id=%d", 1 + i % 32); if (mw_exec(a, q) == SQLITE_OK) good++; }
-    CHECK(good == 500);
-    CHECK(mw_scalar(a, "SELECT sum(v) FROM t") == before + 500);
-    sqlite3_close(a);
-    // everything committed (by the survivor after the crash) is in the database a fresh process sees
-    CHECK_RC(open_mp(path, &a), SQLITE_OK);
-    CHECK(mw_scalar(a, "SELECT sum(v) FROM t") == before + 500);
-    CHECK(mw_scalar(a, "SELECT count(*) FROM t") == 64);
-    sqlite3_close(a);
-    mw_rmdb(path);
     MW_DONE();
 }

@@ -232,18 +232,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
     f->base.pMethods = mw_pass_methods(f->real);
 
     if (mode >= 1) {
-        int mpmode = (int)sqlite3_uri_int64(name, "mw_mp", 0);          // 0 single process, 1 multi-process (shared mode by default), 2 shared mode, 3 multi-process with private stores
-        if (mpmode == 1) mpmode = getenv("MW_MP_PRIVATE") ? 3 : 2;       // shared version index + segmented log is the default; MW_MP_PRIVATE=1 selects the private-store mode (docs §44)
-        if (mpmode == 3) mpmode = 1;
-        if (mpmode < 0 || mpmode > 2) mpmode = mpmode ? 1 : 0;
-#ifdef _WIN32
-        if (mpmode == 1) {                                               // the mode with private stores keeps one log that every process appends to and the compaction truncates, mapped: Windows does not truncate a mapped file (the shared mode, mw_mp=1 or 2, does not)
-            sqlite3_log(SQLITE_CANTOPEN, "multiwriter: the mode of private stores (MW_MP_PRIVATE) is not available on Windows");
-            f->real->pMethods->xClose(f->real);
-            f->base.pMethods = NULL;
-            return SQLITE_CANTOPEN;
-        }
-#endif
+        int mpmode = (int)sqlite3_uri_int64(name, "mw_mp", 0) != 0 ? 2 : 0;      // 0 one process (threads); anything else: several processes (the shared mode: one index of versions and one segmented log, mapped by all of them)
         mw_db *db = mw_db_acquire(name, mode, mpmode);
         mw_lane *lane = db ? sqlite3_malloc(sizeof(mw_lane)) : NULL;
         if (!lane) {

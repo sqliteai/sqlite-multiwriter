@@ -23,7 +23,7 @@
 
 #include <errno.h>
 #if defined(__has_include)
-#if __has_include(<execinfo.h>)
+#if __has_include(<execinfo.h>) && !(defined(__ANDROID__) && __ANDROID_API__ < 33)
 #include <execinfo.h>         // (debugging aid of the fault injection; musl and old Android have none)
 #define MW_HAVE_BACKTRACE 1
 #endif

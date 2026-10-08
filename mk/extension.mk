@@ -56,7 +56,8 @@ EXT_SDK := -isysroot $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null) -ta
 EXT_CFLAGS += $(EXT_SDK)
 EXT_LDFLAGS += $(EXT_SDK) -dynamiclib -headerpad_max_install_names
 else
-EXT_UNIVERSAL := true                      # no ARCH: one build for each, put together with lipo
+# no ARCH: one build for each, put together with lipo
+EXT_UNIVERSAL := true
 endif
 EXT_STRIP = strip -x -S $@
 else ifeq ($(PLATFORM),android)

@@ -237,8 +237,8 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         if (mpmode == 3) mpmode = 1;
         if (mpmode < 0 || mpmode > 2) mpmode = mpmode ? 1 : 0;
 #ifdef _WIN32
-        if (mpmode != 0) {                                               // the log is a mapped file that every process appends to and truncates: Windows does not allow that (docs/windows.md)
-            sqlite3_log(SQLITE_CANTOPEN, "multiwriter: mw_mp (several processes) is not available on Windows: threads of one process only");
+        if (mpmode == 1) {                                               // the mode with private stores keeps one log that every process appends to and the compaction truncates, mapped: Windows does not truncate a mapped file (the shared mode, mw_mp=1 or 2, does not)
+            sqlite3_log(SQLITE_CANTOPEN, "multiwriter: the mode of private stores (MW_MP_PRIVATE) is not available on Windows");
             f->real->pMethods->xClose(f->real);
             f->base.pMethods = NULL;
             return SQLITE_CANTOPEN;

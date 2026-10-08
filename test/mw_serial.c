@@ -1,3 +1,4 @@
+// MW_PORTABLE_TEST: the processes of the processes mode are started with CreateProcess on Windows (the power-loss phases are POSIX only)
 // Randomised serializability check of the commit protocol.
 // Concurrent transactions (inserts, updates, deletes, changes of a UNIQUE column, growth of a payload that splits and frees pages) run on a small set of keys; each one records what it
 // read and what it did, and the epoch it read from and the epoch it committed at (MW_FCNTL_TXINFO). Afterwards the committed transactions are replayed on a model, one at a time in the order
@@ -17,9 +18,20 @@
 #include <stdatomic.h>
 #include <signal.h>
 #include <fcntl.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/wait.h>
+#endif
 #include "mw_test.h"
 #include "multiwriter.h"
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+#ifdef _WIN32
+#define setenv(k, v, o) _putenv_s(k, v)
+static void unsetenv (const char *k) { char b[100]; snprintf(b, sizeof b, "%s=", k); _putenv(b); }
+#endif
 
 enum { MAXOPS = 4, ROKEYS = 8, BLIND = -2 };
 typedef struct { int kind, key, a, b; int sex, sv, su, spl, sw; } op_t;                 // sv == BLIND: the row was not read (only whether it exists is known). kinds: 6 an update or delete that found no row (reads that it is absent); 0 touch (w += 1: a write that the page really sees), 1 v += a, 2 delete, 3 u = b (-1: NULL), 4 insert (v = a, u = b, payload ins_pl), 5 payload = a bytes
@@ -139,9 +151,12 @@ static void child_dump (int sig) {      // (SIGUSR1, debug: what this process co
 }
 static void slot_loop (int slot, int generation, int arm_crash) {
     sqlite3 *db; if (open_db(g_path, &db) != SQLITE_OK) _exit(2);
-    g_child_db = db; signal(SIGUSR1, child_dump);
+    g_child_db = db;
+#ifndef _WIN32
+    signal(SIGUSR1, child_dump);
+#endif
     char fn[300]; rec_name(fn, sizeof fn, g_path, slot);
-    int fd = open(fn, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd < 0) _exit(2);
+    int fd = open(fn, O_WRONLY | O_APPEND | O_CREAT | O_BINARY, 0644); if (fd < 0) _exit(2);
     rec_t R; memset(&R, 0, sizeof R);
     ctx_t c = { .db = db, .rng = 31337u + 7919u * (unsigned)slot + 104729u * (unsigned)generation, .slot = slot, .fd = fd, .R = &R };
     sqlite3_prepare_v2(db, "SELECT v, u, length(p), w FROM t WHERE id = ?", -1, &c.sel, NULL);
@@ -163,6 +178,7 @@ static void *slot_thread (void *arg) { slot_loop((int)(intptr_t)arg, 0, 0); retu
 
 typedef struct { int ex, v, u, pl, w; } mrow;
 static int same (int ex, int v, int u, int pl, int w, const mrow *m) { return ex == BLIND || (ex == m->ex && (!ex || v == BLIND || (v == m->v && u == m->u && pl == m->pl && w == m->w))); }
+static int ro_ok (const ro_t *r, int keys) { if (r->n < 0 || r->n > ROKEYS) return 0; for (int k = 0; k < r->n; k++) if (r->key[k] < 1 || r->key[k] > keys) return 0; return 1; }
 static int cmp_u64 (const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 
 typedef struct { rw_t **known; size_t nknown; rw_t **doubt; size_t ndoubt; ro_t **ro; size_t nro; } txset;      // known: commit epoch known (sorted by it); doubt: committed, epoch unknown (to be placed in a gap)
@@ -172,8 +188,10 @@ static int g_quiet;      // (while the placement of the transactions in doubt is
 #define REPORT(counter, ...) do { if ((counter)++ < 4 && !g_quiet) { printf("    "); printf(__VA_ARGS__); printf("\n"); } } while (0)
 typedef struct { long bad_read, bad_unique, bad_ro, bad_dup_epoch, bad_gap, bad_tail; } viol;
 
-static int reads_fit (const rw_t *t, const model *M) { for (int k = 0; k < t->n; k++) { const op_t *o = &t->op[k]; if (!same(o->sex, o->sv, o->su, o->spl, o->sw, &M->m[o->key])) return 0; } return 1; }
+static int rec_ok (const rw_t *t, const model *M) { for (int k = 0; k < t->n; k++) if (t->op[k].key < 1 || t->op[k].key > M->keys) { printf("  [a record with an op out of range: n %d op %d key %d kind %d slot %d seq %llu commit %llu]\n", t->n, k, t->op[k].key, t->op[k].kind, t->slot, (unsigned long long)t->seq, (unsigned long long)t->commit); return 0; } return 1; }
+static int reads_fit (const rw_t *t, const model *M) { if (!rec_ok(t, M)) return 0; for (int k = 0; k < t->n; k++) { const op_t *o = &t->op[k]; if (!same(o->sex, o->sv, o->su, o->spl, o->sw, &M->m[o->key])) return 0; } return 1; }
 static void apply_rw (const rw_t *t, uint64_t epoch, model *M, viol *V) {
+    if (!rec_ok(t, M)) { V->bad_read++; return; }
     for (int k = 0; k < t->n; k++) { const op_t *o = &t->op[k]; const mrow *x = &M->m[o->key];
         if (!same(o->sex, o->sv, o->su, o->spl, o->sw, x)) REPORT(V->bad_read, "tx committed at %llu (snapshot %llu), key %d, op %d: saw (%d,%d,%d,%d,%d), model (%d,%d,%d,%d,%d)", (unsigned long long)epoch, (unsigned long long)t->snap, o->key, o->kind, o->sex, o->sv, o->su, o->spl, o->sw, x->ex, x->v, x->u, x->pl, x->w); }
     for (int k = 0; k < t->n; k++) { const op_t *o = &t->op[k]; mrow *x = &M->m[o->key];
@@ -323,23 +341,46 @@ static void run_threads (const char *name, int keys, int threads, double secs) {
 }
 
 // ---- real processes killed with SIGKILL ----
-static const char *g_recdir;                                                                              // where the record files are (default: next to the database; for the power-loss test: a directory that the loss does not touch)
+static const char *g_recdir;
+// g_recdir: where the record files are (default: next to the database; for the power-loss test: a directory that the loss does not touch)
 static void rec_name (char *fn, size_t n, const char *path, int slot) { if (g_recdir) snprintf(fn, n, "%s/rec%d", g_recdir, slot); else snprintf(fn, n, "%s.rec%d", path, slot); }
 
 // Starts the processes, kills some of them at random moments while others die at crash points, for `secs`. cut_cmd: the end is a loss of power instead of a normal one: all processes are stopped (nothing is acknowledged
 // after that), the command runs (it cuts the power of the disk), then they are killed.
+// The processes: a fork of this one on POSIX; on Windows (no fork) this program started again with the arguments that the child needs (serial-child ...), which re-creates its globals and runs the same function.
+#ifdef _WIN32
+typedef HANDLE proc_h;
+static proc_h proc_start (int slot, int gen) {
+    char self[600]; GetModuleFileNameA(NULL, self, sizeof self);
+    char cmd[1600]; snprintf(cmd, sizeof cmd, "\"%s\" serial-child %d %d \"%s\" %d %g %d %d \"%s\"", self, slot, gen, g_path, g_keys, g_secs, g_rebase, g_wr, g_recdir ? g_recdir : "-");
+    SetEnvironmentVariableA("MW_SERIAL_CHILD", "1");
+    STARTUPINFOA si; PROCESS_INFORMATION pi; memset(&si, 0, sizeof si); si.cb = sizeof si; memset(&pi, 0, sizeof pi);
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) return NULL;
+    CloseHandle(pi.hThread);
+    return pi.hProcess;
+}
+static int proc_gone (proc_h p) { if (WaitForSingleObject(p, 0) == WAIT_OBJECT_0) { CloseHandle(p); return 1; } return 0; }
+static void proc_kill_wait (proc_h p) { TerminateProcess(p, 137); WaitForSingleObject(p, INFINITE); CloseHandle(p); }
+#else
+typedef pid_t proc_h;
+static proc_h proc_start (int slot, int gen) { proc_h p = fork(); if (p == 0) child_main(slot, gen); return p; }
+static int proc_gone (proc_h p) { int st; return waitpid(p, &st, WNOHANG) == p; }
+static void proc_kill_wait (proc_h p) { kill(p, SIGKILL); int st; waitpid(p, &st, 0); }
+#endif
+
 static void procs_run (const char *path, int keys, int nprocs, double secs, int kill_ms, const char *idx_entries, const char *cut_cmd, int *kills_out, int *crashes_out) {
     if (getenv("MW_SERIAL_KILL_MS")) kill_ms = atoi(getenv("MW_SERIAL_KILL_MS"));
     if (idx_entries) setenv("MW_IDX_ENTRIES", idx_entries, 1); else unsetenv("MW_IDX_ENTRIES");
     g_procs_mode = 1; g_path = path; g_keys = keys; g_secs = secs;
-    pid_t pid[32]; int gen[32]; struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (int i = 0; i < nprocs; i++) { gen[i] = 0; pid[i] = fork(); if (pid[i] == 0) child_main(i, 0); }
+    proc_h pid[32]; int gen[32]; struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < nprocs; i++) { gen[i] = 0; pid[i] = proc_start(i, 0); }
     unsigned rng = 555u; int kills = 0, crashes = 0; double next_kill = (double)kill_ms / 1000.0; int sampled = 0; long long last_tot = -2; double last_move = 0, last_poll = 0;
     for (;;) {
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         double el = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
         if (el > secs) break;
         usleep(5000);
+#ifndef _WIN32
         if (getenv("MW_SERIAL_STALL_SAMPLE") && !sampled && el > 0.5 && el - last_poll > 0.5) {      // (a stall of the writers: what the processes committed does not grow for 2 s: the header of the shared state and the stacks of the processes are taken, once)
             last_poll = el; sqlite3 *pdb; long long tot = -1;
             if (open_db(path, &pdb) == SQLITE_OK) {
@@ -351,22 +392,27 @@ static void procs_run (const char *path, int keys, int nprocs, double secs, int 
             if (tot != last_tot) { last_tot = tot; last_move = el; }
             else if (sampled) { for (int i = 0; i < nprocs; i++) { char cmd[300]; snprintf(cmd, sizeof cmd, "sample %d 1 -file /tmp/sstack_%d_%d.txt >/dev/null 2>&1", (int)pid[i], (int)getpid(), i); (void)!system(cmd); } printf("  [stall: stacks in /tmp/sstack_%d_*.txt]\n", (int)getpid()); }
         }
+#endif
         for (int i = 0; i < nprocs; i++) {                                                           // a process that died by itself (a crash point): replaced
-            int st; if (waitpid(pid[i], &st, WNOHANG) == pid[i]) { crashes++; gen[i]++; pid[i] = fork(); if (pid[i] == 0) child_main(i, gen[i]); }
+            if (proc_gone(pid[i])) { crashes++; gen[i]++; pid[i] = proc_start(i, gen[i]); }
         }
         if (el > next_kill && !getenv("MW_SERIAL_NO_KILL")) {                                                                        // and now and then one is killed from outside, at whatever moment it is in
-            int v = (int)(rnd(&rng) % (uint64_t)nprocs); kill(pid[v], SIGKILL); int st; waitpid(pid[v], &st, 0); kills++;
-            gen[v]++; pid[v] = fork(); if (pid[v] == 0) child_main(v, gen[v]);
+            int v = (int)(rnd(&rng) % (uint64_t)nprocs); proc_kill_wait(pid[v]); kills++;
+            gen[v]++; pid[v] = proc_start(v, gen[v]);
             next_kill = el + (double)(kill_ms / 2 + (int)(rnd(&rng) % (uint64_t)kill_ms)) / 1000.0;
         }
     }
+#ifndef _WIN32
     if (cut_cmd) {
         for (int i = 0; i < nprocs; i++) kill(pid[i], SIGSTOP);
         for (int i = 0; i < nprocs; i++) { int st; waitpid(pid[i], &st, WUNTRACED); }                  // (stopped: whatever they were doing, nothing more is acknowledged)
         printf("power cut: %s\n", cut_cmd); fflush(stdout);
         int rc = system(cut_cmd); CHECK(rc == 0);
     }
-    for (int i = 0; i < nprocs; i++) { kill(pid[i], SIGKILL); int st; waitpid(pid[i], &st, 0); }
+#else
+    (void)cut_cmd;
+#endif
+    for (int i = 0; i < nprocs; i++) proc_kill_wait(pid[i]);
     *kills_out = kills; *crashes_out = crashes;
 }
 
@@ -388,8 +434,8 @@ static void procs_verify (const char *name, const char *path, int keys, int npro
         char fn[300]; rec_name(fn, sizeof fn, path, slot); FILE *f = fopen(fn, "rb"); if (!f) continue;
         rw_t *pending = NULL; rhdr h;
         while (fread(&h, sizeof h, 1, f) == 1) {
-            if (h.type == REC_INTENT) { rw_t *t = malloc(sizeof *t); if (fread(t, sizeof *t, 1, f) != 1) { free(t); break; } if (pending) free(pending); pending = t; }
-            else if (h.type == REC_RO) { ro_t *r = malloc(sizeof *r); if (fread(r, sizeof *r, 1, f) != 1) { free(r); break; } if (S.nro == cap_r) { cap_r *= 2; S.ro = realloc(S.ro, cap_r * sizeof *S.ro); } S.ro[S.nro++] = r; }
+            if (h.type == REC_INTENT) { rw_t *t = malloc(sizeof *t); if (fread(t, sizeof *t, 1, f) != 1) { free(t); break; } if (t->n < 1 || t->n > MAXOPS) { printf("  [slot %d: an intent record that does not make sense at offset %ld: the rest of the file is ignored]\n", slot, ftell(f)); free(t); break; } if (pending) free(pending); pending = t; }
+            else if (h.type == REC_RO) { ro_t *r = malloc(sizeof *r); if (fread(r, sizeof *r, 1, f) != 1) { free(r); break; } if (!ro_ok(r, keys)) { printf("  [slot %d: a read-only record that does not make sense at offset %ld: the rest of the file is ignored]\n", slot, ftell(f)); free(r); break; } if (S.nro == cap_r) { cap_r *= 2; S.ro = realloc(S.ro, cap_r * sizeof *S.ro); } S.ro[S.nro++] = r; }
             else if (h.type == REC_COMMIT) { if (pending && pending->seq == h.seq) { pending->commit = h.epoch; pending->order = h.order; if (S.nknown == cap_k) { cap_k *= 2; S.known = realloc(S.known, cap_k * sizeof *S.known); } S.known[S.nknown++] = pending; pending = NULL; committed++; } }
             else if (h.type == REC_ABORT) { free(pending); pending = NULL; }
             else if (h.type == REC_FULL) full_errors++;
@@ -414,6 +460,7 @@ static void procs_verify (const char *name, const char *path, int keys, int npro
 
 static void run_procs (const char *name, int keys, int nprocs, double secs, int kill_ms, const char *idx_entries) {
     if (skip(name)) return;
+    if (getenv("MW_SERIAL_NPROCS")) nprocs = atoi(getenv("MW_SERIAL_NPROCS"));            // (a way to look at a failure with fewer processes)
     char path[256]; mw_tmpdb(path, sizeof path, "serialp"); g_procs_mode = 1; make_db(path, nprocs);
     int kills, crashes; procs_run(path, keys, nprocs, secs, kill_ms, idx_entries, NULL, &kills, &crashes);
     unsetenv("MW_IDX_ENTRIES");                                    // (the small index is for this scenario only: the verification and the scenarios that follow, with threads in the shared mode, use the default one)
@@ -421,6 +468,7 @@ static void run_procs (const char *name, int keys, int nprocs, double secs, int 
     mw_rmdb(path);
 }
 
+#ifndef _WIN32
 // Power-loss test (test/power/run.sh): the database is on a disk with a volatile write cache that is cut at the end of the run phase; the verify phase runs on what the disk kept.
 //   MW_SERIAL_MODE=threads: one process with a thread for each slot instead of the processes mode.   MW_SERIAL_PHASE=run|verify  MW_SERIAL_DB=<path>  MW_SERIAL_REC=<dir that the loss does not touch>  [MW_SERIAL_KEYS=300 MW_SERIAL_PROCS=6 MW_SERIAL_SECS=6]  MW_SERIAL_CUT_CMD=<command>
 static int power_phase (const char *phase) {
@@ -450,9 +498,27 @@ static int power_phase (const char *phase) {
     MW_DONE();
 }
 
-int main (void) {
+#endif
+
+#ifdef _WIN32
+// a process of the processes mode, started by proc_start with its arguments: serial-child <slot> <generation> <database> <keys> <seconds> <rebase> <without rowid> <record directory>
+static int serial_child (int argc, char **argv) {
+    if (argc < 10) return 2;
+    g_path = argv[4]; g_keys = atoi(argv[5]); g_secs = atof(argv[6]); g_rebase = atoi(argv[7]); g_wr = atoi(argv[8]); g_recdir = strcmp(argv[9], "-") ? argv[9] : NULL; g_procs_mode = 1;
+    child_main(atoi(argv[2]), atoi(argv[3]));
+    return 0;
+}
+#endif
+
+int main (int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
+#ifdef _WIN32
+    if (argc >= 2 && strcmp(argv[1], "serial-child") == 0) return serial_child(argc, argv);
+    if (getenv("MW_SERIAL_CHILD")) { fprintf(stderr, "mw_serial: started as a child without its arguments\n"); return 4; }       // (a safeguard: a copy that does not understand its arguments must not start the test)
+#else
+    (void)argc; (void)argv;
     if (getenv("MW_SERIAL_PHASE")) return power_phase(getenv("MW_SERIAL_PHASE"));
+#endif
     g_rebase = getenv("MW_TEST_REBASE") != NULL;                                                          // (MW_TEST_REBASE=1: only the runs with the rebase)
     for (int pass = g_rebase ? 1 : 0; pass < 2; pass++) {
         g_rebase = pass;

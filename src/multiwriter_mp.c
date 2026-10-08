@@ -103,9 +103,9 @@ int mw_mp_open (mw_db *db) {
         if (!first && flock(db->mp_lockfd, LOCK_SH) != 0) { close(db->mp_lockfd); db->mp_lockfd = -1; return SQLITE_BUSY; }   // blocks while the first process initialises
         // The last process to close unlinks the lock files while holding the exclusive lock: if we were waiting on that lock we hold a
         // deleted inode that nobody else will ever find (two "first" processes on one database). Start over on a stale file.
-        struct stat fs, ps;
+        struct stat fs;
         if (fstat(db->mp_lockfd, &fs) != 0) { close(db->mp_lockfd); db->mp_lockfd = -1; return SQLITE_IOERR; }
-        if (stat(db->mp_path, &ps) != 0 || ps.st_ino != fs.st_ino || ps.st_dev != fs.st_dev) { close(db->mp_lockfd); db->mp_lockfd = -1; continue; }
+        if (mw_same_file(db->mp_lockfd, db->mp_path) != 1) { close(db->mp_lockfd); db->mp_lockfd = -1; continue; }
         // publication/compaction byte locks live on a file of their own: on BSD/macOS flock() and fcntl() locks on
         // one file conflict with each other, and every process holds a shared flock on the header file. (Opened only now: while
         // we hold the header lock nobody can unlink it.)
@@ -295,8 +295,7 @@ int mw_mp_catchup_locked_impl (mw_db *db) {
         // The previous holder died with the lock. If it was replacing the log (rename done, header not yet updated) the path now names a different
         // file than the header describes, and the offsets in the header are those of the old one: adopt the new file and publish a new generation.
         db->mp_recheck = false;
-        struct stat a, b;
-        if (fstat(db->logfd, &a) == 0 && stat(db->logpath, &b) == 0 && (a.st_ino != b.st_ino || a.st_dev != b.st_dev)) {
+        if (mw_same_file(db->logfd, db->logpath) == 0) {
             uint64_t old = atomic_load(&sh->log_pos);
             if (mw_log_reopen(db) == SQLITE_OK) {
                 mw_log_remap_ro(db, 0);

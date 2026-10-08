@@ -141,7 +141,7 @@ static uint64_t fnv64 (uint64_t h, const void *p, size_t n) {
 // A file that was created or renamed is in its directory only once the directory is flushed.
 static void sync_dir_of (const char *path) {
     char *dir = sqlite3_mprintf("%s", path); if (!dir) return;
-    char *sl = strrchr(dir, '/'); if (sl) { if (sl == dir) sl[1] = 0; else *sl = 0; } else { sqlite3_free(dir); dir = sqlite3_mprintf("."); if (!dir) return; }
+    char *sl = mw_last_sep(dir); if (sl) { if (sl == dir) sl[1] = 0; else *sl = 0; } else { sqlite3_free(dir); dir = sqlite3_mprintf("."); if (!dir) return; }
     int fd = open(dir, O_RDONLY);
     if (fd >= 0) { (void)mw_sys_fsync(fd); close(fd); }
     sqlite3_free(dir);

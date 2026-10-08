@@ -155,7 +155,7 @@ static void map_release (segmap *m) { atomic_fetch_sub(&m->users, 1); }
 // another process fsyncs the file stalls: see the log of the other multi-process mode).
 // A segment that was created or renamed is in its directory only once the directory is flushed (ext4 and xfs also flush it with the fsync of the new file; the standard does not promise it).
 static void sync_dir_of (const char *path) {
-    char dir[700]; snprintf(dir, sizeof dir, "%s", path); char *sl = strrchr(dir, '/'); if (sl) { if (sl == dir) sl[1] = 0; else *sl = 0; } else snprintf(dir, sizeof dir, ".");
+    char dir[700]; snprintf(dir, sizeof dir, "%s", path); char *sl = mw_last_sep(dir); if (sl) { if (sl == dir) sl[1] = 0; else *sl = 0; } else snprintf(dir, sizeof dir, ".");
     int fd = open(dir, O_RDONLY); if (fd >= 0) { (void)mw_sys_fsync(fd); close(fd); }
 }
 static int seg_create (mw_seglog *sl, uint32_t seg, uint64_t size, uint64_t base, bool tmp, bool fill) {
@@ -200,8 +200,12 @@ static int cmp_segid (const void *a, const void *b) { uint32_t x = ((const segid
 // Lists the existing segment ids (ascending) and removes "*.new" leftovers.
 static int list_segments (mw_seglog *sl, const char *dbpath, segid **out, int *nout, bool clean) {
     char dir[600], base[300];
-    const char *slash = strrchr(dbpath, '/');
-    if (slash) { size_t n = (size_t)(slash - dbpath); if (n >= sizeof dir) return SQLITE_CANTOPEN; memcpy(dir, dbpath, n); dir[n] = 0; snprintf(base, sizeof base, "%s", slash + 1); }
+    const char *slash = mw_last_sep(dbpath);
+    if (slash) { size_t n = (size_t)(slash - dbpath); if (n >= sizeof dir) return SQLITE_CANTOPEN; memcpy(dir, dbpath, n); dir[n] = 0; snprintf(base, sizeof base, "%s", slash + 1);
+#ifdef _WIN32
+        if (n == 2 && dir[1] == ':') { dir[2] = '\\'; dir[3] = 0; }      // (the root of a drive: "C:" alone is the current directory of that drive)
+#endif
+    }
     else { snprintf(dir, sizeof dir, "."); snprintf(base, sizeof base, "%s", dbpath); }
     char pre[320]; snprintf(pre, sizeof pre, "%s-mw.", base);
     size_t pl = strlen(pre);

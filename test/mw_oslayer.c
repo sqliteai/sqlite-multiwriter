@@ -27,11 +27,15 @@ int main (void) {
     CHECK(fsync(fd) == 0);
     CHECK(sysconf(_SC_PAGESIZE) >= 4096);
 
+    // the engine tells a file that was replaced from the one it holds
+    CHECK(mw_same_file(fd, a) == 1);
+
     // 2. the file is replaced by a rename while it is open (the engine's atomic replace of its log), and the old one stays readable through its descriptor
     int nfd = open(b, O_RDWR | O_CREAT | O_TRUNC, 0600); CHECK(nfd >= 0); CHECK(pwrite(nfd, "NEW", 3, 0) == 3);
     int rc = rename(b, a);
     printf("rename over an open file: rc=%d errno=%d\n", rc, errno);
     CHECK(rc == 0);
+    CHECK(mw_same_file(fd, a) == 0);                                            // (a is another file now)
     rd(fd, 0, 5, buf); CHECK(memcmp(buf, "hello", 5) == 0);                      // the old file, through the old descriptor
     int again = open(a, O_RDWR, 0600); CHECK(again >= 0); rd(again, 0, 3, buf); CHECK(memcmp(buf, "NEW", 3) == 0); close(again);
     close(fd); close(nfd);

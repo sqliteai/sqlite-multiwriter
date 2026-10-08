@@ -15,7 +15,7 @@ The project builds and tests on its own: SQLite 3.53.4 is vendored in `third_par
 The application retries a transaction that fails with `SQLITE_BUSY_SNAPSHOT` (the whole transaction, not the last statement). Isolation: snapshot isolation with first-committer-wins and validation of the pages read; not serializable
 (write skew is possible: `docs/design.md`, "What is guaranteed").
 
-Version 0.5.0 (`MW_VERSION` in `src/multiwriter.h`; `make version`). Status: macOS and Linux (arm64 and x86_64), iOS, Android, Windows (threads of one process): see Platforms. `docs/design.md` is the design, its guarantees and its limits; `docs/history-crdt-design.md` and `docs/engine-history.md` are history (an earlier version captured the CRDT metadata of sqlite-sync: removed).
+Version 0.5.0 (`MW_VERSION` in `src/multiwriter.h`; `make version`). Status: macOS and Linux (arm64 and x86_64), iOS, Android, Windows (threads and processes): see Platforms. `docs/design.md` is the design, its guarantees and its limits; `docs/history-crdt-design.md` and `docs/engine-history.md` are history (an earlier version captured the CRDT metadata of sqlite-sync: removed).
 
 ## Install: the loadable extension
 
@@ -39,7 +39,7 @@ and exports nothing but its entry points and `mw_version`. Built with the engine
 | iOS, iOS simulator, Mac Catalyst | `multiwriter-ios-...`, `-ios-sim-...`, `-mac-catalyst-...` | the same (an app has one process: the threads) |
 | Apple XCFramework | `multiwriter-apple-xcframework-<version>.zip`, and `Package.swift` (Swift Package Manager) | frameworks for iOS, simulator, Catalyst and macOS |
 | Android arm64-v8a, armeabi-v7a, x86_64, x86 | `multiwriter-android-<abi>-...`, and the AAR `multiwriter-android-aar-<version>.aar` | API 26 or later; 16 KB pages |
-| Windows x86_64 | `multiwriter-windows-x86_64-<version>.zip` | threads of one process; `mw_mp` (several processes) is refused: `docs/windows.md` |
+| Windows x86_64 | `multiwriter-windows-x86_64-<version>.zip` | threads and processes (`mw_mp=1`); Windows 10 1709 or later; `docs/windows.md` |
 
 Build one yourself: `make extension [PLATFORM=macos|ios|ios-sim|mac-catalyst|android|linux|linux-musl|windows] [ARCH=...]`, `make xcframework`, `make aar`, `make package`; `make help` lists them (`mk/extension.mk`, `mk/package.mk`).
 
@@ -61,7 +61,7 @@ The version is `MW_VERSION` in `src/multiwriter.h`. A push to the main branch bu
 What to know before relying on it (details and measurements in `docs/design.md`).
 
 **Database and platform**
-- WAL only: `journal_mode` other than WAL, `locking_mode=EXCLUSIVE` and `auto_vacuum` other than none are not supported. `PRAGMA page_size` on a new database is ignored. macOS and Linux; not on a network file system.
+- WAL only: `journal_mode` other than WAL, `locking_mode=EXCLUSIVE` and `auto_vacuum` other than none are not supported. `PRAGMA page_size` on a new database is ignored. Not on a network file system.
 - The database file is only usable through the engine while it is open (the log `<db>-mw` and its segments hold commits that are not yet in the file); `<db>-mw*` files are part of the database. They are versioned (`docs/format.md`): another version of the format is refused, never read wrongly.
 - A VFS stacked above this one must forward the shared-memory methods (`xShm*`); one that keeps its own shared memory makes the commit fail with `SQLITE_IOERR`.
 - `PRAGMA data_version` changes with every transaction (also of the connection itself).

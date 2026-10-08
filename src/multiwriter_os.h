@@ -13,6 +13,15 @@
 #ifndef MULTIWRITER_OS_H
 #define MULTIWRITER_OS_H
 
+// The last separator of a path: '/' everywhere, and on Windows the backslash too (SQLite gives full path names with backslashes)
+#ifdef _WIN32
+#include <string.h>
+static inline char *mw_last_sep (const char *p) { char *a = strrchr(p, '/'), *b = strrchr(p, '\\'); return a > b ? a : b; }
+#else
+#include <string.h>
+static inline char *mw_last_sep (const char *p) { return strrchr(p, '/'); }
+#endif
+
 #ifndef _WIN32
 
 #include <unistd.h>
@@ -25,6 +34,13 @@
 #include <sys/uio.h>
 #include <dirent.h>
 #define MW_OS_POSIX 1
+
+// Is the file that the descriptor holds the one that is at `path` now? (the engine tells a file that another process replaced from the one it has open) 1 yes, 0 no, -1 the path cannot be looked at
+static inline int mw_same_file (int fd, const char *path) {
+    struct stat a, b;
+    if (fstat(fd, &a) != 0 || stat(path, &b) != 0) return -1;
+    return a.st_ino == b.st_ino && a.st_dev == b.st_dev;
+}
 
 #else   // ---- Windows ----
 
@@ -157,6 +173,9 @@ int mw_win_flock (int fd, int op);
 #define F_UNLCK 2
 int mw_win_fcntl (int fd, int cmd, struct flock *fl);
 #define fcntl(fd, cmd, arg) mw_win_fcntl(fd, cmd, arg)
+
+// the same, from the volume and the index of the file (stat() of Windows has no inode, and a device number for a path that is not that of a descriptor)
+int mw_same_file (int fd, const char *path);
 
 // a reservation of disk space (0 or an errno), and: a process is alive
 int mw_win_reserve (int fd, uint64_t to);

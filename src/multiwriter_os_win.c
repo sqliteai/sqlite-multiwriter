@@ -45,10 +45,16 @@ static int win_errno (DWORD e) {
     }
 }
 static int os_trace = -1;
+static void tr (const char *fmt, ...) {         // MW_OS_TRACE=1: to stderr; MW_OS_TRACE=<path>: appended to that file (a child process may not have a stderr)
+    const char *t = getenv("MW_OS_TRACE"); va_list ap; va_start(ap, fmt);
+    FILE *f = (t && t[0] && strcmp(t, "1") != 0) ? fopen(t, "a") : stderr;
+    if (f) { fprintf(f, "[pid %lu] ", (unsigned long)GetCurrentProcessId()); vfprintf(f, fmt, ap); if (f != stderr) fclose(f); }
+    va_end(ap);
+}
 static int fail_at (const char *what) {
     DWORD e = GetLastError();
     if (os_trace < 0) os_trace = getenv("MW_OS_TRACE") != NULL;
-    if (os_trace) fprintf(stderr, "multiwriter os: %s failed, Windows error %lu\n", what, (unsigned long)e);
+    if (os_trace) tr("multiwriter os: %s failed, Windows error %lu\n", what, (unsigned long)e);
     errno = win_errno(e); return -1;
 }
 #define fail() fail_at(__func__)
@@ -72,18 +78,20 @@ static wchar_t *wide_path (const char *p) {
 
 // ---- open / close ----
 int mw_win_open (const char *path, int flags, ...) {
+    if (os_trace < 0) os_trace = getenv("MW_OS_TRACE") != NULL;
+    if (os_trace > 0) tr("multiwriter os: open(%s, %#x)\n", path, flags);
     wchar_t *w = wide_path(path);
     if (!w) { errno = ENOMEM; return -1; }
     DWORD access = (flags & O_RDWR) ? (GENERIC_READ | GENERIC_WRITE) : (flags & O_WRONLY) ? GENERIC_WRITE : GENERIC_READ;
     DWORD disp = (flags & O_CREAT) ? ((flags & O_EXCL) ? CREATE_NEW : OPEN_ALWAYS) : OPEN_EXISTING;
     HANDLE h = CreateFileW(w, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, disp, FILE_ATTRIBUTE_NORMAL, NULL);
     free(w);
-    if (h == INVALID_HANDLE_VALUE) { int r = fail(); if (os_trace > 0) fprintf(stderr, "multiwriter os:   open(%s, flags %#x)\n", path, flags); return r; }
+    if (h == INVALID_HANDLE_VALUE) { int r = fail(); if (os_trace > 0) tr("multiwriter os:   open(%s, flags %#x)\n", path, flags); return r; }
     if ((flags & O_TRUNC) && (access & GENERIC_WRITE)) {
         LARGE_INTEGER z; z.QuadPart = 0;
         if (!SetFilePointerEx(h, z, NULL, FILE_BEGIN) || !SetEndOfFile(h)) { int e = win_errno(GetLastError()); CloseHandle(h); errno = e; return -1; }
     }
-    int fd = _open_osfhandle((intptr_t)h, _O_BINARY | ((access & GENERIC_WRITE) ? 0 : _O_RDONLY));
+    int fd = _open_osfhandle((intptr_t)h, _O_BINARY | ((access & GENERIC_WRITE) ? 0 : _O_RDONLY) | ((flags & O_APPEND) ? _O_APPEND : 0));
     if (fd < 0) { CloseHandle(h); errno = EMFILE; return -1; }
     return fd;
 }
@@ -132,6 +140,8 @@ enum { MW_FileDispositionInfoEx = 21, MW_FileRenameInfoEx = 22 };
 enum { MW_DELETE = 0x1, MW_POSIX_SEMANTICS = 0x2, MW_REPLACE_IF_EXISTS = 0x1 };
 
 int mw_win_unlink (const char *path) {
+    if (os_trace < 0) os_trace = getenv("MW_OS_TRACE") != NULL;
+    if (os_trace > 0) tr("multiwriter os: unlink(%s)\n", path);
     wchar_t *w = wide_path(path);
     if (!w) { errno = ENOMEM; return -1; }
     HANDLE h = CreateFileW(w, DELETE | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
@@ -146,6 +156,8 @@ int mw_win_unlink (const char *path) {
     return ok ? 0 : fail();
 }
 int mw_win_rename (const char *from, const char *to) {
+    if (os_trace < 0) os_trace = getenv("MW_OS_TRACE") != NULL;
+    if (os_trace > 0) tr("multiwriter os: rename(%s, %s)\n", from, to);
     wchar_t *wf = wide_path(from), *wt = wide_path(to);
     int rc = -1;
     if (!wf || !wt) { errno = ENOMEM; goto out; }
@@ -236,7 +248,7 @@ void *mw_win_mmap (void *addr, size_t len, int prot, int flags, int fd, off_t of
     bool wr = (prot & PROT_WRITE) != 0;
     uint64_t maxsz = (uint64_t)off + len;
     LARGE_INTEGER fsz; if (!GetFileSizeEx(h, &fsz)) { fail(); return MAP_FAILED; }
-    if (maxsz > (uint64_t)fsz.QuadPart) { errno = ENXIO; return MAP_FAILED; }     // (a mapping beyond the end of the file would make the file longer here; POSIX leaves the rest unusable)
+    if (maxsz > (uint64_t)fsz.QuadPart) { if (os_trace < 0) os_trace = getenv("MW_OS_TRACE") != NULL; if (os_trace > 0) tr("multiwriter os: mmap of %llu bytes beyond the end of the file (%lld): refused\n", (unsigned long long)maxsz, (long long)fsz.QuadPart); errno = ENXIO; return MAP_FAILED; }     // (a mapping beyond the end of the file would make the file longer here; POSIX leaves the rest unusable)
     HANDLE m = CreateFileMappingW(h, NULL, wr ? PAGE_READWRITE : PAGE_READONLY, (DWORD)(maxsz >> 32), (DWORD)(maxsz & 0xffffffffu), NULL);
     if (!m) { fail(); return MAP_FAILED; }
     void *p = MapViewOfFile(m, wr ? FILE_MAP_WRITE : FILE_MAP_READ, (DWORD)((uint64_t)off >> 32), (DWORD)((uint64_t)off & 0xffffffffu), len);
@@ -274,9 +286,11 @@ static void unlock_byte (HANDLE h, LONGLONG at) {
     OVERLAPPED ov; memset(&ov, 0, sizeof ov); ov.Offset = (DWORD)(at & 0xffffffffu); ov.OffsetHigh = (DWORD)(at >> 32);
     UnlockFileEx(h, 0, 1, 0, &ov);
 }
-static int would_block (void) { DWORD e = GetLastError(); errno = (e == ERROR_LOCK_VIOLATION || e == ERROR_IO_PENDING) ? EWOULDBLOCK : win_errno(e); return -1; }
+static int would_block (void) { DWORD e = GetLastError(); if (os_trace < 0) os_trace = getenv("MW_OS_TRACE") != NULL; if (os_trace) tr("multiwriter os: flock would block (Windows error %lu)\n", (unsigned long)e); errno = (e == ERROR_LOCK_VIOLATION || e == ERROR_IO_PENDING) ? EWOULDBLOCK : win_errno(e); return -1; }
 
 int mw_win_flock (int fd, int op) {
+    if (os_trace < 0) os_trace = getenv("MW_OS_TRACE") != NULL;
+    if (os_trace > 0) tr("multiwriter os: flock(fd %d, op %d)\n", fd, op);
     HANDLE h = HANDLE_OF(fd); if (h == INVALID_HANDLE_VALUE || fd < 0 || fd >= FL_MAXFD) { errno = EBADF; return -1; }
     unsigned char *st = &fl_state[fd];
     BOOL wait = !(op & LOCK_NB);
@@ -322,6 +336,18 @@ int mw_win_fcntl (int fd, int cmd, struct flock *fl) {
         fl->l_pid = 1; return 0;                                // (somebody holds it; the type stays what was asked)
     }
     errno = EINVAL; return -1;
+}
+
+int mw_same_file (int fd, const char *path) {
+    HANDLE h = HANDLE_OF(fd); BY_HANDLE_FILE_INFORMATION a, b;
+    if (h == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(h, &a)) return -1;
+    wchar_t *w = wide_path(path); if (!w) return -1;
+    HANDLE p = CreateFileW(w, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(w);
+    if (p == INVALID_HANDLE_VALUE) return -1;
+    BOOL ok = GetFileInformationByHandle(p, &b); CloseHandle(p);
+    if (!ok) return -1;
+    return a.dwVolumeSerialNumber == b.dwVolumeSerialNumber && a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow;
 }
 
 int mw_win_pid_alive (int pid) {

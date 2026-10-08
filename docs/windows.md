@@ -1,33 +1,36 @@
 # Windows
 
-The engine runs on Windows (MinGW-w64, `make extension PLATFORM=windows` in MSYS2) with the threads of one process. The mode of several processes (`mw_mp=1`) is not available there and a database opened with it is refused with `SQLITE_CANTOPEN`
-(and a line in the SQLite log).
-
-## Why not several processes
-
-In that mode the commit log is a file mapped by every process, which they append to through the mapping, and which the compaction truncates and the processes map again; the segments of the log are deleted and renamed while the others
-have them open. Windows does not let a file with a mapped view be truncated, and the C runtime does not let a file that is open be deleted or renamed. The single process mode (the log is written with `pwritev`, one process owns it) does not need
-any of that.
+The whole engine runs on Windows (MinGW-w64, `make extension PLATFORM=windows` in MSYS2): the threads of one process (`mw=2`) and the processes mode (`mw_mp=1`, the shared mode: one version index and segmented log shared by all the processes).
+What a Windows build does not have is the processes mode with private stores (`MW_MP_PRIVATE`, a legacy mode): its single log file is mapped by every process and truncated by the compaction, and Windows does not truncate a file
+that has a mapped view. A database opened with it is refused with `SQLITE_CANTOPEN` (and a line in the SQLite log).
 
 ## What the Windows build does
 
 `src/multiwriter_os.h` and `src/multiwriter_os_win.c` give the engine the POSIX calls it uses:
 
-- `open` creates files with every share mode, including delete, and gives a C descriptor on the handle; `pread`, `pwrite` and `pwritev` use `OVERLAPPED` offsets; `fsync` is `FlushFileBuffers`; `ftruncate` is `SetEndOfFile`.
-- `unlink` and `rename` use the POSIX semantics of Windows 10 1709 and later (`FileDispositionInfoEx` and `FileRenameInfoEx`): the name goes at once, and a rename replaces a file that is open (the engine swaps the log under its own
-  threads). On an older Windows they fall back to `DeleteFile` and `MoveFileEx`, which keep the name until the last handle is closed.
-- `flock` is made of two byte locks far beyond the end of the file, so that the conversion of an exclusive lock to a shared one (the engine does it when the first user has initialised the database) leaves nobody a moment to slip in.
-  `fcntl` byte-range locks, `mmap`, `msync`, `munmap` and `sysconf` are there too, for the code of the several-processes mode, which is compiled but cannot be reached.
+- `open` creates files with every share mode, including delete, and gives a C descriptor on the handle (binary, `O_APPEND` honoured); `pread`, `pwrite` and `pwritev` use `OVERLAPPED` offsets; `fsync` is `FlushFileBuffers`;
+  `ftruncate` is `SetEndOfFile`; `fstat`/`stat` are the C runtime's, and the one place that needs the identity of a file (has another process replaced it?) uses `mw_same_file` (volume and file index).
+- `unlink` and `rename` use the POSIX semantics of Windows 10 1709 and later (`FileDispositionInfoEx` and `FileRenameInfoEx`): the name goes at once, whoever has the file open, and a rename replaces a file that is open or
+  mapped. On an older Windows they fall back to `DeleteFile` and `MoveFileEx`, which keep the name until the last handle is closed.
+- `flock` is made of two byte locks far beyond the end of the file, so that the conversion of an exclusive lock to a shared one (the first process has initialised the database and lets the others in) leaves nobody a moment to slip in.
+  `fcntl` byte-range locks (the publication lock and the liveness bytes of the processes: Windows drops them when the process ends, at once even for `TerminateProcess`), `mmap` of files and of memory, `msync` and
+  `sysconf` are there too.
+- `nanosleep` and `usleep` use a high resolution waitable timer: `Sleep` rounds to the 15.6 ms tick of the system and the engine waits 50 microseconds at a time in its back-off.
+- The log of a process alone (mw=2, no mw_mp) is not mapped: a mapped file cannot be truncated, which the compaction does. It is written with `pwritev` and read with `pread`, as on the other systems when it is staged.
+- The path of a database is the full path of SQLite, with backslashes; the engine finds the directory of its segments with the last of `/` or `\` (a bug that only the crash recovery shows: after all the processes were killed the
+  first one to open the database found no segment and began an empty log).
 
 ## What is tested
 
-On a Windows 10 (22H2, build 19045) machine, cross-built with MinGW-w64 and run there: the 31 test programs that do not fork pass (twice in a row), and the extension (`multiwriter.dll`) loads into a stock SQLite, registers the VFS and
-runs four writing threads (`test/loadable.c`). The program `mw_oslayer` checks the calls of `multiwriter_os_win.c` one by one: positional reads and writes, `ftruncate`, a rename over an open file, the delete of an open file and
-the reuse of its name at once, `flock` with its conversion, shared mappings, byte-range locks.
+On a Windows 10 machine (22H2, build 19045), cross-built with MinGW-w64 and run there:
 
-Two things that Windows does differently showed up and are handled: a log that is mapped cannot be truncated (so the log of one process is not mapped on Windows), and `Sleep` rounds to the 15.6 ms tick of the system (the engine waits 50
-microseconds at a time in its back-off, so `nanosleep` and `usleep` use a high resolution waitable timer). The disks have a latency: a commit that is durable waits for `FlushFileBuffers`, tens of milliseconds on the machine used,
-and the tests that count commits in a second have a longer second there.
+- the 33 test programs that run on Windows pass, twice in a row: the whole suite of threads, the rebase tests also with `MW_TEST_MP=1`, and `mw_oslayer` (the calls of the layer one by one: positional I/O, truncate, a rename over an open
+  file, the delete of an open file and the reuse of its name at once, `flock` with its conversion, shared mappings, byte-range locks);
+- `mw_procs`: four processes write one database, one is killed, then all are killed at once and the database is opened: every insert that a process had acknowledged is there (a byte for each in a file of its own);
+- `mw_serial` with the processes started by `CreateProcess` and killed by `TerminateProcess`: the randomised serializability check, with and without the rebase, with a WITHOUT ROWID table, passes: 0 reads that differ from the
+  serial order, the transactions in doubt after a kill are placed, the final content is the model's;
+- the extension (`multiwriter.dll`) loads into a stock SQLite, registers the VFS and runs four writing threads (`test/loadable.c`).
 
-
-The tests that do not use `fork()` run on Windows (`make test-ci PLATFORM=windows` in MSYS2); the tests of processes, of crashes and of kills (about twenty programs) use `fork`/`waitpid` and are not built there. The CI runs them on `windows-2022`.
+The tests that fork and wait for children (about twenty: the ones of crashes at a point of the publication, of a full disk, of the liveness of the processes) are POSIX only and not built on Windows; the crash points of `mw_serial`
+(`MW_CRASH_*`) and the power-loss phases are not run there either. A durable commit waits for `FlushFileBuffers`: tens of milliseconds on the disk used, so the tests that count commits in a second have a longer second.
+Not tested: Windows older than 10 1709 (the delete and the rename without POSIX semantics), a network share, a database on a drive without NTFS.

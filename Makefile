@@ -38,7 +38,7 @@ LIB_OBJ := $(ENGINE_OBJ) $(BUILD)/sqlite3.o
 TEST_SRC := $(wildcard test/mw_*.c)
 ifeq ($(PLATFORM),windows)
 # the tests that fork, wait for processes, map files or set the environment of a child are not for Windows (docs/windows.md)
-TEST_SRC := $(filter-out $(shell grep -lE 'sys/wait.h|sys/mman.h|fork|setenv' $(TEST_SRC)) test/mw_relocprep.c,$(TEST_SRC))
+TEST_SRC := $(filter-out $(filter-out $(shell grep -l MW_PORTABLE_TEST $(TEST_SRC)),$(shell grep -lE 'sys/wait.h|sys/mman.h|fork|setenv' $(TEST_SRC))) test/mw_relocprep.c,$(TEST_SRC))
 endif
 TEST_BIN := $(patsubst test/%.c,$(DIST)/%$(EXE),$(TEST_SRC))
 IO_TESTS := $(DIST)/mw_ioerr$(EXE) $(DIST)/mw_diskfull$(EXE)                       # (minutes: make test-io)
@@ -91,6 +91,9 @@ clean:
 
 # the transaction tests with the shared multi-process mode (mw_mp=1) in place of the thread mode
 MP_TESTS := mw_rebase mw_rebasefk mw_rebasefkstress mw_rebasenoop mw_rebaseskew mw_rebasewr mw_serial mw_relocprep mw_shared
+ifeq ($(PLATFORM),windows)
+MP_TESTS := mw_rebase mw_rebasefk mw_rebasefkstress mw_rebasenoop mw_rebaseskew mw_rebasewr mw_serial     # (the others fork)
+endif
 .PHONY: test-mp
-test-mp: $(addprefix $(DIST)/,$(MP_TESTS))
+test-mp: $(addsuffix $(EXE),$(addprefix $(DIST)/,$(MP_TESTS)))
 	@set -e; for t in $(MP_TESTS); do echo "== $$t (mw_mp=1)"; MW_TEST_MP=1 ./$(DIST)/$$t; done

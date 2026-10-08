@@ -38,6 +38,20 @@ __attribute__((constructor)) static void mw_dump_init (void) { signal(SIGUSR1, m
 
 static int mw_failures = 0;
 
+#ifdef _WIN32
+// A crash of a test on Windows says where: the address of the fault and of the calls that led to it, as offsets in the image (x86_64-w64-mingw32-addr2line -e <exe> -f 0x14<offset> on the machine that built it)
+#include <windows.h>
+static LONG WINAPI mw_crash (EXCEPTION_POINTERS *ep) {
+    char *base = (char *)GetModuleHandleA(NULL); void *bt[40]; USHORT n = RtlCaptureStackBackTrace(0, 40, bt, NULL);
+    fprintf(stderr, "CRASH: exception %#lx at offset %#llx (image base %p); access %s address %p\nstack (offsets):", (unsigned long)ep->ExceptionRecord->ExceptionCode, (unsigned long long)((char *)ep->ExceptionRecord->ExceptionAddress - base), (void *)base,
+            ep->ExceptionRecord->NumberParameters ? (ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read") : "?", ep->ExceptionRecord->NumberParameters > 1 ? (void *)ep->ExceptionRecord->ExceptionInformation[1] : NULL);
+    for (USHORT i = 0; i < n; i++) fprintf(stderr, " %#llx", (unsigned long long)((char *)bt[i] - base));
+    fprintf(stderr, "\n"); fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+__attribute__((constructor)) static void mw_crash_init (void) { SetUnhandledExceptionFilter(mw_crash); }
+#endif
+
 // MW_LOG=1 prints what SQLite and the engine write to the SQLite log (sqlite3_log), for a test that fails somewhere that its exit codes do not say
 static void mw_log_cb (void *arg, int code, const char *msg) { (void)arg; fprintf(stderr, "[sqlite log %d] %s\n", code, msg); }
 __attribute__((constructor)) static void mw_log_init (void) { if (getenv("MW_LOG")) sqlite3_config(SQLITE_CONFIG_LOG, mw_log_cb, NULL); }

@@ -57,7 +57,7 @@ afterEvaluate {
                 pom {
                     name = 'sqlite-multiwriter'
                     description = 'SQLite with more writers: many threads and processes write one database at the same time, as a loadable extension.'
-                    url = 'https://github.com/sqlitecloud/sqlite-multiwriter'
+                    url = 'https://github.com/sqliteai/sqlite-multiwriter'
                     licenses {
                         license {
                             name = 'Apache License 2.0'

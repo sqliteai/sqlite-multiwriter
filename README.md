@@ -1,60 +1,190 @@
 # sqlite-multiwriter
 
-Multi-writer SQLite as a wrapper VFS: many connections (threads and processes) write one database at the same time. Each transaction runs on a snapshot and is validated at commit; a commit that lost is refused
-(`SQLITE_BUSY_SNAPSHOT`, run it again) or, with `mw_rebase=1`, replayed at the latest state when it lost only because it shares pages with a commit that changed other rows. Nothing in SQLite is modified, no SQL syntax is
-added, and every commit is ACID (the durability of the WAL with `synchronous=FULL`: a commit log with group commit, compacted into the ordinary database file, which stays a plain SQLite database).
+SQLite is a remarkable piece of software, and it has one well-known limit: a database accepts a single writer at a time. With many threads, or many processes (a group of agents working on the same
+database, for example), the writers queue up behind one lock, or fail with `SQLITE_BUSY` and have to try again.
 
-The project builds and tests on its own: SQLite 3.53.4 is vendored in `third_party/sqlite`. It does not synchronise databases (for that use [sqlite-sync](https://github.com/sqliteai/sqlite-sync) as an extension of its own).
+sqlite-multiwriter removes that limit without touching SQLite. It is a VFS that you load as an extension (or link in): your SQLite, your SQL and your database file stay the same, and many connections
+write the same database at once. Every commit is durable, and the file remains an ordinary SQLite database.
 
-    #include "multiwriter.h"        /* the VFS registers itself when SQLite initialises (SQLITE_EXTRA_INIT) */
+- **More writes per second.** Writers that touch different rows (or different pages) do not wait for each other. In the tables below: 2 to 5 times the transactions per second of stock SQLite with 4 to 16 writers.
+- **Almost no `SQLITE_BUSY`.** With writers on their own rows, the application sees a retry in 0.2 of 100 transactions, where stock SQLite needs 2 retries per transaction at 16 writers.
+- **Threads or processes.** One process with many connections, or many processes on one file.
+- **Nothing to change in the schema or in the SQL.** No triggers, no new syntax, no special tables.
 
-    sqlite3_open_v2("file:app.db?mw=2", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);                /* threads of one process        */
-    sqlite3_open_v2("file:app.db?mw=2&mw_mp=1", ...);                                                                          /* processes (the shared mode)   */
-    sqlite3_open_v2("file:app.db?mw=2&mw_rebase=1", ...);                                                                      /* ... with the rebase           */
+## How it works
 
-The application retries a transaction that fails with `SQLITE_BUSY_SNAPSHOT` (the whole transaction, not the last statement). Isolation: snapshot isolation with first-committer-wins and validation of the pages read; not serializable
-(write skew is possible: `docs/design.md`, "What is guaranteed").
+Each transaction runs on a snapshot of the database. At commit, its pages are checked against the commits published in the meantime. If nobody changed what it wrote or read, it commits: writers do not wait for
+each other. If another commit got there first on the same page, the transaction is refused with `SQLITE_BUSY_SNAPSHOT` and the application runs it again (first committer wins). Commits go through a log with group commit
+(the durability of WAL with `synchronous=FULL`) and are compacted into the database file in the background.
 
-Version 0.5.0 (`MW_VERSION` in `src/multiwriter.h`; `make version`). Status: macOS and Linux (arm64 and x86_64), iOS, Android, Windows (threads and processes): see Platforms. `docs/design.md` is the design, its guarantees and its limits; `docs/history-crdt-design.md` and `docs/engine-history.md` are history (an earlier version captured the CRDT metadata of sqlite-sync: removed).
+**The rebase** (`mw_rebase=1`, optional). Two writers that change different rows can still land on the same page, and that is the usual cause of a refused commit. With the rebase the engine does not refuse the
+loser: it takes the row changes of its transaction and applies them again on top of the latest state, then commits. The application sees no error. A transaction that really conflicts (the same row changed by both)
+is still refused. The rebase is limited to simple transactions: `INSERT`s and `UPDATE`/`DELETE`s of a row by its key. See Limits.
 
-## Install: the loadable extension
+Isolation is snapshot isolation, not serializable: write skew is possible (`docs/design.md`). The application must retry a transaction that fails with `SQLITE_BUSY_SNAPSHOT`, the whole transaction.
 
-Every release has the extension for each platform (GitHub releases; `make extension` builds it for the machine you are on). Load it into a SQLite that allows extensions, then open the database with the VFS:
+## Two ways to use it
 
-    .load ./multiwriter                              -- the sqlite3 shell (the file is multiwriter.so, .dylib or .dll)
+| | Threads (`mw=2`) | Processes (`mw=2&mw_mp=1`) |
+|---|---|---|
+| Who writes | many connections in one process | many processes (agents, workers, a CLI and a server) on the same file |
+| Shared state | memory of the process | shared memory and a log in segments next to the database |
+| Platforms | all | all (little use in an iOS app: one process) |
+
+Add `mw_rebase=1` to either.
+
+## Install
+
+Every release has the extension for each platform ([releases](https://github.com/sqliteai/sqlite-multiwriter/releases/latest); `make extension` builds it for the machine you are on). Load it into a SQLite that
+allows extensions, then open the database with the VFS:
+
+    .load ./multiwriter                              -- the sqlite3 shell (multiwriter.so, .dylib or .dll)
     SELECT mw_version();                             -- 0.5.0
-    -- from C: sqlite3_load_extension(db, "./multiwriter", "sqlite3_multiwriter_init", &err)
-    sqlite3_open_v2("file:app.db?vfs=multiwriter&mw=2&mw_rebase=1", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
 
-`sqlite3_multiwriter_default_init` (as the entry point) also makes it the default VFS. The extension is the engine alone: it calls SQLite through the table of routines of the host (SQLite 3.14 or later; tested with the 3.53 of `third_party/sqlite`),
-and exports nothing but its entry points and `mw_version`. Built with the engine and SQLite in one (the default `make`), the VFS registers itself when SQLite initialises, and the URI needs no `vfs=`.
+From C:
+
+    sqlite3_enable_load_extension(db, 1);
+    sqlite3_load_extension(db, "./multiwriter", "sqlite3_multiwriter_init", &err);
+
+`sqlite3_multiwriter_default_init` as the entry point also makes it the default VFS. The extension calls SQLite through the routines of the host (SQLite 3.14 or later). To build the engine and SQLite into one
+library, run `make`: the VFS then registers itself when SQLite starts and the URI needs no `vfs=`.
+
+## Multi-threading
+
+Open every connection with the same URI and retry on `SQLITE_BUSY_SNAPSHOT`:
+
+    #define URI "file:app.db?vfs=multiwriter&mw=2&mw_rebase=1"
+
+    /* load the extension once (see Install), then in each thread: */
+    sqlite3 *db;
+    sqlite3_open_v2(URI, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+
+    for (;;) {
+        sqlite3_exec(db, "BEGIN", 0, 0, 0);
+        sqlite3_exec(db, "UPDATE account SET balance = balance + 10 WHERE id = 7", 0, 0, 0);
+        int rc = sqlite3_exec(db, "COMMIT", 0, 0, 0);
+        if (rc == SQLITE_OK) break;
+        sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+        if (rc != SQLITE_BUSY_SNAPSHOT && rc != SQLITE_BUSY) break;       /* a real error */
+        /* otherwise run the whole transaction again */
+    }
+
+Options (URI parameters, read when the database is opened):
+
+| Parameter | Meaning |
+|---|---|
+| `mw=2` | use the engine (0: off) |
+| `mw_rebase=1` | replay a commit that lost only on shared pages instead of refusing it |
+| `mw_profile=small` | smaller caches (8 MB of pages, 16 MB of log before compaction), for a phone or a small server |
+| `mw_log_max_mb` | size of the log before it is compacted into the database |
+| `mw_fullfsync=1` | `F_FULLFSYNC` for the log and the compaction on macOS |
+
+The complete list is in `docs/design.md`.
+
+### Against stock SQLite, threads
+
+WAL, `synchronous=FULL` (every commit is on disk when it returns), 8-second runs, an 18-core Mac, SQLite 3.53.4. "Retries" is the number of times the application had to run a transaction again after `SQLITE_BUSY`,
+per 100 committed transactions. Stock SQLite: one writer at a time. Full tables, with more scenarios and the rows written: `docs/benchmarks.md`.
+
+**Each thread inserts its own rows** (100 rows per transaction)
+
+| Threads | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 13,099 | 0 | 14,877 | 0 | 14,780 | 0 |
+| 4 | 9,049 | 130 | 30,984 | 0.0 | 31,094 | 0.0 |
+| 16 | 8,539 | 197 | 46,449 | 0.2 | 46,113 | 0.1 |
+| 64 | 7,890 | 430 | 40,336 | 1.0 | 40,770 | 0.7 |
+
+**Each thread updates its own row, rows share pages** (one row per transaction)
+
+| Threads | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 17,683 | 0 | 33,010 | 0 | 33,167 | 0 |
+| 4 | 11,128 | 5.6 | 39,510 | 0.7 | 29,104 | 0 |
+| 16 | 10,376 | 32 | 32,977 * | 8.2 | 51,061 | 0 |
+| 64 | 10,884 | 134 | 39,871 | 65 | 45,244 | 0 |
+
+\* a few transactions gave up after 1000 retries.
+
+**Every thread updates the same 4 rows** (`a = a + 1`): a real conflict, which no engine can merge
+
+| Threads | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 13,624 | 0 | 29,799 | 0 | 33,795 | 0 |
+| 4 | 13,642 | 5.1 | 29,247 | 3.9 | 20,524 | 11 |
+| 16 | 14,684 | 24 | 26,849 | 21 | 28,201 | 39 |
+| 64 | 13,812 | 109 | 28,126 | 101 | 22,484 | 156 |
+
+When writers fight over the same rows, the gain is about 2x and the retries are those of SQLite; the rebase does not help there.
+
+## Multi-process (agents on one database)
+
+Every process opens the same file with `mw_mp=1`; the code is the one above with a different URI:
+
+    #define URI "file:agents.db?vfs=multiwriter&mw=2&mw_mp=1&mw_rebase=1"
+
+The processes share one index of page versions and a log (`agents.db-mw*` files next to the database). A process that is killed does not block the others: its unfinished transaction is discarded and its
+committed ones are kept. The last process to close leaves a plain SQLite file. Databases must be on a local file system.
+
+### Against stock SQLite, processes
+
+Same machine and settings as above; every writer is a separate process.
+
+**Each process inserts its own rows** (100 rows per transaction)
+
+| Processes | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 13,122 | 0 | 14,167 | 0 | 14,208 | 0 |
+| 4 | 9,051 | 126 | 27,626 | 0.0 | 28,180 | 0.0 |
+| 16 | 8,419 | 180 | 24,257 | 0.2 | 24,454 | 0.2 |
+
+**Each process updates its own row, rows share pages** (one row per transaction)
+
+| Processes | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 13,976 | 0 | 30,848 | 0 | 30,752 | 0 |
+| 4 | 13,738 | 5.7 | 45,304 | 20 | 46,301 | 0 |
+| 16 | 12,722 | 28 | 43,487 | 106 | 47,184 | 0 |
+
+**Every process updates the same 4 rows** (`a = a + 1`)
+
+| Processes | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 14,233 | 0 | 31,715 | 0 | 32,707 | 0 |
+| 4 | 14,062 | 5.0 | 40,909 | 67 | 41,709 | 48 |
+| 16 | 12,716 | 26 | 41,619 | 119 | 43,381 | 108 |
+
+The rebase is what removes the retries of the middle table: the processes never change the same row, only the same pages.
 
 ## Platforms
 
-| Platform | Files of a release | Notes |
+Archives and packages are on the [current release](https://github.com/sqliteai/sqlite-multiwriter/releases/latest).
+
+| Platform | File of the release | Notes |
 |---|---|---|
-| Linux glibc, x86_64 and arm64 | `multiwriter-linux-<arch>-<version>.tar.gz` | the whole engine, threads and processes |
-| Linux musl (Alpine), x86_64 and arm64 | `multiwriter-linux-musl-<arch>-...` | the same |
-| macOS | `multiwriter-macos-universal-...` (x86_64 + arm64), and each alone | the same |
-| iOS, iOS simulator, Mac Catalyst | `multiwriter-ios-...`, `-ios-sim-...`, `-mac-catalyst-...` | the same (an app has one process: the threads) |
-| Apple XCFramework | `multiwriter-apple-xcframework-<version>.zip`, and `Package.swift` (Swift Package Manager) | frameworks for iOS, simulator, Catalyst and macOS |
-| Android arm64-v8a, armeabi-v7a, x86_64, x86 | `multiwriter-android-<abi>-...`, and the AAR `multiwriter-android-aar-<version>.aar` | API 26 or later; 16 KB pages |
-| Windows x86_64 | `multiwriter-windows-x86_64-<version>.zip` | threads and processes (`mw_mp=1`); Windows 10 1709 or later; `docs/windows.md` |
+| Linux glibc, x86_64 and arm64 | `multiwriter-linux-<arch>-<version>.tar.gz` | threads and processes |
+| Linux musl (Alpine), x86_64 and arm64 | `multiwriter-linux-musl-<arch>-...` | threads and processes |
+| macOS, x86_64 and arm64 | `multiwriter-macos-universal-...`, and each alone | threads and processes |
+| iOS, iOS simulator, Mac Catalyst | `multiwriter-ios-...`, `-ios-sim-...`, `-mac-catalyst-...` | threads |
+| Apple XCFramework | `multiwriter-apple-xcframework-<version>.zip`, and `Package.swift` (Swift Package Manager) | iOS, simulator, Catalyst, macOS |
+| Android arm64-v8a, armeabi-v7a, x86_64, x86 | `multiwriter-android-<abi>-...`, and `multiwriter-android-aar-<version>.aar` | API 26 or later, 16 KB pages |
+| Windows x86_64 | `multiwriter-windows-x86_64-<version>.zip` | threads and processes; Windows 10 1709 or later (`docs/windows.md`) |
 
-Build one yourself: `make extension [PLATFORM=macos|ios|ios-sim|mac-catalyst|android|linux|linux-musl|windows] [ARCH=...]`, `make xcframework`, `make aar`, `make package`; `make help` lists them (`mk/extension.mk`, `mk/package.mk`).
+Build one yourself: `make extension [PLATFORM=macos|ios|ios-sim|mac-catalyst|android|linux|linux-musl|windows] [ARCH=...]`, `make xcframework`, `make aar`, `make package`
+(`mk/extension.mk`, `mk/package.mk`). The version is `MW_VERSION` in `src/multiwriter.h`; a push to `main` builds and tests every platform and, if that version has no release yet, publishes it
+(`.github/workflows/main.yml`).
 
-## Releases
+## Build and test
 
-The version is `MW_VERSION` in `src/multiwriter.h`. A push to the main branch builds and tests every platform (`.github/workflows/main.yml`); if the version has no release yet, the same run tags it with the version and publishes the release with the archives, the XCFramework and the AAR (and puts the checksum of the XCFramework in `Package.swift`). To release, change `MW_VERSION`.
-
-    git clone <url> && cd sqlite-multiwriter
-    make test           # the test suite (about 40 programs, a few minutes)
+    git clone https://github.com/sqliteai/sqlite-multiwriter && cd sqlite-multiwriter
+    make test           # the test suite (about 50 programs, a few minutes)
     make test-mp        # the transaction tests with processes (mw_mp=1)
     make test-io        # errors of the file system and a full disk (minutes)
     make bench          # dist/mw_bench;  bench/compare_sqlite.py: against stock SQLite
     test/sanitize.sh asan|ubsan|tsan [tests]
-    # durability against a loss of power (Docker, privileged; see test/power/run.sh)
-    docker build -t mw-power test/power && docker run --rm --privileged -v "$PWD":/src mw-power bash /src/test/power/run.sh
+
+SQLite 3.53.4 is vendored in `third_party/sqlite`; nothing else is needed. Design, guarantees and limits: `docs/design.md`. The files `docs/history-crdt-design.md` and `docs/engine-history.md`
+are history of earlier versions. This project does not synchronise databases; for that see [sqlite-sync](https://github.com/sqliteai/sqlite-sync).
 
 ## Limits
 

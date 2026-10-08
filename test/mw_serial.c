@@ -90,15 +90,14 @@ static void run_rw (ctx_t *c, rw_t *out, int *got) {
         else if (r < 3) { o->kind = 1; o->a = 1 + (int)(rnd(&c->rng) % 9); snprintf(sql, sizeof sql, "UPDATE t SET v = v + %d WHERE id = %d", o->a, o->key); }
         else if (r < 5) { o->kind = 2; snprintf(sql, sizeof sql, "DELETE FROM t WHERE id = %d", o->key); }
         else if (r < 7) { o->kind = 3; do o->b = ucol(&c->rng); while (o->b == o->su);       // (a change that changes nothing writes no page: the row would be read and not written)
-            if (o->b < 0) snprintf(sql, sizeof sql, "UPDATE t SET u = NULL WHERE id = %d%s", o->key, blind ? " AND u IS NOT NULL" : "");        // (blind: it must really change the row, or it would write no page; the guard reads the row)
-            else if (blind) snprintf(sql, sizeof sql, "UPDATE t SET u = %d WHERE id = %d AND u IS NOT %d", o->b, o->key, o->b);
+            if (o->b < 0) snprintf(sql, sizeof sql, "UPDATE t SET u = NULL WHERE id = %d", o->key);        // (blind: it may set the value that the row has: a change that writes no page, which the rebase must not replay around)
             else snprintf(sql, sizeof sql, "UPDATE t SET u = %d WHERE id = %d", o->b, o->key); }
-        else if (r < 9) { o->kind = 5; do o->a = (int)(rnd(&c->rng) % 600); while (o->a == o->spl); snprintf(sql, sizeof sql, "UPDATE t SET p = zeroblob(%d) WHERE id = %d AND length(p) <> %d", o->a, o->key, blind ? o->a : -1); }
+        else if (r < 9) { o->kind = 5; do o->a = (int)(rnd(&c->rng) % 600); while (o->a == o->spl); snprintf(sql, sizeof sql, "UPDATE t SET p = zeroblob(%d) WHERE id = %d", o->a, o->key); }
         else { o->kind = 0; snprintf(sql, sizeof sql, "UPDATE t SET w = w + 1 WHERE id = %d", o->key); }
         int rc = mw_exec(db, sql);
         if (blind && rc == SQLITE_OK) {                                  // what a blind statement says: an insert that succeeded found the key free; another one found the row, or did not
             if (o->kind == 4) { o->sex = 0; o->sv = 0; }
-            else if (sqlite3_changes(db) == 0) { o->sex = (o->kind == 3 || o->kind == 5) ? BLIND : 0; o->kind = 6; o->sv = 0; }       // (a guarded update that changed nothing says nothing: the row was absent or already like that)
+            else if (sqlite3_changes(db) == 0) { o->sex = 0; o->kind = 6; o->sv = 0; }
         }
         if (rc != SQLITE_OK) { ok = 0; if ((rc & 0xff) == SQLITE_FULL) put_rec(c->fd, REC_FULL, c->slot, 0, 0, 0, NULL, 0); if ((rc & 0xff) == SQLITE_CONSTRAINT) R->constraint++; else if ((rc & 0xff) == SQLITE_BUSY) R->busy++; else { R->other++; if (getenv("MW_VERBOSE")) printf("  other rc %d on: %s\n", rc, sql); } }
     }

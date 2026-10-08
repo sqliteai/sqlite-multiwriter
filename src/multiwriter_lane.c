@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <assert.h>
 #include <sys/stat.h>
 #include "multiwriter_io.h"
@@ -174,6 +175,11 @@ static int stmt_kind (const char *sql) {
     if (sqlite3_strnicmp(sql, "INSERT", 6) == 0 || sqlite3_strnicmp(sql, "REPLACE", 7) == 0 || sqlite3_strnicmp(sql, "UPDATE", 6) == 0 || sqlite3_strnicmp(sql, "DELETE", 6) == 0) return RD_DML;
     return RD_OTHER;
 }
+static bool has_word (const char *sql, const char *w) {
+    size_t n = strlen(w);
+    for (const char *p = sql; *p; p++) if (sqlite3_strnicmp(p, w, (int)n) == 0 && (p == sql || !(isalnum((unsigned char)p[-1]) || p[-1] == '_')) && !(isalnum((unsigned char)p[n]) || p[n] == '_')) return true;
+    return false;
+}
 static bool stmt_reads (const char *sql) {
     while (sql && (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r' || *sql == '(')) sql++;
     return sql && (sqlite3_strnicmp(sql, "SELECT", 6) == 0 || sqlite3_strnicmp(sql, "WITH", 4) == 0 || sqlite3_strnicmp(sql, "VALUES", 6) == 0);
@@ -181,29 +187,37 @@ static bool stmt_reads (const char *sql) {
 void mw_lane_stmt_note (mw_lane *lane, mw_stmt_note *n) {
     sqlite3_stmt *st = n->stmt;
     if (!n->ending) {
-        if (n->autocommit) lane->rd_dep = false;                                   // (this statement starts a transaction)
+        if (n->autocommit) { lane->rd_dep = false; lane->rd_chg_base = sqlite3_total_changes(sqlite3_db_handle(st)); }       // (this statement starts a transaction)
         const char *sql = sqlite3_sql(st);
         if (sql && sqlite3_strnicmp(sql, "EXPLAIN", 7) == 0) return;               // (our own: the bytecode of a statement is looked at from inside the hook)
         lane->rd_db = sqlite3_db_handle(st);
-        if (stmt_reads(sql)) lane->rd_dep = true;
+        if (stmt_reads(sql) || (sql && has_word(sql, "REPLACE"))) lane->rd_dep = true;      // (REPLACE deletes rows that no change counter counts)
         lane->rd_cur = st; lane->rd_cur_kind = stmt_kind(sql);
         if (lane->rd_cur_kind == RD_DML && !stmt_is_point(lane, st, sql)) lane->rd_dep = true;
         return;
     }
     if (lane->rd_cur != st) return;                                              // (also the EXPLAIN of the hook itself)
     lane->rd_cur = NULL;
-    if (lane->rd_cur_kind == RD_DML && !sqlite3_stmt_readonly(st) && sqlite3_changes64(sqlite3_db_handle(st)) == 0) lane->rd_dep = true;       // (an UPDATE or DELETE that found nothing has read that the row is absent)
+    if (lane->rd_cur_kind == RD_DML && !sqlite3_stmt_readonly(st) && sqlite3_changes(sqlite3_db_handle(st)) == 0) lane->rd_dep = true;       // (an UPDATE or DELETE that found nothing has read that the row is absent)
 }
 // (A statement that changed nothing writes no page, so the one that is committing now has no such read.)
 // The hook is the connection's one trace callback. SQLite has no way to read the current one, so it cannot be saved and put back, or chained: an application that installs its own sqlite3_trace_v2
 // replaces it, and then no statement is seen. A commit happens inside a statement (COMMIT, or the write itself in autocommit mode), and the hook has seen that one if it is the statement that is running
 // now on the connection. If it is not, the hook was replaced (at any time: even in the middle of the transaction the statement that commits is not seen): the transaction is treated as one that
 // read, no rebase, never a wrong one.
-bool mw_lane_reads_unchanged (mw_lane *lane) {
+bool mw_lane_reads_unchanged (mw_lane *lane, int nnet) {
     if (lane->rd_dep) return true;
     if (!lane->rd_cur || !lane->rd_db) return true;
-    for (sqlite3_stmt *st = sqlite3_next_stmt(lane->rd_db, NULL); st; st = sqlite3_next_stmt(lane->rd_db, st)) if (st == lane->rd_cur && sqlite3_stmt_busy(st)) return false;
-    return true;
+    bool alive = false;
+    for (sqlite3_stmt *st = sqlite3_next_stmt(lane->rd_db, NULL); st; st = sqlite3_next_stmt(lane->rd_db, st)) if (st == lane->rd_cur && sqlite3_stmt_busy(st)) alive = true;
+    if (!alive) return true;
+    // A statement that changes a row to what it is (UPDATE t SET a = 5 where a is 5) is counted as a change and writes no page, so the replay, which has only the row changes of the pages, does not see it: the
+    // row it read (and wrote, as it thought) goes unchecked. The changes that the statements counted (sqlite3_total_changes: the rows of the statements and of the foreign key actions, not the rows that
+    // REPLACE deletes: those transactions are excluded above) must be exactly the net row changes found in the pages: every counted change is then a row that changed, and no row changed twice or back.
+    // (The committing statement itself is not counted yet: an autocommit point statement changes one row, or it would have written no page.)
+    int counted = (int)((unsigned)sqlite3_total_changes(lane->rd_db) - (unsigned)lane->rd_chg_base);
+    if (lane->rd_cur_kind == RD_DML) counted++;
+    return counted != nnet;
 }
 
 // A conflicting transaction can be rebased (multiwriter_rebase.c: its row changes are replayed at the latest snapshot) only if the connection asked for it (URI mw_rebase=1), it is not itself a

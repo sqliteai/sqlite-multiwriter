@@ -399,7 +399,7 @@ int mw_lane_rebase (mw_lane *lane, const uint8_t *const *imgs, uint32_t cookie, 
     mw_rd_result res;
     mw_rowdiff_compute(lane, imgs, R->cat, &res);                               // (in parallel: every connection decodes its own pages)
     if (res.unsupported || res.n == 0) { mw_rd_result_free(&res); atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }
-    if (mw_lane_reads_unchanged(lane)) { mw_rd_result_free(&res); atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }       // (it read rows that it did not change: write skew, the application retries)
+    if (mw_lane_reads_unchanged(lane, res.n)) { mw_rd_result_free(&res); atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }       // (it read rows that it did not change: write skew, the application retries)
     bool fk = false;
     if (R->cat->has_fk) { int on = 1; if (lane->rd_db) sqlite3_db_config(lane->rd_db, SQLITE_DBCONFIG_ENABLE_FKEY, -1, &on); fk = on != 0; }       // (an application that does not enforce them: the replay does not either)
     rb_req rq = { .lane = lane, .res = &res, .cookie = cookie, .fk = fk };

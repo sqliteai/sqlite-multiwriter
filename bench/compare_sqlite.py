@@ -41,7 +41,7 @@ def run(variant, n):
         js = [json.loads(l[5:]) for l in r.stdout.splitlines() if l.startswith("JSON ")]
         if not js: res["error"] = (r.stdout + r.stderr)[-300:]; clean(db); return res
         j = js[0]; res.update(merged=j.get("mw_rebases", 0), rebase_ms=j.get("mw_rebase_ms", 0), merge_attempts_lost=j.get("mw_rebase_retries", 0), page_conflicts=j.get("mw_page_conflicts", 0)); res.update(tx_s=j["tx_per_s"], retries=j["busy"], gave_up=j["errors"], committed=j["committed"], wait_mean_us=j["wait_mean_us"], wait_p50_us=j["wait_p50_us"],
-                              wait_p99_us=j["wait_p99_us"], wait_max_us=j["wait_max_us"], lat_p50_us=j["p50_us"], lat_p99_us=j["p99_us"], rss_mb=j["rss_mb"], valid=j["valid"], cpu_s=j["cpu_s"])
+                              wait_p99_us=j["wait_p99_us"], wait_max_us=j["wait_max_us"], lat_p50_us=j["p50_us"], lat_p99_us=j["p99_us"], lat_p999_us=j["p999_us"], lat_max_us=j["max_us"], rss_mb=j["rss_mb"], valid=j["valid"], cpu_s=j["cpu_s"])
     else:
         bar = tempfile.mkdtemp(); od = tempfile.mkdtemp(); m0 = vm()
         procs = [subprocess.Popen(base + ["--agents", "1", "--agent-base", str(i), "--no-setup", "--duration", str(DUR), "--warmup", "2", "--seed", "1", "--barrier", bar],
@@ -63,7 +63,7 @@ def run(variant, n):
             rss = sorted(j["rss_mb"] for j in js); p50 = sorted(j["wait_p50_us"] for j in js)
             res.update(merged=sum(j.get("mw_rebases", 0) for j in js), rebase_ms=sum(j.get("mw_rebase_ms", 0) for j in js), merge_attempts_lost=sum(j.get("mw_rebase_retries", 0) for j in js), page_conflicts=sum(j.get("mw_page_conflicts", 0) for j in js)); res.update(tx_s=sum(j["tx_per_s"] for j in js), retries=sum(j["busy"] for j in js), gave_up=sum(j["errors"] for j in js), committed=tot, reporting=len(js),
                        wait_mean_us=wm, wait_p50_us=p50[len(p50) // 2], wait_p99_us=max(j["wait_p99_us"] for j in js), wait_max_us=max(j["wait_max_us"] for j in js),
-                       lat_p50_us=sorted(j["p50_us"] for j in js)[len(js) // 2], lat_p99_us=max(j["p99_us"] for j in js), rss_mb_median=rss[len(rss) // 2], rss_mb_sum=sum(rss),
+                       lat_p50_us=sorted(j["p50_us"] for j in js)[len(js) // 2], lat_p99_us=max(j["p99_us"] for j in js), lat_p999_us=max(j["p999_us"] for j in js), lat_max_us=max(j["max_us"] for j in js), rss_mb_median=rss[len(rss) // 2], rss_mb_sum=sum(rss),
                        sys_mem_growth_mb=m1 - m0, cpu_s=sum(j["cpu_s"] for j in js))
         v = subprocess.run(base + ["--agents", "1", "--verify-sum", str(res.get("committed", 0))], capture_output=True, text=True).stdout
         res["valid"] = 1 if "-> VALID" in v else 0

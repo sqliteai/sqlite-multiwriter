@@ -1,5 +1,8 @@
 # sqlite-multiwriter
 
+**With 16 threads writing one database, 48,988 transactions per second against 8,705 for SQLite (5.6x), and the slowest 1 in 1000 commits takes 1.96 ms instead of 140 ms.**
+**With 16 processes, 25,682 against 8,548 (3.0x), and 1.50 ms against 241 ms.**
+
 SQLite is a remarkable piece of software, and it has one well-known limit: a database accepts a single writer at a time. With many threads, or many processes (a group of agents working on the same
 database, for example), the writers queue up behind one lock, or fail with `SQLITE_BUSY` and have to try again.
 
@@ -13,17 +16,17 @@ write the same database at once. Every commit is durable, and the file remains a
 
 ## In numbers
 
-16 writers on one database, `synchronous=FULL` (every commit is on disk when it returns), against stock SQLite in WAL mode. Same machine and settings as the tables below.
+16 writers on one database against stock SQLite in WAL mode, `synchronous=FULL` (every commit is on disk when it returns). Latency is the time from the start of a transaction to its commit, retries included. Best result in bold; how it was measured is under the tables below.
 
-| 16 writers | SQLite tx/s | multiwriter tx/s | Gain | Retries per 100 tx, SQLite → multiwriter |
-|---|---:|---:|---:|---:|
-| Threads, each inserting its own rows | 8,539 | 46,449 | 5.4x | 197 → 0.2 |
-| Threads, own rows on shared pages (with rebase) | 10,376 | 51,061 | 4.9x | 32 → 0 |
-| Processes, each inserting its own rows | 8,419 | 24,257 | 2.9x | 180 → 0.2 |
-| Processes, own rows on shared pages (with rebase) | 12,722 | 47,184 | 3.7x | 28 → 0 |
-| Threads, all on the same 4 rows | 14,684 | 26,849 | 1.8x | 24 → 21 |
+| 16 writers | SQLite tx/s | multiwriter tx/s | Gain | Retries per 100 tx | Slowest 1 in 1000 commits |
+|---|---:|---:|---:|---:|---:|
+| Threads, each inserting its own rows | 8,705 | **48,988** | 5.6x | 197 → **0.2** | 140 → **1.96** ms |
+| Threads, own rows on shared pages (with rebase) | 15,066 | **55,948** | 3.7x | 23 → **0** | 521 → **0.93** ms |
+| Processes, each inserting its own rows | 8,548 | **25,682** | 3.0x | 188 → **0.1** | 241 → **1.50** ms |
+| Processes, own rows on shared pages (with rebase) | 12,823 | **50,997** | 4.0x | 34 → **0** | 870 → **15.9** ms |
+| Threads, all on the same 4 rows | 13,881 | **34,471** | 2.5x | 32 → **16** | 533 → **109** ms |
 
-One writer is not slower than SQLite (14,877 against 13,099 tx/s). When writers change the same rows they really conflict: the gain is smaller and the retries stay.
+One writer is not slower than SQLite (16,371 against 13,450 tx/s). When writers change the same rows they really conflict: the gain is smaller and the retries stay.
 
 ## How it works
 
@@ -97,26 +100,27 @@ The complete list is in `docs/design.md`.
 
 ### Against stock SQLite, threads
 
-WAL, `synchronous=FULL` (every commit is on disk when it returns), 8-second runs, an 18-core Mac, SQLite 3.53.4. "Retries" is the number of times the application had to run a transaction again after `SQLITE_BUSY`,
-per 100 committed transactions. Stock SQLite: one writer at a time. Full tables, with more scenarios and the rows written: `docs/benchmarks.md`.
+Apple M5 Pro (18 cores, 64 GB, SSD, APFS), SQLite 3.53.4 in WAL mode, `synchronous=FULL`, 8-second runs on a fresh database. "Retries" is how many times, per 100 committed transactions, the application had to
+run a transaction again after `SQLITE_BUSY`; the engine refuses a commit that conflicts and the application runs it again, up to 1000 times. Best result of each row in bold. More scenarios and the rows written:
+`docs/benchmarks.md`. To repeat the runs: `make bench`, then `VARIANTS=mw,mwr,sqlite WORKLOAD=bulk python3 bench/compare_sqlite.py threads out.jsonl 8 1 4 16 64` (`WORKLOAD` is `bulk`, `groups` or `hot`).
 
 **Each thread inserts its own rows** (100 rows per transaction)
 
 | Threads | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 13,099 | 0 | 14,877 | 0 | 14,780 | 0 |
-| 4 | 9,049 | 130 | 30,984 | 0.0 | 31,094 | 0.0 |
-| 16 | 8,539 | 197 | 46,449 | 0.2 | 46,113 | 0.1 |
-| 64 | 7,890 | 430 | 40,336 | 1.0 | 40,770 | 0.7 |
+| 1 | 13,450 | **0** | **16,371** | **0** | 10,272 | **0** |
+| 4 | 9,378 | 130 | **34,223** | **0.0** | 22,998 | **0.0** |
+| 16 | 8,705 | 197 | **48,988** | 0.2 | 22,403 | **0.1** |
+| 64 | 8,138 | 427 | **45,843** | 1.2 | 25,739 | **0.9** |
 
 **Each thread updates its own row, rows share pages** (one row per transaction)
 
 | Threads | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 17,683 | 0 | 33,010 | 0 | 33,167 | 0 |
-| 4 | 11,128 | 5.6 | 39,510 | 0.7 | 29,104 | 0 |
-| 16 | 10,376 | 32 | 32,977 * | 8.2 | 51,061 | 0 |
-| 64 | 10,884 | 134 | 39,871 | 65 | 45,244 | 0 |
+| 1 | 14,002 | **0** | **32,839** | **0** | 24,903 | **0** |
+| 4 | 13,370 | 5.0 | **44,457** | 0.6 | 37,383 | **0** |
+| 16 | 15,066 | 23 | 43,668 * | 6.9 | **55,948** | **0** |
+| 64 | 13,777 | 104 | 36,418 | 63 | **40,291** | **0** |
 
 \* a few transactions gave up after 1000 retries.
 
@@ -124,12 +128,22 @@ per 100 committed transactions. Stock SQLite: one writer at a time. Full tables,
 
 | Threads | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 13,624 | 0 | 29,799 | 0 | 33,795 | 0 |
-| 4 | 13,642 | 5.1 | 29,247 | 3.9 | 20,524 | 11 |
-| 16 | 14,684 | 24 | 26,849 | 21 | 28,201 | 39 |
-| 64 | 13,812 | 109 | 28,126 | 101 | 22,484 | 156 |
+| 1 | 13,517 | **0** | 23,730 | **0** | **28,770** | **0** |
+| 4 | 13,159 | 6.5 | 38,018 | **2.4** | **40,137** | 7.2 |
+| 16 | 13,881 | 32 | **34,471** | **16** | 19,296 | 36 |
+| 64 | 12,945 | 127 | **30,756** | **94** | 22,121 | 160 |
 
-When writers fight over the same rows, the gain is about 2x and the retries are those of SQLite; the rebase does not help there.
+**Commit latency** (milliseconds, each thread inserting its own rows): time from the start of a transaction to its commit, retries included
+
+| Threads | SQLite p50 | p99 | p99.9 | multiwriter p50 | p99 | p99.9 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.07 | 0.09 | 1.23 | **0.06** | **0.08** | **0.15** |
+| 4 | 0.21 | 1.54 | 57.2 | **0.11** | **0.24** | **0.72** |
+| 16 | **0.23** | 54.7 | 140 | 0.28 | **1.20** | **1.96** |
+| 64 | **0.26** | 138 | 253 | 1.18 | **4.08** | **35.1** |
+
+SQLite's median can be lower with many writers: a writer that finds the database busy fails at once and the application retries, and the cost shows in the 99.9th percentile. When writers fight over the
+same rows the gain is about 2x and the rebase does not help. Where every statement is a new 100-row `INSERT` (first table) the rebase costs about half of the throughput; it pays when writers share pages (second table).
 
 ## Multi-process (agents on one database)
 
@@ -142,31 +156,39 @@ committed ones are kept. The last process to close leaves a plain SQLite file. D
 
 ### Against stock SQLite, processes
 
-Same machine and settings as above; every writer is a separate process.
+Same machine and settings as above; every writer is a separate process (`WORKLOAD=bulk python3 bench/compare_sqlite.py procs out.jsonl 8 1 4 16`).
 
 **Each process inserts its own rows** (100 rows per transaction)
 
 | Processes | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 13,122 | 0 | 14,167 | 0 | 14,208 | 0 |
-| 4 | 9,051 | 126 | 27,626 | 0.0 | 28,180 | 0.0 |
-| 16 | 8,419 | 180 | 24,257 | 0.2 | 24,454 | 0.2 |
+| 1 | 13,800 | **0** | **15,085** | **0** | 9,751 | **0** |
+| 4 | 9,159 | 135 | **28,536** | **0.0** | 23,316 | **0.0** |
+| 16 | 8,548 | 188 | **25,682** | **0.1** | 23,843 | **0.1** |
 
 **Each process updates its own row, rows share pages** (one row per transaction)
 
 | Processes | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 13,976 | 0 | 30,848 | 0 | 30,752 | 0 |
-| 4 | 13,738 | 5.7 | 45,304 | 20 | 46,301 | 0 |
-| 16 | 12,722 | 28 | 43,487 | 106 | 47,184 | 0 |
+| 1 | 14,480 | **0** | 36,012 | **0** | **37,366** | **0** |
+| 4 | 13,650 | 5.1 | **49,927** | 20 | 49,678 | **0** |
+| 16 | 12,823 | 34 | 50,540 | 102 | **50,997** | **0** |
 
 **Every process updates the same 4 rows** (`a = a + 1`)
 
 | Processes | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 14,233 | 0 | 31,715 | 0 | 32,707 | 0 |
-| 4 | 14,062 | 5.0 | 40,909 | 67 | 41,709 | 48 |
-| 16 | 12,716 | 26 | 41,619 | 119 | 43,381 | 108 |
+| 1 | 13,267 | **0** | 39,210 | **0** | **39,412** | **0** |
+| 4 | 12,316 | **5.2** | **44,651** | 66 | 44,430 | 49 |
+| 16 | 13,447 | **25** | 46,455 | 109 | **46,690** | 100 |
+
+**Commit latency** (milliseconds, each process inserting its own rows)
+
+| Processes | SQLite p50 | p99 | p99.9 | multiwriter p50 | p99 | p99.9 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.07 | **0.09** | 1.26 | **0.06** | 0.21 | **0.27** |
+| 4 | 0.23 | 0.94 | 64.9 | **0.14** | **0.30** | **0.40** |
+| 16 | **0.23** | 77.1 | 241 | 0.60 | **0.91** | **1.50** |
 
 The rebase is what removes the retries of the middle table: the processes never change the same row, only the same pages.
 

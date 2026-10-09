@@ -1,5 +1,7 @@
 # Benchmarks
 
+The tables of the README are from a later run (2026-10-09: `bench/results/lat_*_2026-10-09.jsonl`, Apple M5 Pro) that also records the latency of a commit (p50, p99, p99.9 and maximum). The numbers below are those of 2026-10-07.
+
 Measured on one Mac with 18 cores, SQLite 3.53.4, `synchronous=FULL` (every commit is on disk when it returns), 2026-10-07. One run of 8 seconds per number, so differences of a few percent are noise.
 The numbers are in `bench/results/simple_*_2026-10-07.jsonl`; `bench/make_report.py` makes this page from them. Part 1 is for threads of one process, part 2 for separate processes; each has the same scenarios and the comparison with SQLite.
 

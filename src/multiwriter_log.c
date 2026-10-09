@@ -325,22 +325,15 @@ int mw_log_open (mw_db *db, int pgsz) {
     return SQLITE_OK;
 }
 
-// The mapped log is replaced or unmapped only through these two: lazy store versions (multi-process catch-up) point into the mapping, so they are copied out first,
-// and the store is told where the current mapping is.
-static void log_unmap (mw_db *db, bool materialize) {
+static void log_unmap (mw_db *db) {
     if (!db->logmap) return;
-    if (materialize && db->store) mw_store_materialize_lazy(db->store);
     munmap(db->logmap, LOG_MAP_BYTES);
     db->logmap = NULL;
-    if (db->store) atomic_store(&db->store->lazy_base, NULL);
 }
-static void log_mapped (mw_db *db, void *m) {
-    db->logmap = m == MAP_FAILED ? NULL : m;
-    if (db->store) atomic_store(&db->store->lazy_base, db->logmap);
-}
+static void log_mapped (mw_db *db, void *m) { db->logmap = m == MAP_FAILED ? NULL : m; }
 
 void mw_log_close (mw_db *db, bool remove_file) {
-    log_unmap(db, false);                                                // (the store is about to be freed: nothing to materialise)
+    log_unmap(db);
     if (db->logfd >= 0) { flock(db->logfd, LOCK_UN); close(db->logfd); db->logfd = -1; }
     if (remove_file && db->logpath) unlink(db->logpath);
     sqlite3_free(db->logpath);
@@ -417,7 +410,7 @@ out:
 // the append offset (sparse); records are validated by checksum at recovery, so the unwritten tail is harmless.
 void mw_log_remap (mw_db *db) {
     db->logsync_off = 0; db->logsync_low1 = 0;
-    log_unmap(db, true);
+    log_unmap(db);
     struct stat sb;
     db->logfile_size = fstat(db->logfd, &sb) == 0 ? (uint64_t)sb.st_size : 0;
 #ifdef _WIN32
@@ -1066,7 +1059,7 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch, mw_log_prep *prep) {
     sqlite3_free(tmp);
     // swap: offsets shift by (LOG_HDR_SIZE - tail_off)
     sync_quiesce(db);                                                    // (a group-commit leader may be inside msync/fsync on the old mapping and fd)
-    log_unmap(db, true);
+    log_unmap(db);
     { static _Atomic int dly = MW_KNOB_UNSET; const int us = mw_knob_int(&dly, "MW_TEST_SWAP_DELAY_US", 0); if (us > 0) usleep((useconds_t)us); }      // (tests: widens the gap between the quiesce and the swap of the descriptor)
     pthread_mutex_lock(&db->log_mu);                                     // (mw_log_ensure_room uses the descriptor under this lock, outside of the group-commit quiesce: it must not find it closed, or reused by another open)
     close(db->logfd);                                                    // (releases the old inode's lock; the new one is held)

@@ -79,7 +79,7 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
         h = c->dirty_next;
         int k = -1;
         for (int lo = 0, hi = c->n - 1; lo <= hi; ) { int mid = (lo + hi) / 2; if (c->v[mid].epoch <= T) { k = mid; lo = mid + 1; } else hi = mid - 1; }
-        if (k >= 0 && c->v[k].epoch > base) { memcpy(page, mw_pv_data(db->store, &c->v[k]), pgsz); have = true; }
+        if (k >= 0 && c->v[k].epoch > base) { memcpy(page, c->v[k].data, pgsz); have = true; }
         pthread_mutex_unlock(mu);
         if (!have) continue;
         ssize_t w = mw_io_pwrite(db->fd_real, page, pgsz, (off_t)(pgno - 1) * (off_t)pgsz);
@@ -99,7 +99,7 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
             mw_spinlock(mu1);
             int k1 = -1;
             for (int lo = 0, hi = c1->n - 1; lo <= hi; ) { int mid = (lo + hi) / 2; if (c1->v[mid].epoch <= T) { k1 = mid; lo = mid + 1; } else hi = mid - 1; }
-            if (k1 >= 0) { const uint8_t *q = mw_pv_data(db->store, &c1->v[k1]) + 28; size_pages = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3]; }
+            if (k1 >= 0) { const uint8_t *q = c1->v[k1].data + 28; size_pages = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3]; }
             pthread_mutex_unlock(mu1);
         }
     }

@@ -131,13 +131,12 @@ typedef struct {
 #define MW_CHAIN_BLOCK (1u << MW_CHAIN_BLOCK_BITS)
 #define MW_DIR_SIZE (1u << 20)                       // x 4096 pages = 4G pages
 
-typedef struct { uint64_t epoch; uint8_t *data; uint64_t lazy; } mw_pv;      // lazy: data == NULL and the image is in the shared log mapping at offset lazy - 1 (multi-process catch-up)
+typedef struct { uint64_t epoch; uint8_t *data; } mw_pv;
 typedef struct {
     mw_pv    *v;                                     // ascending epoch
     int       n, cap;
     uint32_t  dirty_next, cand_next;                 // intrusive list links (pgno + 1, 0 = end)
     uint8_t   dirty, queued;                         // in the compaction / GC list (protected by the page's stripe)
-    uint8_t   lazy_hot;                              // a lazy version of this page was read: later versions are copied at catch-up, off the critical path (page 1, interior pages)
 } mw_chain;
 typedef struct { uint64_t epoch; uint32_t dbsize; uint64_t log_off; } mw_sizerec;   // log_off: offset of the commit's log record (0 = none)   // db size (pages) as of an epoch, ascending
 
@@ -165,14 +164,9 @@ typedef struct {
     _Atomic uint64_t      base_bytes;                // clean pages of the real file cached as epoch-0 versions
     uint64_t              base_limit;                // cache cap (default 64 MB)
     struct mw_db         *shared_db;                 // shared mode: the page versions are in the shared index of this database, not here
-    _Atomic(const uint8_t *) lazy_base;              // the log mapping the lazy versions point into (multi-process): valid until the mapping is replaced, which materialises them first
-    _Atomic uint64_t      lazy_n;                    // lazy versions currently held
 } mw_store;
 
 // The bytes of a version: its private copy, or the page image inside the shared log mapping.
-static inline const uint8_t *mw_pv_data (const mw_store *st, const mw_pv *p) {
-    return p->data ? p->data : atomic_load_explicit(&st->lazy_base, memory_order_acquire) + (p->lazy - 1);
-}
 
 struct mw_lane {
     mw_db      *db;
@@ -432,7 +426,6 @@ typedef struct {
     bool            adopt_images;     // the images are individually malloc'ed blocks the store may keep: it frees them if the publication fails
 } mw_validate;
 // Validates against `v` and installs atomically under the store write lock (the only serialization point).
-void      mw_store_materialize_lazy (mw_store *st);       // copy every lazy version out of the mapping (before it is replaced)
 int       mw_store_install_recovered (mw_store *st, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images);
 // `sync`: fsync the log before the commit becomes visible (synchronous=FULL semantics).
 // Locks of the page store are held for fractions of a microsecond. A contended acquisition of a plain pthread mutex sleeps in the kernel (a wake-up costs tens
@@ -461,7 +454,7 @@ enum { MW_ST_PUBLISH, MW_ST_LOCKS, MW_ST_APPEND, MW_ST_SYNC, MW_ST_VISIBLE, MW_S
 extern bool mw_timing_on;
 void mw_stage_add (int stage, uint64_t ns);
 void mw_count_add (int counter, uint64_t v);      // (timing) named counters: see mw_timing_dump
-enum { MW_C_SY_LEADER, MW_C_SY_FOLLOWER, MW_C_SY_RECS, MW_C_SY_BYTES, MW_C_SY_WAKES, MW_C_VIS_IMMEDIATE, MW_C_VIS_SPUN, MW_C_VIS_PARKED, MW_C_LAZY_READ, MW_C_ADM_BUSY, MW_C_ADM_SAMPLES, MW_C_ADM_WAITERS, MW_C_COUNT };
+enum { MW_C_SY_LEADER, MW_C_SY_FOLLOWER, MW_C_SY_RECS, MW_C_SY_BYTES, MW_C_SY_WAKES, MW_C_VIS_IMMEDIATE, MW_C_VIS_SPUN, MW_C_VIS_PARKED, MW_C_ADM_BUSY, MW_C_ADM_SAMPLES, MW_C_ADM_WAITERS, MW_C_COUNT };
 uint64_t mw_stage_now (void);
 #define MW_T0() (mw_timing_on ? mw_stage_now() : 0)
 #define MW_T1(stage, t0) do { if (mw_timing_on) mw_stage_add((stage), mw_stage_now() - (t0)); } while (0)

@@ -359,13 +359,6 @@ uint64_t mw_mp_compaction_target (mw_db *db) {
     return t1 < t0 ? t1 : t0;
 }
 
-// When every live process is fully caught up at epoch T == committed, restart the log at its header without
-// truncating the file (another process may still have it mapped: truncating would SIGBUS it). Stale bytes past
-// the new records cannot validate: record epochs must be contiguous.
-// (There used to be a reset of the log in place here: when every process had applied everything, the end was set back to 64 and the old bytes were overwritten by new
-// records. With lazy versions that point into the mapping of the log that would corrupt what they point at, so the log is only ever *replaced* by a new file
-// (mw_mp_rewrite_log, below); an old file stays valid for the processes that still map it.)
-
 // MARK: - schema barrier across processes -
 //
 // Same contract as the in-process barrier (multiwriter_tx.c): an optimisation of *when* a schema change runs, never

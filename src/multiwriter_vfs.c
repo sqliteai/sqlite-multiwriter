@@ -196,15 +196,21 @@ static const sqlite3_io_methods *mw_pass_methods (sqlite3_file *real) {
     return (real->pMethods->iVersion >= 3) ? &mw_io : (real->pMethods->iVersion == 2) ? &v2 : &v1;
 }
 
-// URI mw=0: stock passthrough; mw=1: the engine (private lanes); mw=2: experimental (lane tracking on the stock shared WAL).
-// Inside, the engine is mode 2 and the tracking mode 1 (the numbers the code compares against).
+// URI mw=0: stock passthrough; mw=1: the engine (private lanes); mw=2: experimental (lane tracking on the stock shared WAL). true/on/yes and false/off/no are accepted for 1 and 0.
+// Inside, the engine is mode 2 and the tracking mode 1 (the numbers the code compares against). Returns -1 for a value that is none of these: the open fails, a typo must not give stock SQLite.
 static int mw_mode_for (const char *name, int flags) {
     if (!name || !(flags & SQLITE_OPEN_MAIN_DB)) return 0;
-    // vfs=multiwriter in the URI turns the engine on (mw=0 opts out). Not every open through the VFS: the database that VACUUM INTO or ATTACH opens has a plain name and stays as stock.
-    int dflt = mw_default_enabled;
-    const char *v = sqlite3_uri_parameter(name, "vfs");
-    if (v && !strcmp(v, "multiwriter")) dflt = 1;
-    int uri_mode = (int)sqlite3_uri_int64(name, "mw", dflt);
+    const char *v = sqlite3_uri_parameter(name, "mw");
+    int uri_mode;
+    if (!v) {
+        // vfs=multiwriter in the URI turns the engine on (mw=0 opts out). Not every open through the VFS: the database that VACUUM INTO or ATTACH opens has a plain name and stays as stock.
+        const char *vfs = sqlite3_uri_parameter(name, "vfs");
+        uri_mode = (vfs && !strcmp(vfs, "multiwriter")) ? 1 : mw_default_enabled;
+    }
+    else if (!strcmp(v, "0") || !sqlite3_stricmp(v, "false") || !sqlite3_stricmp(v, "off") || !sqlite3_stricmp(v, "no")) uri_mode = 0;
+    else if (!strcmp(v, "1") || !sqlite3_stricmp(v, "true") || !sqlite3_stricmp(v, "on") || !sqlite3_stricmp(v, "yes")) uri_mode = 1;
+    else if (!strcmp(v, "2")) uri_mode = 2;
+    else return -1;
     return uri_mode == 1 ? 2 : uri_mode == 2 ? 1 : 0;
 }
 
@@ -222,6 +228,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
     }
 
     int mode = mw_mode_for(name, flags);
+    if (mode < 0) { sqlite3_log(SQLITE_CANTOPEN, "multiwriter: mw=%s is not 0, 1 or 2", sqlite3_uri_parameter(name, "mw")); return SQLITE_CANTOPEN; }
     if (mode >= 2 && name) {
         const char *cache = sqlite3_uri_parameter(name, "cache");
         if (cache && !strcmp(cache, "shared")) return SQLITE_CANTOPEN;          // shared-cache shares one pager between connections: no private lanes

@@ -96,7 +96,7 @@ Options (URI parameters, read when the database is opened):
 
 | Parameter | Meaning |
 |---|---|
-| `mw` | `1`: the engine, and the default when the URI has `vfs=multiwriter`; `0`: off for that database |
+| `mw` | `1`: the engine, and the default when the URI has `vfs=multiwriter`; `0`: off for that database; any other value fails the open |
 | `mw_rebase=1` | replay a commit that lost only on shared pages instead of refusing it |
 | `mw_profile=small` | smaller caches (8 MB of pages, 16 MB of log before compaction), for a phone or a small server |
 | `mw_log_max_mb` | size of the log before it is compacted into the database |

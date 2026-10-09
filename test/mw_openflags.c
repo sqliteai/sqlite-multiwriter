@@ -5,6 +5,20 @@
 int main (void) {
     char path[256]; mw_tmpdb(path, sizeof path, "openflags"); char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=1", path);
     sqlite3 *db = NULL;
+    // 0. the value of mw= is checked: a typo must not give stock SQLite. 1, true and on are the engine, 0 and off are stock, 2 is the experimental mode; anything else fails to open
+    {
+        const char *bad[] = { "banana", "3", "", "-1" }, *good[] = { "1", "true", "on", "yes", "0", "off", "2" };
+        for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) {
+            char u[400]; snprintf(u, sizeof u, "file:%s-v?mw=%s", path, bad[i]);
+            CHECK_RC(sqlite3_open_v2(u, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL), SQLITE_CANTOPEN); sqlite3_close(db); db = NULL;
+        }
+        for (unsigned i = 0; i < sizeof good / sizeof *good; i++) {
+            char u[400]; snprintf(u, sizeof u, "file:%s-v%u?mw=%s", path, i, good[i]);
+            CHECK_RC(sqlite3_open_v2(u, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL), SQLITE_OK);
+            CHECK_RC(mw_exec(db, "CREATE TABLE t(a); INSERT INTO t VALUES(1)"), SQLITE_OK); sqlite3_close(db); db = NULL;
+            char p[400]; snprintf(p, sizeof p, "%s-v%u", path, i); mw_rmfiles(p);
+        }
+    }
     // 1. no SQLITE_OPEN_CREATE and no file: it fails, and nothing is created
     CHECK_RC(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL), SQLITE_CANTOPEN); sqlite3_close(db); db = NULL;
     CHECK(access(path, F_OK) != 0);

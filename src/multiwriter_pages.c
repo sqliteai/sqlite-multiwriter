@@ -125,7 +125,7 @@ int mw_store_read (mw_store *st, uint32_t pgno, uint64_t snap, uint32_t poff, ui
     pthread_mutex_t *mu = stripe_of(st, pgno);
     mw_spinlock(mu);
     int i = chain_find(c, snap);
-    if (i >= 0) { if (!c->v[i].data) { c->lazy_hot = 1; if (mw_timing_on) mw_count_add(MW_C_LAZY_READ, 1); } memcpy(dst, mw_pv_data(st, &c->v[i]) + poff, n); found = 1; }
+    if (i >= 0) { memcpy(dst, c->v[i].data + poff, n); found = 1; }
     pthread_mutex_unlock(mu);
     return found;
 }
@@ -145,7 +145,6 @@ void mw_store_cache_base (mw_store *st, uint32_t pgno, const void *image) {
     if (c->n == 0 && chain_reserve(c) == SQLITE_OK) {
         c->v[0].epoch = 0;
         c->v[0].data = copy;
-        c->v[0].lazy = 0;
         c->n = 1;
         copy = NULL;
         atomic_fetch_add(&st->base_bytes, (uint64_t)st->pgsz);
@@ -252,7 +251,6 @@ static void chain_install_batched (mw_store *st, uint32_t pgno, mw_chain *c, uin
     if (pgno == 1) { atomic_store_explicit(&st->p1_cookie, (((uint32_t)data[40] << 24) | ((uint32_t)data[41] << 16) | ((uint32_t)data[42] << 8) | (uint32_t)data[43]), memory_order_relaxed); atomic_store_explicit(&st->p1_head_epoch, epoch, memory_order_release); }
     c->v[c->n].epoch = epoch;
     c->v[c->n].data = data;
-    c->v[c->n].lazy = 0;
     c->n++;
     atomic_fetch_add_explicit(&st->versions, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&st->versions_allocated, 1, memory_order_relaxed);
@@ -271,7 +269,6 @@ static void chain_install (mw_store *st, uint32_t pgno, mw_chain *c, uint64_t ep
     if (pgno == 1) { atomic_store_explicit(&st->p1_cookie, (((uint32_t)data[40] << 24) | ((uint32_t)data[41] << 16) | ((uint32_t)data[42] << 8) | (uint32_t)data[43]), memory_order_relaxed); atomic_store_explicit(&st->p1_head_epoch, epoch, memory_order_release); }
     c->v[c->n].epoch = epoch;
     c->v[c->n].data = data;
-    c->v[c->n].lazy = 0;
     c->n++;
     atomic_fetch_add(&st->versions, 1);
     atomic_fetch_add(&st->versions_allocated, 1);
@@ -346,12 +343,12 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
                     }
                     int oi = chain_find(c, snap_for(v, v->read_pgnos[i]));
                     uint8_t *oldimg = NULL; const uint8_t *oldp = NULL;
-                    if (oi >= 0) { if (!c->v[oi].data) c->lazy_hot = 1; oldp = mw_pv_data(st, &c->v[oi]); }
+                    if (oi >= 0) oldp = c->v[oi].data;
                     else if ((oldimg = malloc((size_t)st->pgsz)) != NULL) {                 // no version at the snapshot in memory: the real file's page
                         mw_file *f = lane->file;
                         if (f->real->pMethods->xRead(f->real, oldimg, st->pgsz, (sqlite3_int64)(v->read_pgnos[i] - 1) * st->pgsz) == SQLITE_OK) oldp = oldimg;
                     }
-                    bool same = used && oldp && mw_interior_routes_same(oldp, mw_pv_data(st, &c->v[c->n - 1]), st->pgsz, reserved, used, nused);
+                    bool same = used && oldp && mw_interior_routes_same(oldp, c->v[c->n - 1].data, st->pgsz, reserved, used, nused);
                     free(oldimg);
                     if (same) { atomic_fetch_add(&db->n_reads_saved, 1); continue; }
                 }
@@ -582,7 +579,6 @@ int mw_db_publish_finish (mw_db *db, mw_lane *lane, int rc, uint64_t my_epoch, i
 
 // Recovery: install a commit read back from the log (single-threaded, before the database is used).
 int mw_store_install_recovered (mw_store *st, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images) {
-    // (also called at run time by the multi-process catch-up, while readers and GC walk the chains: reserve and install under the stripe lock)
     for (int i = 0; i < n; i++) {
         mw_chain *c = chain_get(st, pgnos[i], true);
         uint8_t *copy = malloc((size_t)st->pgsz);
@@ -609,32 +605,6 @@ int mw_store_install_recovered (mw_store *st, uint64_t epoch, uint32_t dbsize, i
     st->nsizes++;
     pthread_mutex_unlock(&st->seq_mu);
     return SQLITE_OK;
-}
-
-// The log mapping is about to be replaced (new generation, rewrite, close): give every lazy version its own copy. The caller holds the process's mp_mu (nothing installs lazy
-// versions meanwhile) and must not hold seq_mu (lock order: stripes before seq_mu); nothing is done, and no lock taken, when there are none.
-void mw_store_materialize_lazy (mw_store *st) {
-    if (!st || atomic_load(&st->lazy_n) == 0) return;
-    uint64_t tmat0 = now_ns(), nmat = atomic_load(&st->lazy_n);
-    const uint8_t *base = atomic_load(&st->lazy_base);
-    for (int i = 0; i < MW_STRIPES; i++) mw_spinlock(&st->stripes[i].mu);
-    for (uint32_t b = 0; b < MW_DIR_SIZE; b++) {
-        mw_chain *blk = atomic_load(&st->dir[b]);
-        if (!blk) continue;
-        for (uint32_t i = 0; i < MW_CHAIN_BLOCK; i++) {
-            for (int j = 0; j < blk[i].n; j++) {
-                mw_pv *p = &blk[i].v[j];
-                if (p->data || !p->lazy) continue;
-                uint8_t *copy = base ? malloc((size_t)st->pgsz) : NULL;
-                if (copy) { memcpy(copy, base + (p->lazy - 1), (size_t)st->pgsz); p->data = copy; atomic_fetch_add(&st->bytes, (uint64_t)st->pgsz); }
-                else { p->data = calloc(1, (size_t)st->pgsz); if (getenv("MW_DEBUG")) fprintf(stderr, "materialize: out of memory or no mapping\n"); }       // (cannot happen: a zero page is wrong, but a crash is worse; the database is marked failed by the caller on NOMEM)
-                p->lazy = 0;
-            }
-        }
-    }
-    atomic_store(&st->lazy_n, 0);
-    for (int i = MW_STRIPES - 1; i >= 0; i--) pthread_mutex_unlock(&st->stripes[i].mu);
-    if (getenv("MW_DEBUG")) fprintf(stderr, "materialize: %llu lazy versions in %.2f ms\n", (unsigned long long)nmat, (double)(now_ns() - tmat0) / 1e6);
 }
 
 // The epoch a page is validated against: the snapshot, or our own latest commit for a page this snapshot already committed.
@@ -669,7 +639,7 @@ bool mw_store_head_image (mw_store *st, uint32_t pgno, uint8_t *dst, uint64_t *e
     bool found = false;
     pthread_mutex_t *mu = stripe_of(st, pgno);
     mw_spinlock(mu);
-    if (c->n > 0) { if (!c->v[c->n - 1].data) c->lazy_hot = 1; memcpy(dst, mw_pv_data(st, &c->v[c->n - 1]), (size_t)st->pgsz); *epoch = c->v[c->n - 1].epoch; found = true; }
+    if (c->n > 0) { memcpy(dst, c->v[c->n - 1].data, (size_t)st->pgsz); *epoch = c->v[c->n - 1].epoch; found = true; }
     pthread_mutex_unlock(mu);
     return found;
 }
@@ -715,7 +685,7 @@ uint64_t mw_db_gc (mw_db *db) {
         if (c->n > 0 && c->v[c->n - 1].epoch <= oldest && c->v[c->n - 1].epoch <= compacted) drop = c->n;
         for (int j = 0; j < drop; j++) {
             if (c->v[j].epoch == 0) atomic_fetch_sub(&st->base_bytes, (uint64_t)st->pgsz);
-            if (c->v[j].data) { free(c->v[j].data); atomic_fetch_sub(&st->bytes, (uint64_t)st->pgsz); } else atomic_fetch_sub(&st->lazy_n, 1);
+            if (c->v[j].data) { free(c->v[j].data); atomic_fetch_sub(&st->bytes, (uint64_t)st->pgsz); }
             atomic_fetch_sub(&st->versions, 1);
             atomic_fetch_add(&st->versions_reclaimed, 1);
             reclaimed++;

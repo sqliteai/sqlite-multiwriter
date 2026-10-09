@@ -36,9 +36,16 @@ Open a database through the VFS with `file:db?vfs=multiwriter` (threads of one p
   - **merge of interior pages** (`multiwriter_btree.c`): both commits rewrote an interior table page (typically the parent of leaves both split): the page is merged three-way with the newest version;
   - **rebase** (below), if `mw_rebase=1`.
   Otherwise the commit is refused and the lane's transaction ends; hot spots are served by a turn (a connection that lost serialises its next few transactions).
-- **What is guaranteed.** Snapshot isolation with first-committer-wins at the level of pages, plus the validation of the pages read: no lost update, no write over a row that was deleted meanwhile, no UNIQUE value held by two rows,
-  a read-only transaction sees one consistent prefix of the commits, a transaction that reads a page that somebody changed does not commit. It is **not serializable**: write skew between rows that live on different pages
-  (a transaction reads A and writes B, another reads B and writes A) is allowed, as in any snapshot isolation. `test/mw_serial.c` checks the guarantee (below).
+- **What is guaranteed.** Snapshot isolation with first-committer-wins at the level of pages, plus the validation of the pages read: no lost update, no write over a row that was deleted meanwhile, no UNIQUE value held by two
+  rows, and a read-only transaction sees one consistent prefix of the commits. A transaction that read a page that another commit rewrote after its snapshot is refused (`SQLITE_BUSY_SNAPSHOT`). That is what stops write skew:
+  in the pair "T1 reads A and writes B, T2 reads B and writes A" the second to commit read a page that the first rewrote, also when A and B are on different pages, when the page caches are warm, with the rebase, when a
+  row is read through a list or a range, and when what was read is the absence of a row (the maximum key, an empty table); `test/mw_writeskew.c` runs each of these. The validation is made at commit, under the publication
+  lock, against every commit since the snapshot, and `test/mw_serial.c` checks with random transactions that the reads agree with the serial order of the commits. This is a tested property, not a proof, and it has limits:
+  - `mw_readcheck=0` turns the validation of the reads off: the pair above then commits (write skew), and so does any read that the commit does not check.
+  - The reads of page 1 (the header of the file: its size, the freelist, the schema cookie) are not in the read set; a schema change is caught by the schema cookie, which is compared on its own.
+  - Transactions on several attached databases are not atomic across the files.
+  - The interior pages shortcut below is argued for table b-trees and tested, not proved.
+  So it is stronger than plain snapshot isolation, but it is not documented as serializable in general.
 - **Interior pages of an index.** A transaction that read a page and finds it changed is not refused when the page is an interior page of a table b-tree that still routes the children the transaction went through (`mw_interior_routes_same`). That is not done for the interior pages of an index: their cells are entries (for a WITHOUT ROWID table, whole rows), and what a transaction read from one is not covered by the routes of its children. Found with `mw_serial` on a WITHOUT ROWID table in the processes mode (stale reads accepted, with and without the rebase), and measured: with the shortcut off for index pages the runs are clean. The cost is a retry where an index page near the root was rewritten (a split): about 7-20% of the throughput of the bench workloads that update through an index of a table under contention, none for tables with an integer key.
 - **DDL** takes an exclusive schema barrier (one schema change at a time, writers drain); any transaction that overlaps a schema change fails on the cookie and is run again.
 - **Not supported:** `journal_mode` other than WAL, `locking_mode=EXCLUSIVE`, `auto_vacuum` other than none.
@@ -175,7 +182,7 @@ the relocation prepared before the lock, the rebase (`mw_rebase`: what is replay
   126 in the model, a failing `integrity_check`); ignoring the read conflicts (hundreds of inconsistent reads, duplicate UNIQUE values, a failing `integrity_check`); a repair of a dead publisher that finishes a commit without installing its pages (4-5 epochs
   per run that nobody accounts for) or undoes a complete record (a table of 93 rows against 227); `shidx_gc_repair` turned into a no-op (537 thousand commits refused with `SQLITE_FULL` in the small-index scenario); and, for the rebase,
   a replay that does not check that the row is what the transaction saw (13 thousand reads that differ from the serial order, 244 broken UNIQUE values, in the hot scenario).
-  A bug of the test itself that it found about the rebase: a transaction that reads a row on a page that it writes and does not write the row (a change that changes nothing) is write skew; the rebase allows it (see above), so the generator avoids it.
+  A bug of the test itself that it found about the rebase: a transaction that reads a row on a page that it writes and does not write the row (a change that changes nothing) is write skew; the rebase refuses it now (it compares the changes that SQLite counted with the row changes found in the pages), and the generator still avoids it.
 - **`test/power/`: durability against a loss of power, without a machine to switch off.** The kernel of Docker Desktop has no `dm-flakey`, so the disk is emulated: `nbdsrv.py` serves over NBD a disk whose write cache is volatile
   (a write reaches the image at a FLUSH, with FUA, or by chance at the cut, in blocks of 4 KB written whole or not at all), `nbdcli.c` attaches it to `/dev/nbdN` with the kernel's ioctls, and `run.sh` (image of `test/power/Dockerfile`:
   gcc, e2fsprogs, python3; `docker run --privileged`) runs `mw_serial` in phase `run` on ext4 on that disk (processes or, with `MW_SERIAL_MODE=threads`, six threads of one process: the staged log), stops everything, cuts the power of the disk,
@@ -187,7 +194,7 @@ the relocation prepared before the lock, the rebase (`mw_rebase`: what is replay
 ## Parameters (URI and environment)
 
 URI parameters (read at open): `mw` (0 off, 2 lanes: the engine), `mw_mp` (0 one process, 1 processes: the shared mode), **`mw_rebase`** (1: the rebase), `mw_fullfsync`, `mw_profile` (`small`: the cache of pages of the
-real file at 8 MB, a log of 16 MB before it is compacted), `mw_base_cache_mb`, `mw_log_max_mb`, `mw_gc` (commits between two collections of versions), `mw_hot_credit`, `mw_readcheck` (0: no validation of the pages read), and, for tests and
+real file at 8 MB, a log of 16 MB before it is compacted), `mw_base_cache_mb`, `mw_log_max_mb`, `mw_gc` (commits between two collections of versions), `mw_hot_credit`, `mw_readcheck` (0: no validation of the pages read: fewer retries, write skew becomes possible), and, for tests and
 measurements, `mw_noreloc`, `mw_noroute`, `mw_nomerge`, `mw_norebase` (marks a connection that never rebases: the helper), `mw_rebase_backoff` (0: replay every conflict), `mw_prep_delay_us` (waits between the preparation of a relocation and the publication lock).
 
 Environment: `MW_FULLFSYNC`, `MW_PROFILE`, `MW_SEG_MB` (size of a segment of the shared log), `MW_IDX_ENTRIES`, `MW_SIDECAR_DIR` (where the shared maps go: `/dev/shm` on Linux), `MW_SPIN_US`, `MW_POOL_BATCH`, `MW_ENOSPC_WAIT_MS`;
@@ -202,7 +209,7 @@ the database. Not covered: a hostile local user who owns the directory of the da
 
 Covered and tested: rowid tables with and without INTEGER PRIMARY KEY, values of every type, overflow values, indexes, UNIQUE constraints, DDL (as above), savepoints and rollbacks, `VACUUM` (as DDL), threads and processes, crashes (SIGKILL at any moment and at
 every point of the publication and of the compaction), I/O errors and a full disk, a loss of power (ext4 on an emulated disk). Not covered: `journal_mode` other than WAL, exclusive locking, attached databases (each file is its own database
-object: the transactions that span them are not atomic across the files), virtual tables with the rebase (it refuses), a database of another text encoding with the rebase, serializability (write skew), a reader that never ends (above), a machine
+object: the transactions that span them are not atomic across the files), virtual tables with the rebase (it refuses), a database of another text encoding with the rebase, a proof of serializability (the validation of the reads is tested, not proved; `mw_readcheck=0` allows write skew), a reader that never ends (above), a machine
 that reorders writes around a flush. Platforms: macOS and Linux (arm64 tested); iOS, Windows, Android later.
 
 ## Third party and license

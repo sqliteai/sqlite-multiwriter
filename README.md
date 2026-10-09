@@ -44,7 +44,7 @@ each other. If another commit got there first on the same page, the transaction 
 loser: it takes the row changes of its transaction and applies them again on top of the latest state, then commits. The application sees no error. A transaction that really conflicts (the same row changed by both)
 is still refused. The rebase is limited to simple transactions: `INSERT`s and `UPDATE`/`DELETE`s of a row by its key. See Limits.
 
-Isolation is snapshot isolation, not serializable: write skew is possible (`docs/design.md`). The application must retry a transaction that fails with `SQLITE_BUSY_SNAPSHOT`, the whole transaction.
+Isolation is snapshot isolation plus validation of the pages a transaction read: if another commit rewrote one of them after the snapshot, the commit is refused, which rules out the usual write skew (`docs/design.md`, "What is guaranteed"). It is tested, not proved serializable. The application must retry a transaction that fails with `SQLITE_BUSY_SNAPSHOT`, the whole transaction.
 
 ## Two ways to use it
 
@@ -103,6 +103,7 @@ Options (URI parameters, read when the database is opened):
 | `mw_profile=small` | smaller caches (8 MB of pages, 16 MB of log before compaction), for a phone or a small server |
 | `mw_log_max_mb` | size of the log before it is compacted into the database |
 | `mw_fullfsync=1` | `F_FULLFSYNC` for the log and the compaction on macOS |
+| `mw_readcheck=0` | do not validate the pages a transaction read: fewer retries, but write skew becomes possible |
 
 The complete list is in `docs/design.md`.
 
@@ -240,7 +241,7 @@ What to know before relying on it (details and measurements in `docs/design.md`)
 - `PRAGMA data_version` changes with every transaction (also of the connection itself).
 
 **Isolation and retries**
-- Snapshot isolation with first-committer-wins on pages, plus validation of the pages read. Not serializable in general. The application must retry a transaction that fails with `SQLITE_BUSY_SNAPSHOT` (the whole transaction).
+- Snapshot isolation with first-committer-wins on pages, plus validation of the pages read. Not proved serializable: the reads of page 1 (the header of the file) are not validated, `mw_readcheck=0` turns the validation off (write skew becomes possible), and transactions on attached databases are not atomic across the files. The application must retry a transaction that fails with `SQLITE_BUSY_SNAPSHOT` (the whole transaction).
 - Throughput of one database is bounded by the publication of a commit (about 40 us in the processes mode) and by true conflicts: many writers on the same row serialise, and the rebase does not help them.
 
 **The rebase (`mw_rebase=1`, opt in)** replays a commit that lost only on pages it shares with others, row by row, instead of refusing it. It is never wrong, but it often does not apply, and then the commit is refused and retried as without it:

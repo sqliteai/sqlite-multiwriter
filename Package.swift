@@ -13,8 +13,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "MultiWriterBinary",
-            url: "https://github.com/sqliteai/sqlite-multiwriter/releases/download/0.5.0/multiwriter-apple-xcframework-0.5.0.zip",
-            checksum: "e337363072d1fa6d26861045c689d7b3700e6ea2d0cfcb35e36ae1c86185c548"
+            url: "https://github.com/sqliteai/sqlite-multiwriter/releases/download/0.5.1/multiwriter-apple-xcframework-0.5.1.zip",
+            checksum: "8def1f382241d2c5a5f78c28c5582b3f65607511407ee198f8800ead4adc367c"
         ),
         .target(
             name: "MultiWriter",

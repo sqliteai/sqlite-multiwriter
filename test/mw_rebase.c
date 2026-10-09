@@ -95,6 +95,23 @@ int main (void) {
         sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
     }
 
+    // 2b. a statement with several rows in VALUES is not a point statement (the check says so without looking at its bytecode): the page conflict is refused, as without the rebase, and the retry works.
+    // A single row with "),(" in a string is taken for one too: refused or replayed, never wrong.
+    {
+        mw_tmpdb(path, sizeof path, "rebase2b"); make(path, TBL);
+        sqlite3 *a, *b; CHECK_RC(open_mw(path, &a, 1), SQLITE_OK); CHECK_RC(open_mw(path, &b, 1), SQLITE_OK);
+        int rc = race(a, b, "INSERT INTO t(id, a, b) VALUES (101, 1, 'x'), (102, 2, 'y')", "UPDATE t SET a = 2000 WHERE id = 30");
+        printf("2b. several rows in VALUES against another row of the page: commit rc=%d, rebases %llu\n", rc, (unsigned long long)stats(a).rebases);
+        CHECK(is_conflict(rc)); CHECK(stats(a).rebases == 0);
+        CHECK_RC(mw_exec(a, "INSERT INTO t(id, a, b) VALUES (101, 1, 'x'), (102, 2, 'y')"), SQLITE_OK);
+        CHECK(mw_scalar(a, "SELECT count(*) FROM t WHERE id IN (101, 102)") == 2 && mw_scalar(a, "SELECT a FROM t WHERE id=30") == 2000);
+        int rc2 = race(a, b, "INSERT INTO t(id, a, b) VALUES (103, 3, 'p),(q')", "UPDATE t SET a = 3000 WHERE id = 31");
+        CHECK(rc2 == SQLITE_OK || is_conflict(rc2));
+        if (rc2 != SQLITE_OK) CHECK_RC(mw_exec(a, "INSERT INTO t(id, a, b) VALUES (103, 3, 'p),(q')"), SQLITE_OK);
+        CHECK(mw_scalar(a, "SELECT count(*) FROM t WHERE id = 103") == 1 && mw_scalar(a, "SELECT a FROM t WHERE id=31") == 3000);
+        CHECK(integrity_ok(a)); sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+    }
+
     // 3. a row that was deleted meanwhile, a row that both deleted, an increment of one counter by both (no lost update): refused
     {
         mw_tmpdb(path, sizeof path, "rebase3"); make(path, TBL);

@@ -160,7 +160,23 @@ static bool bytecode_is_point (sqlite3 *db, const char *sql) {
     free(ops);
     return point;
 }
+// An INSERT with several rows in VALUES is compiled with a coroutine, which the bytecode check refuses: say so without parsing the statement again (a bulk insert is a new text every time: the cache of
+// statements never hits, and EXPLAIN of a few KB costs more than the insert). "),(" outside of a string is the mark; one inside a string only makes a point statement look like a refused one.
+static bool multirow_insert (const char *sql) {
+    while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r') sql++;
+    if (sqlite3_strnicmp(sql, "INSERT", 6) != 0 && sqlite3_strnicmp(sql, "REPLACE", 7) != 0) return false;
+    for (const char *p = strchr(sql, ')'); p; p = strchr(p + 1, ')')) {
+        const char *q = p + 1;
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+        if (*q != ',') continue;
+        q++;
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+        if (*q == '(') return true;
+    }
+    return false;
+}
 static bool stmt_is_point (mw_lane *lane, sqlite3_stmt *st, const char *sql) {
+    if (multirow_insert(sql)) return false;
     rd_ent *c = lane->rd_cache;
     if (!c) { c = lane->rd_cache = sqlite3_malloc64(RD_CACHE * sizeof *c); if (!c) return false; memset(c, 0, RD_CACHE * sizeof *c); }
     for (int i = 0; i < RD_CACHE; i++) if (c[i].sql && strcmp(c[i].sql, sql) == 0) return c[i].point;
@@ -177,7 +193,8 @@ static int stmt_kind (const char *sql) {
 }
 static bool has_word (const char *sql, const char *w) {
     size_t n = strlen(w);
-    for (const char *p = sql; *p; p++) if (sqlite3_strnicmp(p, w, (int)n) == 0 && (p == sql || !(isalnum((unsigned char)p[-1]) || p[-1] == '_')) && !(isalnum((unsigned char)p[n]) || p[n] == '_')) return true;
+    const char c0 = (char)(w[0] | 0x20);
+    for (const char *p = sql; *p; p++) if (((*p | 0x20) == c0) && sqlite3_strnicmp(p, w, (int)n) == 0 && (p == sql || !(isalnum((unsigned char)p[-1]) || p[-1] == '_')) && !(isalnum((unsigned char)p[n]) || p[n] == '_')) return true;
     return false;
 }
 static bool stmt_reads (const char *sql) {
@@ -193,7 +210,7 @@ void mw_lane_stmt_note (mw_lane *lane, mw_stmt_note *n) {
         lane->rd_db = sqlite3_db_handle(st);
         if (stmt_reads(sql) || (sql && has_word(sql, "REPLACE"))) lane->rd_dep = true;      // (REPLACE deletes rows that no change counter counts)
         lane->rd_cur = st; lane->rd_cur_kind = stmt_kind(sql);
-        if (lane->rd_cur_kind == RD_DML && !stmt_is_point(lane, st, sql)) lane->rd_dep = true;
+        if (lane->rd_cur_kind == RD_DML && !lane->rd_dep && !stmt_is_point(lane, st, sql)) lane->rd_dep = true;      // (already known to depend: the answer would change nothing)
         return;
     }
     if (lane->rd_cur != st) return;                                              // (also the EXPLAIN of the hook itself)

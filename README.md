@@ -64,7 +64,7 @@ Every release has the extension for each platform ([releases](https://github.com
 allows extensions, then open the database with the VFS:
 
     .load ./multiwriter                              -- the sqlite3 shell (multiwriter.so, .dylib or .dll)
-    SELECT mw_version();                             -- 0.5.1
+    SELECT mw_version();                             -- 0.5.2
 
 From C:
 

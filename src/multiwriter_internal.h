@@ -358,7 +358,6 @@ struct mw_db {
     bool              mp_stale_owner;      // the header said that the publication lock was held by our own pid when we registered: a process that died with it (repaired once the database is open)
     bool              mp_first;            // this process initialised the shared state
     bool              orphaned;            // inherited through fork(): the child must not use (or tear down) the parent's state; it opens its own
-    bool              mp_recheck;          // we stole the publication lock from a dead process: verify the log file is still the one the header describes
     int               mp_lockfd, mp_pubfd, mp_proc;   // mp_lockfd: flock membership + shared header; mp_pubfd: fcntl byte locks only (BSD mixes the two kinds)
     char             *mp_path, *mp_pubpath;
     mw_shm           *shm;
@@ -433,7 +432,6 @@ typedef struct {
     bool            adopt_images;     // the images are individually malloc'ed blocks the store may keep: it frees them if the publication fails
 } mw_validate;
 // Validates against `v` and installs atomically under the store write lock (the only serialization point).
-int       mw_store_install_lazy (mw_store *st, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *offs);   // multi-process catch-up: versions that point into the mapped log
 void      mw_store_materialize_lazy (mw_store *st);       // copy every lazy version out of the mapping (before it is replaced)
 int       mw_store_install_recovered (mw_store *st, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images);
 // `sync`: fsync the log before the commit becomes visible (synchronous=FULL semantics).
@@ -522,7 +520,6 @@ uint64_t  mw_mp_global_oldest (mw_db *db);             // min snapshot over ever
 int64_t   mw_mp_reserve (mw_lane *lane, int64_t at_least);
 int64_t   mw_mp_ceiling (mw_db *db);
 void      mw_mp_snapshot_register (mw_lane *lane);     // publishes lane->tx.snapshot_epoch in the slot (after the epoch was read)
-void      mw_store_drop_dirty_upto (mw_store *st, uint64_t epoch);
 void      mw_mp_ddl_begin (mw_db *db);
 void      mw_mp_ddl_end (mw_db *db);
 bool      mw_mp_ddl_blocked (mw_db *db);               // another live process owns the schema barrier
@@ -536,8 +533,6 @@ void      mw_mp_compaction_unlock (mw_db *db);
 uint64_t  mw_mp_compaction_target (mw_db *db);
 void      mw_mp_reap_dead_slots (mw_db *db);          // frees the registry slots of dead processes (their snapshots no longer hold anything back)
 uint64_t  mw_log_scan_after (mw_db *db, uint64_t epoch, uint64_t end);
-uint64_t  mw_log_header_base (mw_db *db);
-void      mw_store_flush (mw_store *st, uint32_t base_dbsize, uint64_t epoch);
 
 // registry
 mw_db  *mw_db_acquire (const char *path, int mode, bool mp);   // mp: several processes (shared mode)   // NULL on OOM or if the file is already open in another mode

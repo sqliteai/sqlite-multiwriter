@@ -415,13 +415,11 @@ out:
 // the kernel owns the pages), which avoids a write syscall per commit -- profiling showed pwrite was the largest
 // cost of a small commit and serialises on the file inode when many threads commit. The file is grown ahead of
 // the append offset (sparse); records are validated by checksum at recovery, so the unwritten tail is harmless.
-static uint64_t log_usable (mw_db *db, uint64_t st_size) { (void)db; return st_size; }
-
 void mw_log_remap (mw_db *db) {
     db->logsync_off = 0; db->logsync_low1 = 0;
     log_unmap(db, true);
     struct stat sb;
-    db->logfile_size = fstat(db->logfd, &sb) == 0 ? log_usable(db, (uint64_t)sb.st_size) : 0;
+    db->logfile_size = fstat(db->logfd, &sb) == 0 ? (uint64_t)sb.st_size : 0;
 #ifdef _WIN32
     if (!db->mp) { log_mapped(db, MAP_FAILED); return; }     // (no mapping of the log of one process: the file with a mapped view cannot be truncated, which compaction does; it is written with pwritev and read with pread)
 #endif
@@ -1097,12 +1095,5 @@ uint64_t mw_log_scan_after (mw_db *db, uint64_t epoch, uint64_t end) {
         off += REC_HDR_SIZE + (uint64_t)r.npages * (4 + pgsz) + r.ext_len;
     }
     return off;
-}
-
-uint64_t mw_log_header_base (mw_db *db) {
-    log_hdr h;
-    if (!db->logmap) return 0;
-    memcpy(&h, db->logmap, sizeof h);
-    return memcmp(h.magic, LOG_MAGIC, 8) == 0 ? h.base_epoch : 0;
 }
 

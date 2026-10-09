@@ -162,16 +162,13 @@ static bool bytecode_is_point (sqlite3 *db, const char *sql) {
 }
 // An INSERT with several rows in VALUES is compiled with a coroutine, which the bytecode check refuses: say so without parsing the statement again (a bulk insert is a new text every time: the cache of
 // statements never hits, and EXPLAIN of a few KB costs more than the insert). "),(" outside of a string is the mark; one inside a string only makes a point statement look like a refused one.
+static const char *skip_ws (const char *p) { while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++; return p; }
 static bool multirow_insert (const char *sql) {
-    while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r') sql++;
+    sql = skip_ws(sql);
     if (sqlite3_strnicmp(sql, "INSERT", 6) != 0 && sqlite3_strnicmp(sql, "REPLACE", 7) != 0) return false;
     for (const char *p = strchr(sql, ')'); p; p = strchr(p + 1, ')')) {
-        const char *q = p + 1;
-        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
-        if (*q != ',') continue;
-        q++;
-        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
-        if (*q == '(') return true;
+        const char *q = skip_ws(p + 1);
+        if (*q == ',' && *skip_ws(q + 1) == '(') return true;
     }
     return false;
 }
@@ -186,7 +183,7 @@ static bool stmt_is_point (mw_lane *lane, sqlite3_stmt *st, const char *sql) {
     return point;
 }
 static int stmt_kind (const char *sql) {
-    while (sql && (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r')) sql++;
+    if (sql) sql = skip_ws(sql);
     if (!sql) return RD_OTHER;
     if (sqlite3_strnicmp(sql, "INSERT", 6) == 0 || sqlite3_strnicmp(sql, "REPLACE", 7) == 0 || sqlite3_strnicmp(sql, "UPDATE", 6) == 0 || sqlite3_strnicmp(sql, "DELETE", 6) == 0) return RD_DML;
     return RD_OTHER;

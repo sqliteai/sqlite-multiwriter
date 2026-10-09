@@ -30,7 +30,7 @@ mw_db *mw_db_acquire (const char *path, int mode, bool mp) {
     mw_db *db = mw_dbs;
     while (db && (db->orphaned || strcmp(db->path, path) != 0)) db = db->next;
     if (db) {
-        if (db->mode != mode || (mode >= 2 && (db->mp_req != mp))) db = NULL;     // one database, one mode (multi-process is a property of the database)
+        if (db->mode != mode || (mode >= 2 && db->mp_req != mp)) db = NULL;     // one database, one mode (multi-process is a property of the database)
         else db->refs++;
     } else if ((db = sqlite3_malloc(sizeof(*db))) != NULL) {
         memset(db, 0, sizeof(*db));

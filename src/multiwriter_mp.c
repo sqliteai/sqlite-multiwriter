@@ -225,7 +225,7 @@ void mw_mp_lock (mw_db *db) {
             if (s == t) {
                 int32_t exp = 0;
                 if (atomic_compare_exchange_strong_explicit(&sh->pub_owner, &exp, me, memory_order_acquire, memory_order_relaxed)) { return; }
-                if (exp != me && (polls & 31) == 31 && !pid_alive(db, exp) && atomic_compare_exchange_strong(&sh->pub_owner, &exp, me)) { db->mp_recheck = true; if (db->mp_req) mw_shared_repair(db); return; }   // the holder died
+                if (exp != me && (polls & 31) == 31 && !pid_alive(db, exp) && atomic_compare_exchange_strong(&sh->pub_owner, &exp, me)) { if (db->mp_req) mw_shared_repair(db); return; }   // the holder died
             } else if (s > t) {                                                                             // our ticket was skipped (we looked dead for too long): a new one
                 t = atomic_fetch_add(&sh->pub_ticket, 1);
                 atomic_store(&sh->pub_tk_pid[t % 1024], me);
@@ -256,7 +256,7 @@ void mw_mp_lock (mw_db *db) {
         if (atomic_load_explicit(&sh->pub_owner, memory_order_relaxed) == 0 && atomic_compare_exchange_strong_explicit(&sh->pub_owner, &exp, me, memory_order_acquire, memory_order_relaxed)) return;
         if ((spin & 255) == 255) {
             int32_t owner = atomic_load(&sh->pub_owner);
-            if (owner != 0 && owner != me && !pid_alive(db, owner) && atomic_compare_exchange_strong(&sh->pub_owner, &owner, me)) { db->mp_recheck = true; if (db->mp_req) mw_shared_repair(db); }     // steal from a dead process
+            if (owner != 0 && owner != me && !pid_alive(db, owner) && atomic_compare_exchange_strong(&sh->pub_owner, &owner, me)) { if (db->mp_req) mw_shared_repair(db); }     // steal from a dead process
             if (atomic_load(&sh->pub_owner) == me) return;
         }
         if (spin < 400) MP_RELAX();

@@ -45,12 +45,11 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
     uint64_t t0 = now_ns();
     int rc = SQLITE_OK;
 
-    uint64_t visible = atomic_load(&db->epoch);
-    uint64_t oldest = mw_db_oldest_active_snapshot(db);
-    uint64_t T = oldest < visible ? oldest : visible;
+    uint64_t T = mw_db_oldest_active_snapshot(db), visible = atomic_load(&db->epoch);
+    if (visible < T) T = visible;
     uint64_t base = db->base_epoch;
     if (T <= base) goto done;                                      // nothing new to materialise (or pinned by an old reader)
-    if (db->has_log) {                                  // (commits with synchronous < FULL are visible before they are on the disk: the log has them there before their pages go into the file, or a power failure leaves the file ahead of the log)
+    if (db->has_log) {   // (commits with synchronous < FULL are visible before they are on the disk: the log has them there before their pages go into the file, or a power failure leaves the file ahead of the log)
         uint64_t du; pthread_mutex_lock(&db->log_mu); du = db->synced_upto; pthread_mutex_unlock(&db->log_mu);
         if (du < T) { rc = mw_log_sync(db, T, MW_LOG_OFF(db)); if (rc != SQLITE_OK) goto done; }
     }
@@ -109,7 +108,7 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
     if (rc == SQLITE_OK) mw_fault_hit(MW_CRASH_COMPACT_PAGES);
 
     // 2. durable new base
-    if (rc == SQLITE_OK) { rc = mw_log_set_base(db, T); if (rc == SQLITE_OK) { mw_fault_hit(MW_CRASH_COMPACT_BASE); } }
+    if (rc == SQLITE_OK) { rc = mw_log_set_base(db, T); if (rc == SQLITE_OK) mw_fault_hit(MW_CRASH_COMPACT_BASE); }
 
     // 3. settle the dirty list: clean pages drop out, pages with newer versions (or everything, on failure) are re-pushed
     for (uint32_t h = detached; h; ) {

@@ -580,24 +580,6 @@ int mw_db_publish_finish (mw_db *db, mw_lane *lane, int rc, uint64_t my_epoch, i
     return rc;
 }
 
-// Pages whose newest version is <= epoch are already in the real file (another process compacted): forget them.
-void mw_store_drop_dirty_upto (mw_store *st, uint64_t epoch) {
-    mw_spinlock(&st->list_mu);
-    uint32_t head = st->dirty_head;
-    st->dirty_head = 0;
-    pthread_mutex_unlock(&st->list_mu);
-    while (head) {
-        uint32_t pgno = head - 1;
-        mw_chain *c = chain_get(st, pgno, false);
-        pthread_mutex_t *mu = stripe_of(st, pgno);
-        mw_spinlock(mu);
-        head = c->dirty_next;
-        if (c->n > 0 && c->v[c->n - 1].epoch > epoch) { mw_spinlock(&st->list_mu); c->dirty_next = st->dirty_head; st->dirty_head = pgno + 1; pthread_mutex_unlock(&st->list_mu); }
-        else c->dirty = 0;
-        pthread_mutex_unlock(mu);
-    }
-}
-
 // Recovery: install a commit read back from the log (single-threaded, before the database is used).
 int mw_store_install_recovered (mw_store *st, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint8_t *const *images) {
     // (also called at run time by the multi-process catch-up, while readers and GC walk the chains: reserve and install under the stripe lock)
@@ -624,47 +606,6 @@ int mw_store_install_recovered (mw_store *st, uint64_t epoch, uint32_t dbsize, i
     st->sizes[st->nsizes].dbsize = dbsize;
     size_note(st, epoch, dbsize);
     st->sizes[st->nsizes].log_off = 0;                           // (recovery knows the offsets; rewrite needs them only for new commits)
-    st->nsizes++;
-    pthread_mutex_unlock(&st->seq_mu);
-    return SQLITE_OK;
-}
-
-// Multi-process catch-up: the version is not copied, it points at the page image inside the shared log mapping (offs[i] = file offset of image i). Every process used to copy
-// every commit of every other process (N copies of ~7 pages per commit); now a page is copied only if somebody reads it. Must not be used for anything but the mapped log of the
-// current generation: the mapping is replaced under mw_store_materialize_lazy.
-int mw_store_install_lazy (mw_store *st, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *offs) {
-    for (int i = 0; i < n; i++) {
-        mw_chain *c = chain_get(st, pgnos[i], true);
-        if (!c) return SQLITE_NOMEM;
-        pthread_mutex_t *mu = stripe_of(st, pgnos[i]);
-        mw_spinlock(mu);
-        if (chain_reserve(c) != SQLITE_OK) { pthread_mutex_unlock(mu); return SQLITE_NOMEM; }
-        if (c->n >= 1 && !c->queued) { c->queued = 1; LIST_PUSH(st, cand_head, cand_next, pgnos[i], c); }
-        if (!c->dirty) { c->dirty = 1; LIST_PUSH(st, dirty_head, dirty_next, pgnos[i], c); }
-        if (pgnos[i] == 1) { const uint8_t *im = atomic_load(&st->lazy_base) + offs[i]; atomic_store_explicit(&st->p1_cookie, (((uint32_t)im[40] << 24) | ((uint32_t)im[41] << 16) | ((uint32_t)im[42] << 8) | (uint32_t)im[43]), memory_order_relaxed); atomic_store_explicit(&st->p1_head_epoch, epoch, memory_order_release); }
-        c->v[c->n].epoch = epoch;
-        uint8_t *copy = NULL;
-        if (c->lazy_hot) { copy = malloc((size_t)st->pgsz); if (copy) memcpy(copy, atomic_load(&st->lazy_base) + offs[i], (size_t)st->pgsz); }     // (somebody reads this page: copy now, not inside the next publisher's lock)
-        c->v[c->n].data = copy;
-        c->v[c->n].lazy = copy ? 0 : offs[i] + 1;
-        c->n++;
-        atomic_fetch_add(&st->versions, 1);
-        atomic_fetch_add(&st->versions_allocated, 1);
-        if (copy) atomic_fetch_add(&st->bytes, (uint64_t)st->pgsz); else atomic_fetch_add(&st->lazy_n, 1);
-        pthread_mutex_unlock(mu);
-    }
-    mw_spinlock(&st->seq_mu);
-    if (st->nsizes == st->sizes_cap) {
-        int cap = st->sizes_cap ? st->sizes_cap * 2 : 64;
-        mw_sizerec *p = sqlite3_realloc64(st->sizes, (sqlite3_uint64)cap * sizeof(mw_sizerec));
-        if (!p) { pthread_mutex_unlock(&st->seq_mu); return SQLITE_NOMEM; }
-        st->sizes = p;
-        st->sizes_cap = cap;
-    }
-    st->sizes[st->nsizes].epoch = epoch;
-    st->sizes[st->nsizes].dbsize = dbsize;
-    size_note(st, epoch, dbsize);
-    st->sizes[st->nsizes].log_off = 0;
     st->nsizes++;
     pthread_mutex_unlock(&st->seq_mu);
     return SQLITE_OK;
@@ -796,25 +737,3 @@ uint64_t mw_db_gc (mw_db *db) {
     return reclaimed;
 }
 
-// Drops every version and size record (a lagging process resynchronising after the log was rewritten past its
-// position: everything <= `epoch` is in the real file). All stripes are held, so readers see either the old or the new state.
-void mw_store_flush (mw_store *st, uint32_t base_dbsize, uint64_t epoch) {
-    for (int i = 0; i < MW_STRIPES; i++) mw_spinlock(&st->stripes[i].mu);
-    for (uint32_t b = 0; b < MW_DIR_SIZE; b++) {
-        mw_chain *blk = atomic_load(&st->dir[b]);
-        if (!blk) continue;
-        for (uint32_t i = 0; i < MW_CHAIN_BLOCK; i++) {
-            for (int j = 0; j < blk[i].n; j++) free(blk[i].v[j].data);
-            blk[i].n = 0; blk[i].dirty = blk[i].queued = 0; blk[i].dirty_next = blk[i].cand_next = 0;
-        }
-    }
-    atomic_store(&st->lazy_n, 0);
-    mw_spinlock(&st->list_mu); st->dirty_head = st->cand_head = 0; pthread_mutex_unlock(&st->list_mu);
-    mw_spinlock(&st->seq_mu);
-    st->nsizes = 0;
-    st->base_dbsize = base_dbsize;
-    st->compacted_epoch = epoch;
-    pthread_mutex_unlock(&st->seq_mu);
-    atomic_store(&st->versions, 0); atomic_store(&st->bytes, 0); atomic_store(&st->base_bytes, 0);
-    for (int i = MW_STRIPES - 1; i >= 0; i--) pthread_mutex_unlock(&st->stripes[i].mu);
-}

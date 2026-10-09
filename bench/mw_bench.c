@@ -21,7 +21,7 @@
 //   longtx        H    several reads, then one write
 //   groups              each agent its own row, four groups of agents whose rows share a page (four contended pages)
 //   hot           I    4 hot rows of the table ct (true conflicts: UPDATE ct SET a=a+1)
-//   bulk          -    100-row INSERT per transaction on disjoint keys (the Turso 0.8 benchmark shape); --poisson-tps N: open-loop arrivals
+//   bulk          -    100-row INSERT per transaction on disjoint keys; --poisson-tps N: open-loop arrivals
 //   longreader    J    independent writers + one reader pinning an old snapshot
 //   insert-uuid / insert-int / insert-autoinc   K   concurrent INSERT with different key strategies
 #include <pthread.h>
@@ -209,7 +209,7 @@ static int do_txn (agent_t *a) {
 static double exp_draw (uint64_t *rng, double mean_ns) { double u = ((double)(xs(rng) >> 11) + 1.0) / 9007199254740993.0; return -mean_ns * log(u); }
 
 // Open loop (--poisson-tps): every agent has Poisson arrivals at tps/agents; a transaction's latency runs from its scheduled arrival to its commit,
-// so queueing behind a lock or a slow commit is part of the number (as in the Turso 0.8 latency benchmark).
+// so queueing behind a lock or a slow commit is part of the number.
 #ifdef __APPLE__
 // macOS coalesces the timers of idle threads: a thread that sleeps until its next scheduled arrival wakes up 2 ms late at the median and 10 ms late at p99, which would be
 // reported as transaction latency. A real-time (time-constraint) policy removes the slack (p99 35 us in an isolated test). Used only for the open-loop latency test.

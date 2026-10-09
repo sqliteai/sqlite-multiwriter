@@ -8,7 +8,7 @@
 //    header (64 B): LOG_MAGIC, version, page size, base_epoch, salt, cksum
 //    record (40 B header + npages * (4 + pgsz) + ext_len): magic, npages, epoch, dbsize, pgsz, ext_len, cksum
 //
-//  Durability ordering (documented in docs/multiwriter.md):
+//  Durability ordering (documented in docs/design.md):
 //    1. the commit is validated and installed in the store *invisibly* (epoch not advanced) under the
 //       store write lock, which also reserves the record's log offset (epoch order == offset order);
 //    2. outside any lock the record is written; with synchronous>=FULL it is fsynced (group commit);

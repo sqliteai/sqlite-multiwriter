@@ -7,11 +7,10 @@ the commits that were published meanwhile when it commits, and a commit that los
 when it lost only because of pages that it shares with a commit that changed other rows. Every commit is durable when it is acknowledged (a commit log with group commit and `synchronous=FULL`
 semantics), and the log is compacted into the ordinary database file, which stays a plain SQLite database. No SQLite source is changed, no SQL syntax is added, triggers and hooks are not used.
 
-The project does not synchronise databases and keeps no metadata of its own about rows. (An earlier version captured the CRDT state of sqlite-sync for every table: `history-crdt-design.md`. It was removed; to synchronise
-databases use sqlite-sync as an extension of its own.) SQLite 3.53.4 is vendored in `third_party/sqlite`; nothing else is needed to build and test.
+The project does not synchronise databases and keeps no metadata of its own about rows; to synchronise databases use sqlite-sync as an extension of its own. SQLite 3.53.4 is vendored in `third_party/sqlite`; nothing else is needed to build and test.
 
 Open a database through the VFS with `file:db?vfs=multiwriter` (threads of one process; `mw=1` is the default with `vfs=multiwriter`, `mw=0` is stock, `mw=2` is the experimental lane tracking) or `file:db?vfs=multiwriter&mw_mp=1` (processes: the shared mode); add `&mw_rebase=1` for the rebase. The VFS registers itself when SQLite initialises
-(`SQLITE_EXTRA_INIT`). `docs/engine-history.md` and `docs/history-crdt-design.md` are history, with the measurements behind older choices.
+(`SQLITE_EXTRA_INIT`).
 
 ## Layers (`src/`)
 

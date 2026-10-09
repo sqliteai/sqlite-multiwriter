@@ -3,8 +3,8 @@
 **With 16 threads writing one database, 49,277 transactions per second against 8,630 for SQLite (5.7x), and the slowest 1 in 1000 commits takes 2.08 ms instead of 157 ms.**
 **With 16 processes, 25,987 against 8,636 (3.0x), and 1.54 ms against 233 ms.**
 
-SQLite is a remarkable piece of software, and it has one well-known limit: a database accepts a single writer at a time. With many threads, or many processes (a group of agents working on the same
-database, for example), the writers queue up behind one lock, or fail with `SQLITE_BUSY` and have to try again.
+SQLite is the most widely used database in the world, and it has one well-known limit: a database accepts only one writer at a time. With many threads, or many processes (several agents working on the
+same database, for example), the writers queue up behind one lock, or fail with `SQLITE_BUSY` and have to try again.
 
 sqlite-multiwriter removes that limit without touching SQLite. It is a VFS that you load as an extension (or link in): your SQLite, your SQL and your database file stay the same, and many connections
 write the same database at once. Every commit is durable, and the file remains an ordinary SQLite database.
@@ -29,6 +29,12 @@ write the same database at once. Every commit is durable, and the file remains a
 One writer is not slower than SQLite (15,959 against 13,746 tx/s). When writers change the same rows they really conflict: the gain is smaller and the retries stay.
 
 ## How it works
+
+Each writer has its own WAL. Its transactions run there on a snapshot of the database, and at commit they are checked, ordered and published; the log is merged into the database file in the background:
+
+    writer 1 --> private WAL --+
+    writer 2 --> private WAL --+--> check and publish --> commit log --> database file
+    writer 3 --> private WAL --+    (first committer wins)               (compaction)
 
 Each transaction runs on a snapshot of the database. At commit, its pages are checked against the commits published in the meantime. If nobody changed what it wrote or read, it commits: writers do not wait for
 each other. If another commit got there first on the same page, the transaction is refused with `SQLITE_BUSY_SNAPSHOT` and the application runs it again (first committer wins). Commits go through a log with group commit
@@ -56,7 +62,7 @@ Every release has the extension for each platform ([releases](https://github.com
 allows extensions, then open the database with the VFS:
 
     .load ./multiwriter                              -- the sqlite3 shell (multiwriter.so, .dylib or .dll)
-    SELECT mw_version();                             -- 0.5.0
+    SELECT mw_version();                             -- 0.5.1
 
 From C:
 
@@ -145,9 +151,9 @@ run a transaction again after `SQLITE_BUSY`; the engine refuses a commit that co
 SQLite's median can be lower with many writers: a writer that finds the database busy fails at once and the application retries, and the cost shows in the 99.9th percentile. When writers fight over the
 same rows the gain is about 2x and the rebase does not help.
 
-## Multi-process (agents on one database)
+## Multi-process
 
-Every process opens the same file with `mw_mp=1`; the code is the one above with a different URI:
+Use it when several agents write to the same database. Every process opens the same file with `mw_mp=1`; the code is the one above with a different URI:
 
     #define URI "file:agents.db?vfs=multiwriter&mw_mp=1&mw_rebase=1"
 
@@ -219,8 +225,7 @@ Build one yourself: `make extension [PLATFORM=macos|ios|ios-sim|mac-catalyst|and
     make bench          # dist/mw_bench;  bench/compare_sqlite.py: against stock SQLite
     test/sanitize.sh asan|ubsan|tsan [tests]
 
-SQLite 3.53.4 is vendored in `third_party/sqlite`; nothing else is needed. Design, guarantees and limits: `docs/design.md`. The files `docs/history-crdt-design.md` and `docs/engine-history.md`
-are history of earlier versions. This project does not synchronise databases; for that see [sqlite-sync](https://github.com/sqliteai/sqlite-sync).
+SQLite 3.53.4 is vendored in `third_party/sqlite`; nothing else is needed. Design, guarantees and limits: `docs/design.md`. This project does not synchronise databases; for that see [sqlite-sync](https://github.com/sqliteai/sqlite-sync).
 
 ## Limits
 
@@ -228,7 +233,7 @@ What to know before relying on it (details and measurements in `docs/design.md`)
 
 **Database and platform**
 - WAL only: `journal_mode` other than WAL, `locking_mode=EXCLUSIVE` and `auto_vacuum` other than none are not supported. `PRAGMA page_size` on a new database is ignored. Not on a network file system.
-- The database file is only usable through the engine while it is open (the log `<db>-mw` and its segments hold commits that are not yet in the file); `<db>-mw*` files are part of the database. They are versioned (`docs/format.md`): another version of the format is refused, never read wrongly.
+- The database file is only usable through the engine while it is open (the log `<db>-mw` and its segments hold commits that are not yet in the file); `<db>-mw*` files are part of the database. They are versioned: another version of the format is refused, never read wrongly.
 - A VFS stacked above this one must forward the shared-memory methods (`xShm*`); one that keeps its own shared memory makes the commit fail with `SQLITE_IOERR`.
 - `PRAGMA data_version` changes with every transaction (also of the connection itself).
 

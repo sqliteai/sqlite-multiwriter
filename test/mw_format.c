@@ -1,4 +1,4 @@
-// The format of the files that outlive a process (the log "<db>-mw", the segments "<db>-mw.N") is versioned (docs/format.md): a file of another version, one that uses a feature that this library
+// The format of the files that outlive a process (the log "<db>-mw", the segments "<db>-mw.N") is versioned: a file of another version, one that uses a feature that this library
 // does not know, and one with the magic of another format are refused when the database is opened, with a message, and are left exactly as they were (the commits that they hold are not dropped as
 // damaged and not replaced by a new log). The same file with its own header opens and holds every commit. A process that runs another version of the engine and has the database open is refused too.
 #include <fcntl.h>

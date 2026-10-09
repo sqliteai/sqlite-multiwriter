@@ -388,7 +388,7 @@ sqlite3_vfs *mw_root_vfs (void);
 mw_db      *mw_db_find_by_wal (const char *wal_name);
 // The format of the files of the engine that outlive a process (the log "<db>-mw" and the segments "<db>-mw.N": they hold commits that are not in the database file yet). A change of their layout
 // that a reader of the old one would misread raises MW_FORMAT_VERSION; a change that an old reader can ignore does not exist: every addition is an incompatible feature, a bit of `features`
-// in the header, that this library refuses when it does not know it. A file of another format is never read, never replaced and never dropped as damaged: the open fails (docs/format.md).
+// in the header, that this library refuses when it does not know it. A file of another format is never read, never replaced and never dropped as damaged: the open fails.
 #define MW_FORMAT_VERSION  1u
 #define MW_FORMAT_FEATURES 0ull           // the bits of `features` that this library knows
 int mw_format_check (const char *what, const char *path, const char magic[8], const char *expected, uint32_t version, uint64_t features);

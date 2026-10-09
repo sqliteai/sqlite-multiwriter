@@ -6,10 +6,24 @@ database, for example), the writers queue up behind one lock, or fail with `SQLI
 sqlite-multiwriter removes that limit without touching SQLite. It is a VFS that you load as an extension (or link in): your SQLite, your SQL and your database file stay the same, and many connections
 write the same database at once. Every commit is durable, and the file remains an ordinary SQLite database.
 
-- **More writes per second.** Writers that touch different rows (or different pages) do not wait for each other. In the tables below: 2 to 5 times the transactions per second of stock SQLite with 4 to 16 writers.
-- **Almost no `SQLITE_BUSY`.** With writers on their own rows, the application sees a retry in 0.2 of 100 transactions, where stock SQLite needs 2 retries per transaction at 16 writers.
+- **More writes per second.** Writers that touch different rows (or different pages) do not wait for each other.
+- **Almost no `SQLITE_BUSY`.** With writers on their own rows the application retries about 2 in 1000 transactions.
 - **Threads or processes.** One process with many connections, or many processes on one file.
 - **Nothing to change in the schema or in the SQL.** No triggers, no new syntax, no special tables.
+
+## In numbers
+
+16 writers on one database, `synchronous=FULL` (every commit is on disk when it returns), against stock SQLite in WAL mode. Same machine and settings as the tables below.
+
+| 16 writers | SQLite tx/s | multiwriter tx/s | Gain | Retries per 100 tx, SQLite → multiwriter |
+|---|---:|---:|---:|---:|
+| Threads, each inserting its own rows | 8,539 | 46,449 | 5.4x | 197 → 0.2 |
+| Threads, own rows on shared pages (with rebase) | 10,376 | 51,061 | 4.9x | 32 → 0 |
+| Processes, each inserting its own rows | 8,419 | 24,257 | 2.9x | 180 → 0.2 |
+| Processes, own rows on shared pages (with rebase) | 12,722 | 47,184 | 3.7x | 28 → 0 |
+| Threads, all on the same 4 rows | 14,684 | 26,849 | 1.8x | 24 → 21 |
+
+One writer is not slower than SQLite (14,877 against 13,099 tx/s). When writers change the same rows they really conflict: the gain is smaller and the retries stay.
 
 ## How it works
 

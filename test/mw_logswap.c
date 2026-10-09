@@ -13,7 +13,7 @@ int main (void) {
     char *doc = malloc(10000 * 5 + 1); size_t n = 0;
     for (int i = 0; i < 10000; i++) n += (size_t)sprintf(doc + n, "%c%c%c ", 'a' + i % 10, 'a' + i / 10 % 10, 'a' + i / 100 % 10);
     for (int r = 0; r < rounds; r++) {
-        char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_compact_ms=1", path);
+        char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=1&mw_compact_ms=1", path);
         sqlite3 *db; CHECK_RC(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL), SQLITE_OK);
         sqlite3_extended_result_codes(db, 1);
         CHECK_RC(mw_exec(db, "DROP TABLE IF EXISTS t2; CREATE VIRTUAL TABLE t2 USING fts4; INSERT INTO t2(t2) VALUES('automerge=1')"), SQLITE_OK);
@@ -30,7 +30,7 @@ int main (void) {
     free(doc);
     // and commits of several MB, each asks for room in the log
     {
-        char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_compact_ms=1", path);
+        char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=1&mw_compact_ms=1", path);
         sqlite3 *db; CHECK_RC(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL), SQLITE_OK);
         CHECK_RC(mw_exec(db, "CREATE TABLE IF NOT EXISTS big(id INTEGER PRIMARY KEY, b BLOB)"), SQLITE_OK);
         for (int i = 0; i < 300; i++) {

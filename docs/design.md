@@ -10,7 +10,7 @@ semantics), and the log is compacted into the ordinary database file, which stay
 The project does not synchronise databases and keeps no metadata of its own about rows. (An earlier version captured the CRDT state of sqlite-sync for every table: `history-crdt-design.md`. It was removed; to synchronise
 databases use sqlite-sync as an extension of its own.) SQLite 3.53.4 is vendored in `third_party/sqlite`; nothing else is needed to build and test.
 
-Open a database through the VFS with `file:db?mw=2` (threads of one process) or `file:db?mw=2&mw_mp=1` (processes: the shared mode); add `&mw_rebase=1` for the rebase. The VFS registers itself when SQLite initialises
+Open a database through the VFS with `file:db?vfs=multiwriter` (threads of one process; `mw=1` is the default with `vfs=multiwriter`, `mw=0` is stock, `mw=2` is the experimental lane tracking) or `file:db?vfs=multiwriter&mw_mp=1` (processes: the shared mode); add `&mw_rebase=1` for the rebase. The VFS registers itself when SQLite initialises
 (`SQLITE_EXTRA_INIT`). `docs/engine-history.md` and `docs/history-crdt-design.md` are history, with the measurements behind older choices.
 
 ## Layers (`src/`)

@@ -25,13 +25,13 @@ Isolation is snapshot isolation, not serializable: write skew is possible (`docs
 
 ## Two ways to use it
 
-| | Threads (`mw=2`) | Processes (`mw=2&mw_mp=1`) |
+| | Threads | Processes (`mw_mp=1`) |
 |---|---|---|
 | Who writes | many connections in one process | many processes (agents, workers, a CLI and a server) on the same file |
 | Shared state | memory of the process | shared memory and a log in segments next to the database |
 | Platforms | all | all (little use in an iOS app: one process) |
 
-Add `mw_rebase=1` to either.
+Add `mw_rebase=1` to either. `vfs=multiwriter` is all it takes to turn the engine on (the SQLite connection has to be opened with `SQLITE_OPEN_URI`).
 
 ## Install
 
@@ -53,7 +53,7 @@ library, run `make`: the VFS then registers itself when SQLite starts and the UR
 
 Open every connection with the same URI and retry on `SQLITE_BUSY_SNAPSHOT`:
 
-    #define URI "file:app.db?vfs=multiwriter&mw=2&mw_rebase=1"
+    #define URI "file:app.db?vfs=multiwriter&mw_rebase=1"
 
     /* load the extension once (see Install), then in each thread: */
     sqlite3 *db;
@@ -73,7 +73,7 @@ Options (URI parameters, read when the database is opened):
 
 | Parameter | Meaning |
 |---|---|
-| `mw=2` | use the engine (0: off) |
+| `mw` | `1`: the engine, and the default when the URI has `vfs=multiwriter`; `0`: off for that database |
 | `mw_rebase=1` | replay a commit that lost only on shared pages instead of refusing it |
 | `mw_profile=small` | smaller caches (8 MB of pages, 16 MB of log before compaction), for a phone or a small server |
 | `mw_log_max_mb` | size of the log before it is compacted into the database |
@@ -121,7 +121,7 @@ When writers fight over the same rows, the gain is about 2x and the retries are 
 
 Every process opens the same file with `mw_mp=1`; the code is the one above with a different URI:
 
-    #define URI "file:agents.db?vfs=multiwriter&mw=2&mw_mp=1&mw_rebase=1"
+    #define URI "file:agents.db?vfs=multiwriter&mw_mp=1&mw_rebase=1"
 
 The processes share one index of page versions and a log (`agents.db-mw*` files next to the database). A process that is killed does not block the others: its unfinished transaction is discarded and its
 committed ones are kept. The last process to close leaves a plain SQLite file. Databases must be on a local file system.

@@ -1,8 +1,8 @@
 # SQLite's own test suite through the engine (2026-10-07, run again after the fixes below)
 
-How: `test/tcl/README.md`. SQLite 3.53.4 source tree, `testfixture` built with the engine linked in, every database opened with `mw=2` (`MW_DEFAULT_MODE=2`), the 1190 `test/*.test` files run one by one (60 s each), compared with the stock `testfixture` on the same files.
+How: `test/tcl/README.md`. SQLite 3.53.4 source tree, `testfixture` built with the engine linked in, every database opened with `mw=1` (`MW_DEFAULT_MODE=1`), the 1190 `test/*.test` files run one by one (60 s each), compared with the stock `testfixture` on the same files.
 
-| | stock | engine (`mw=2`), first run | engine, after the fixes |
+| | stock | engine (`mw=1`), first run | engine, after the fixes |
 |---|---|---|---|
 | files with no error | 1151 | 872 | 886 |
 | files with errors | 7 | 206 | 193 |
@@ -40,7 +40,7 @@ By design (about 140 files):
 - Tests that look at the files: `-journal`/`-wal`/`-shm` that must exist (`trans`, `misc1`, `wal*`, `walcksum`, `walro*`, `walsetlk`...), the size of the file after a `VACUUM` or a delete (`vacuum`, `vacuum5`, `interrupt`, `sync`), the open files (`stmt`, `tempdb`), a copy of `test.db` made by the test with the commits not in it yet (`cacheflush`: the commits are in the log), `hexio_write` into the file (`alter2/3`, `corrupt*`, `rdonly`, `incrblob3`).
 - Locks that do not block (`attach`, `lock*`, `busy`, `capi2`, `capi3b/c`, `tclsqlite`, `thread1`, `shared9`, `tkt2409`, `tkt2854`, `tkt-f3e5abed55`): the tests expect `SQLITE_BUSY` for a second writer, a reader while a writer holds `RESERVED`, or a read lock that stops a writer.
 - Page size and file format set by `PRAGMA` on a new database (`pagesize`, `format4`, `descidx*`, `tkt1512`...).
-- `memdb1`: the image of an `mw=2` database is in WAL mode (stock has the same limit for a WAL database): `deserialize` into a memory database does not open it.
+- `memdb1`: the image of an `mw=1` database is in WAL mode (stock has the same limit for a WAL database): `deserialize` into a memory database does not open it.
 - Large transactions: `zeroblob`, `incrblob2` (memory high-water of a 1-10 MB `zeroblob`): the write set of a transaction is in memory in the private WAL (and a copy while it is published), where stock streams it to the journal. A transaction of N MB of pages uses 2-3 N MB of memory.
 - Crash and fault simulation (`crash*`, `*fault*`, `walcrash*`, `diskfull`, `writecrash`, `ioerr*`): the test VFS (`crash`, `devsym`, `tvfs`) intercepts the calls to the files and the engine does others (it writes its own log); `sqlite_diskfull_pending` and the like act inside the unix VFS.
 - Out-of-memory tests that expect an error and get a success (`mallocA/E/F/G/I/J`, `malloc6/8`, `mallocB/H`, `vtab_err`, `wherefault`, `tableapi`...): the test build of SQLite makes every `sqlite3_file_control` and every VFS call ask for a little memory (`DO_OS_MALLOC_TEST`), and the engine's hook that follows the schema changes (the statement hook) calls `sqlite3_file_control`, whose result it does not use: the injected failure is absorbed. Not present in a normal build. (It moves with the number of allocations before it: a change in the hook made seven of these files pass or fail.)
@@ -50,7 +50,7 @@ Understood in the second pass (they were the 20 that were not):
 - `shared6-2.3`: a second connection opens the same file with another VFS (`unix-none`), that bypasses the engine, and reads the main file, where the commits are not (they are in the log).
 - `pragma3`: `PRAGMA data_version` changes at every transaction (SQLite adds one when its page cache is reset, and the engine resets it, to know the pages a transaction reads: a read-only connection that keeps its cache, see above, does not have it). An application that polls it to know whether someone else wrote sees a change at each poll: it refreshes more than needed, it does not miss a change.
 - `superlock`, `savepoint-3.*`: lock semantics and the state of the file lock (`unlocked`/`reserved`) that the tests ask the unix VFS for.
-- `memdb1`: the serialisation of an `mw=2` database is a WAL-mode image (the same limit as stock for a WAL database) and `deserialize` does not open it.
+- `memdb1`: the serialisation of an `mw=1` database is a WAL-mode image (the same limit as stock for a WAL database) and `deserialize` does not open it.
 - `wal4-2`: "the database file must stay empty" after a `SELECT` on an empty file: the engine writes the header of the WAL mode when it opens an empty file.
 - `swarmvtab*`, `swarmvtabfault`, `upsertfault`, `enc`: they pass now (the temporary-table barrier, and the other fixes above).
 - `fts4merge3`, `backcompat`: they run the test fixtures found next to the binary, and the build directory had an old copy of the engine's fixture; with it removed they pass.

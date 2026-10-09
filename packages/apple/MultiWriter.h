@@ -4,7 +4,7 @@
 //  The framework holds the extension; it is loaded into a SQLite that allows extensions:
 //      sqlite3_enable_load_extension(db, 1);
 //      sqlite3_load_extension(db, "<path to the framework's binary>", "sqlite3_multiwriter_init", &err);
-//  then a database is opened with the VFS:  file:app.db?vfs=multiwriter&mw=2   (see the README).
+//  then a database is opened with the VFS:  file:app.db?vfs=multiwriter&mw=1   (see the README).
 #ifndef MULTIWRITER_H
 #define MULTIWRITER_H
 

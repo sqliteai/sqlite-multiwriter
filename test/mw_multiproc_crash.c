@@ -10,7 +10,7 @@
 
 static int open_mp (const char *path, sqlite3 **db) {
     char uri[400];
-    snprintf(uri, sizeof uri, "file:%s?mw=2&mw_mp=1&mw_gc=32&mw_compact_ms=5", path);
+    snprintf(uri, sizeof uri, "file:%s?mw=1&mw_mp=1&mw_gc=32&mw_compact_ms=5", path);
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;

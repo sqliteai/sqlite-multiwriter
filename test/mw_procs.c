@@ -21,7 +21,7 @@ enum { KIDS = 4, ROWS = 400 };
 
 static int child (const char *path, int id, int rows, int rebase) {
     char uri[600]; sqlite3 *db;
-    snprintf(uri, sizeof uri, "file:%s?mw=2&mw_mp=1%s", path, rebase ? "&mw_rebase=1" : "");
+    snprintf(uri, sizeof uri, "file:%s?mw=1&mw_mp=1%s", path, rebase ? "&mw_rebase=1" : "");
     int orc = sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL);
     if (orc != SQLITE_OK) { printf("child %d: open failed: %d %s\n", id, db ? sqlite3_extended_errcode(db) : -1, db ? sqlite3_errmsg(db) : "(no handle)"); return 2; }
     sqlite3_busy_timeout(db, 0);
@@ -100,7 +100,7 @@ int main (int argc, char **argv) {
         CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, w INTEGER, v INTEGER)"), SQLITE_OK);
         sqlite3_close(s);
 
-        proc_t p[KIDS]; sqlite3 *c; char uri[600]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_mp=1", path);
+        proc_t p[KIDS]; sqlite3 *c; char uri[600]; snprintf(uri, sizeof uri, "file:%s?mw=1&mw_mp=1", path);
         if (!getenv("MW_PROCS_PHASE3")) {
         // 1. KIDS processes write at once
         for (int i = 0; i < KIDS; i++) { p[i] = spawn(self, path, i, ROWS, rebase); CHECK(p[i] != 0 && p[i] != (proc_t)-1); }

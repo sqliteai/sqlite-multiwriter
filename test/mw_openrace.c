@@ -6,7 +6,7 @@
 #include "multiwriter.h"
 
 static int open_mp (const char *path, sqlite3 **db) {
-    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_mp=1", path);
+    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=1&mw_mp=1", path);
     return sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
 }
 

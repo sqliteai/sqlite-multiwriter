@@ -5,7 +5,7 @@
 
 static int open_lane (const char *path, sqlite3 **db) {
     char uri[300];
-    snprintf(uri, sizeof uri, "file:%s?mw=2", path);
+    snprintf(uri, sizeof uri, "file:%s?mw=1", path);
     return sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
 }
 static void copy_file (const char *a, const char *b) {

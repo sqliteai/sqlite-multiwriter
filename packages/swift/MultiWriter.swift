@@ -7,7 +7,7 @@ import Foundation
 ///
 ///     sqlite3_enable_load_extension(db, 1)
 ///     sqlite3_load_extension(db, MultiWriter.extensionPath!, MultiWriter.entryPoint, nil)
-///     // then open the databases with the VFS:  file:app.db?vfs=multiwriter&mw=2
+///     // then open the databases with the VFS:  file:app.db?vfs=multiwriter&mw=1
 public enum MultiWriter {
     /// The name of the function that SQLite calls when the extension is loaded.
     public static let entryPoint = "sqlite3_multiwriter_init"

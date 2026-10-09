@@ -12,7 +12,7 @@ static unsigned rnd (unsigned *s) { *s = *s * 1103515245u + 12345u; return *s >>
 
 static void *work (void *arg) {
     worker_t *w = arg; sqlite3 *db; char uri[300];
-    snprintf(uri, sizeof uri, "file:%s?mw=2&mw_rebase=1&mw_rebase_backoff=0%s", g_path, getenv("MW_TEST_MP") ? "&mw_mp=1" : "");
+    snprintf(uri, sizeof uri, "file:%s?mw=1&mw_rebase=1&mw_rebase_backoff=0%s", g_path, getenv("MW_TEST_MP") ? "&mw_mp=1" : "");
     if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { mw_failures++; return NULL; }
     sqlite3_busy_timeout(db, 0);
     for (int r = 0; r < ROUNDS; r++) {

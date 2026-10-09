@@ -5,7 +5,7 @@
 
 static int open_lane (const char *path, sqlite3 **db, const char *extra) {
     char uri[300];
-    snprintf(uri, sizeof uri, "file:%s?mw=2%s", path, extra);
+    snprintf(uri, sizeof uri, "file:%s?mw=1%s", path, extra);
     return sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
 }
 static mw_tx_info txinfo (sqlite3 *db) { mw_tx_info i; memset(&i, 0, sizeof i); sqlite3_file_control(db, "main", MW_FCNTL_TXINFO, &i); return i; }

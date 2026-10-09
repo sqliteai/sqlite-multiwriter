@@ -92,7 +92,7 @@ static char *text_ (sqlite3 *db, const char *sql) {
 static int open_agent (agent_t *a) {
     int rc;
     if (cfg.mode == M_MW) {
-        char uri[600]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=64&mw_mp=%d%s%s", cfg.path, cfg.mp, cfg.rebase ? "&mw_rebase=1" : "", getenv("MW_BENCH_URI_EXTRA") ? getenv("MW_BENCH_URI_EXTRA") : "");
+        char uri[600]; snprintf(uri, sizeof uri, "file:%s?mw=1&mw_gc=64&mw_mp=%d%s%s", cfg.path, cfg.mp, cfg.rebase ? "&mw_rebase=1" : "", getenv("MW_BENCH_URI_EXTRA") ? getenv("MW_BENCH_URI_EXTRA") : "");
         rc = sqlite3_open_v2(uri, &a->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX, NULL);
     } else {
         rc = sqlite3_open_v2(cfg.path, &a->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX, "unix");   // no wrapper in the baselines

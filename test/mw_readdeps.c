@@ -9,7 +9,7 @@
 static int close_cs (sqlite3 *db) { return sqlite3_close(db); }
 static int open_lane (const char *path, sqlite3 **db, int readcheck) {
     char uri[300];
-    snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=0&mw_readcheck=%d", path, readcheck);
+    snprintf(uri, sizeof uri, "file:%s?mw=1&mw_gc=0&mw_readcheck=%d", path, readcheck);
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) sqlite3_extended_result_codes(*db, 1);
     return rc;

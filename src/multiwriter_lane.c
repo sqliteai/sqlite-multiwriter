@@ -2,7 +2,7 @@
 //  multiwriter_lane.c
 //  sqlite-multiwriter
 //
-//  Private write lanes. In private-lane mode ("mw=2") each connection gets:
+//  Private write lanes. In private-lane mode ("mw=1") each connection gets:
 //    - its own in-memory "-wal" (no real file): SQLite believes it is the only writer, so
 //      there is no WAL write-lock contention between connections;
 //    - its own private wal-index (xShmMap memory) and no-op shm locks;

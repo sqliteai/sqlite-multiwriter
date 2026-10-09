@@ -1,6 +1,6 @@
 # Windows
 
-The whole engine runs on Windows (MinGW-w64, `make extension PLATFORM=windows` in MSYS2): the threads of one process (`mw=2`) and the processes mode (`mw_mp=1`, the shared mode: one version index and segmented log shared by all the processes).
+The whole engine runs on Windows (MinGW-w64, `make extension PLATFORM=windows` in MSYS2): the threads of one process (`mw=1`) and the processes mode (`mw_mp=1`, the shared mode: one version index and segmented log shared by all the processes).
 There is only one processes mode, on every platform (the private-store mode that mapped a single log file was removed in 0.5.0).
 
 ## What the Windows build does
@@ -15,7 +15,7 @@ There is only one processes mode, on every platform (the private-store mode that
   `fcntl` byte-range locks (the publication lock and the liveness bytes of the processes: Windows drops them when the process ends, at once even for `TerminateProcess`), `mmap` of files and of memory, `msync` and
   `sysconf` are there too.
 - `nanosleep` and `usleep` use a high resolution waitable timer: `Sleep` rounds to the 15.6 ms tick of the system and the engine waits 50 microseconds at a time in its back-off.
-- The log of a process alone (mw=2, no mw_mp) is not mapped: a mapped file cannot be truncated, which the compaction does. It is written with `pwritev` and read with `pread`, as on the other systems when it is staged.
+- The log of a process alone (mw=1, no mw_mp) is not mapped: a mapped file cannot be truncated, which the compaction does. It is written with `pwritev` and read with `pread`, as on the other systems when it is staged.
 - The path of a database is the full path of SQLite, with backslashes; the engine finds the directory of its segments with the last of `/` or `\` (a bug that only the crash recovery shows: after all the processes were killed the
   first one to open the database found no segment and began an empty log).
 

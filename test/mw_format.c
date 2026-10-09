@@ -27,7 +27,7 @@ static int write_hdr (const char *file, hdr_t *h, int fix_cksum) {
 static long file_hash (const char *file) { FILE *f = fopen(file, "rb"); if (!f) return -1; unsigned long h = 5381; int c; while ((c = fgetc(f)) != EOF) h = h * 33 + (unsigned)c; fclose(f); return (long)h; }
 
 static int open_db (const char *path, int mp, sqlite3 **db) {
-    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2%s", path, mp ? "&mw_mp=1" : "");
+    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=1%s", path, mp ? "&mw_mp=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); }
     return rc;

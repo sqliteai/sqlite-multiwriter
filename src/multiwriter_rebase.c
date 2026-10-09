@@ -54,7 +54,7 @@ static char *uri_for (const char *path, bool mp) {
         else *o++ = path[i];
     }
     *o = 0;
-    char *uri = sqlite3_mprintf("file:%s?mw=2&mw_norebase=1&mw_mp=%d", esc, mp ? 1 : 0);
+    char *uri = sqlite3_mprintf("file:%s?mw=1&mw_norebase=1&mw_mp=%d", esc, mp ? 1 : 0);
     sqlite3_free(esc);
     return uri;
 }

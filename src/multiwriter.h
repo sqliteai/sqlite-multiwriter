@@ -47,8 +47,9 @@ int mw_vfs_register (int make_default);
 // Unregisters the VFS (only valid when no connection is open on it).
 int mw_vfs_unregister (void);
 
-// Enables lane tracking for every database opened through the VFS (default 0). A single
-// database can be opted in/out with the URI parameter mw=1 / mw=0.
+// The mw= mode of every database opened through the VFS that does not say it in its URI (default 0:
+// stock; 1: the engine; 2: experimental lane tracking). A URI with vfs=multiwriter means mw=1.
+// A single database can choose with the URI parameter mw=0 / mw=1 / mw=2.
 void mw_vfs_set_enabled_default (int enabled);
 
 // Transaction identity of the connection's current (or last) transaction.

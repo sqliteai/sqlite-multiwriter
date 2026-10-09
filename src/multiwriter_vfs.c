@@ -196,10 +196,16 @@ static const sqlite3_io_methods *mw_pass_methods (sqlite3_file *real) {
     return (real->pMethods->iVersion >= 3) ? &mw_io : (real->pMethods->iVersion == 2) ? &v2 : &v1;
 }
 
-// mw=0 stock passthrough, mw=1 lane tracking on the stock shared WAL, mw=2 private lanes.
+// URI mw=0: stock passthrough; mw=1: the engine (private lanes); mw=2: experimental (lane tracking on the stock shared WAL).
+// Inside, the engine is mode 2 and the tracking mode 1 (the numbers the code compares against).
 static int mw_mode_for (const char *name, int flags) {
     if (!name || !(flags & SQLITE_OPEN_MAIN_DB)) return 0;
-    return (int)sqlite3_uri_int64(name, "mw", mw_default_enabled);
+    // vfs=multiwriter in the URI turns the engine on (mw=0 opts out). Not every open through the VFS: the database that VACUUM INTO or ATTACH opens has a plain name and stays as stock.
+    int dflt = mw_default_enabled;
+    const char *v = sqlite3_uri_parameter(name, "vfs");
+    if (v && !strcmp(v, "multiwriter")) dflt = 1;
+    int uri_mode = (int)sqlite3_uri_int64(name, "mw", dflt);
+    return uri_mode == 1 ? 2 : uri_mode == 2 ? 1 : 0;
 }
 
 static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int flags, int *pout) {

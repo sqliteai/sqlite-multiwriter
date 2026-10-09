@@ -53,7 +53,7 @@ static int ov_open (sqlite3_vfs *v, const char *name, sqlite3_file *f, int flags
     return rc;
 }
 static void own_shm_run (void) {
-    char path[256], uri[400]; mw_tmpdb(path, sizeof path, "ownshm"); snprintf(uri, sizeof uri, "file:%s?mw=2", path);
+    char path[256], uri[400]; mw_tmpdb(path, sizeof path, "ownshm"); snprintf(uri, sizeof uri, "file:%s?mw=1", path);
     sqlite3 *db; CHECK_RC(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, "ownshm"), SQLITE_OK);
     sqlite3_extended_result_codes(db, 1);
     int rc = mw_exec(db, "CREATE TABLE t(a)");
@@ -65,7 +65,7 @@ static void own_shm_run (void) {
 static void stacked_run (int sect, int pgsz) {
     sector = sect;
     char path[256], uri[400]; mw_tmpdb(path, sizeof path, "stacked");
-    snprintf(uri, sizeof uri, "file:%s?mw=2", path);
+    snprintf(uri, sizeof uri, "file:%s?mw=1", path);
     sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     char q[100]; snprintf(q, sizeof q, "PRAGMA page_size=%d; PRAGMA journal_mode=WAL;", pgsz);
     CHECK_RC(mw_exec(s, q), SQLITE_OK); CHECK_RC(sqlite3_close(s), SQLITE_OK);
@@ -98,7 +98,7 @@ static void m_shut (void *a) { real_mem.xShutdown(a); }
 static void oom_run (void) {
     int busy = 0, nomem = 0, other = 0, ok = 0;
     for (int n = 1; n <= 400; n++) for (int body = 0; body < 2; body++) {
-        char path[256], uri[300]; mw_tmpdb(path, sizeof path, "oom"); snprintf(uri, sizeof uri, "file:%s?mw=2", path);
+        char path[256], uri[300]; mw_tmpdb(path, sizeof path, "oom"); snprintf(uri, sizeof uri, "file:%s?mw=1", path);
         sqlite3 *db; fail_at = 0;
         if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { CHECK(0); return; }
         sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, NULL, 0, 0);           // (every allocation goes through the allocator that fails)

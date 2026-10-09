@@ -9,7 +9,7 @@
 #include "multiwriter.h"
 
 static int open_mp (const char *path, sqlite3 **db, int delay_us) {
-    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_mp=1&mw_gc=16&mw_prep_delay_us=%d", path, delay_us);
+    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=1&mw_mp=1&mw_gc=16&mw_prep_delay_us=%d", path, delay_us);
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;

@@ -42,7 +42,7 @@ typedef struct { rw_t *rw; size_t nrw, caprw; ro_t *ro; size_t nro, capro; long 
 static int g_wr;      // the table t is a WITHOUT ROWID table (its interior pages hold rows)
 static const char *g_path; static int g_keys; static double g_secs; static int g_procs_mode, g_threadmode, g_rebase;      // g_threadmode: the "processes" of the power-loss run are threads of one process (the engine's single-process mode)
 static int open_db (const char *path, sqlite3 **db) {
-    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=%d%s%s%s", path, getenv("MW_SERIAL_GC") ? atoi(getenv("MW_SERIAL_GC")) : 16, ((g_procs_mode && !g_threadmode) || getenv("MW_TEST_MP")) ? "&mw_mp=1" : "", g_rebase ? "&mw_rebase=1" : "", getenv("MW_SERIAL_NOROUTE") ? "&mw_noroute=1" : "");
+    char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=1&mw_gc=%d%s%s%s", path, getenv("MW_SERIAL_GC") ? atoi(getenv("MW_SERIAL_GC")) : 16, ((g_procs_mode && !g_threadmode) || getenv("MW_TEST_MP")) ? "&mw_mp=1" : "", g_rebase ? "&mw_rebase=1" : "", getenv("MW_SERIAL_NOROUTE") ? "&mw_noroute=1" : "");
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;

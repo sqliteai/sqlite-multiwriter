@@ -3,7 +3,7 @@
 #include "multiwriter.h"
 
 int main (void) {
-    char path[256]; mw_tmpdb(path, sizeof path, "openflags"); char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=2", path);
+    char path[256]; mw_tmpdb(path, sizeof path, "openflags"); char uri[300]; snprintf(uri, sizeof uri, "file:%s?mw=1", path);
     sqlite3 *db = NULL;
     // 1. no SQLITE_OPEN_CREATE and no file: it fails, and nothing is created
     CHECK_RC(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL), SQLITE_CANTOPEN); sqlite3_close(db); db = NULL;

@@ -9,7 +9,7 @@
 static int close_cs (sqlite3 *db) { return sqlite3_close(db); }
 static int open_lane (const char *path, sqlite3 **db) {
     char uri[300];
-    snprintf(uri, sizeof uri, "file:%s?mw=2&mw_gc=32&mw_readcheck=0", path);   // structural rebases are the subject here
+    snprintf(uri, sizeof uri, "file:%s?mw=1&mw_gc=32&mw_readcheck=0", path);   // structural rebases are the subject here
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) sqlite3_extended_result_codes(*db, 1);
     return rc;

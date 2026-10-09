@@ -9,7 +9,7 @@ enum { NT = 4, ROWS = 300 };
 
 static void *writer (void *arg) {
     long id = (long)arg; sqlite3 *db; char uri[400];
-    snprintf(uri, sizeof uri, "file:%s?vfs=multiwriter&mw=2&mw_rebase=1", g_path_db);
+    snprintf(uri, sizeof uri, "file:%s?vfs=multiwriter&mw_rebase=1", g_path_db);
     if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { mw_failures++; return NULL; }
     sqlite3_busy_timeout(db, 0); sqlite3_extended_result_codes(db, 1);
     for (int i = 0; i < ROWS; i++) {

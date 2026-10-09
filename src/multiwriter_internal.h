@@ -229,7 +229,7 @@ struct mw_lane {
     bool        snapshot_held;  // registered in db->lanes as an active snapshot
     mw_lane    *next_active;    // intrusive list of lanes holding a snapshot (protected by db->mu)
     mw_lane    *prev_active;
-    bool        private_mode;   // mw=2: private WAL + private wal-index (true lane)
+    bool        private_mode;   // mw=1: private WAL + private wal-index (true lane)
     // private lane state (only valid when private_mode)
     mw_memwal   wal;
     bool        wal_bound;

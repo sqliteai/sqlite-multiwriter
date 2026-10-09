@@ -26,7 +26,7 @@ static bool alive_never (int32_t pid, void *ctx) { (void)pid; (void)ctx; return 
 
 // ---- functional ----
 static void test_functional (void) {
-    char path[128]; snprintf(path, sizeof path, "/tmp/mw_shidx_f_%d.idx", (int)getpid()); unlink(path);
+    char path[256]; snprintf(path, sizeof path, "%s/mw_shidx_f_%d.idx", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid()); unlink(path);
     shidx_params p = { 16, 4096, 64, 0 };
     shidx *ix = shidx_open(path, &p);
     CHECK(ix != NULL);
@@ -100,7 +100,7 @@ static void test_functional (void) {
 
 // ---- arena exhaustion and candidate overflow ----
 static void test_limits (void) {
-    char path[128]; snprintf(path, sizeof path, "/tmp/mw_shidx_l_%d.idx", (int)getpid()); unlink(path);
+    char path[256]; snprintf(path, sizeof path, "%s/mw_shidx_l_%d.idx", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid()); unlink(path);
     shidx_params p = { 14, 64, 8, 4 };                           // 64 versions, 4 candidates
     shidx *ix = shidx_open(path, &p);
     CHECK(ix != NULL);
@@ -198,7 +198,7 @@ static bool alive_kill0 (int32_t pid, void *ctx) { (void)ctx; return kill(pid, 0
 
 static void test_stress (int writers, int readers, int seconds) {
     char path[128], lockp[160];
-    snprintf(path, sizeof path, "/tmp/mw_shidx_s_%d.idx", (int)getpid()); unlink(path);
+    snprintf(path, sizeof path, "%s/mw_shidx_s_%d.idx", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid()); unlink(path);
     snprintf(lockp, sizeof lockp, "%s.lock", path);
     shidx_params p = { 14, 1u << 16, 256, 0 };
     shidx *ix = shidx_open(path, &p);

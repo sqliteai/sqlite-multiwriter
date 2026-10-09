@@ -18,9 +18,13 @@ endif
 CFLAGS += -O2 -g -Wall -Wno-unused-function -I$(SRC_DIR) -I$(SQLITE_DIR) -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS
 SQLITE_FLAGS := -DSQLITE_EXTRA_INIT=mw_extra_init -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_RTREE -DSQLITE_CORE
 include mk/platform.mk
-LDFLAGS += -lpthread -lm
+LDFLAGS += $(if $(filter android,$(PLATFORM)),,-lpthread) -lm
 ifeq ($(PLATFORM),linux)
 CFLAGS += -D_GNU_SOURCE
+LDFLAGS += -ldl
+endif
+ifeq ($(PLATFORM),android)
+CFLAGS += -D_GNU_SOURCE      # (tests for a device or an emulator: make all PLATFORM=android CC=<ndk>/aarch64-linux-android26-clang)
 LDFLAGS += -ldl
 endif
 ifeq ($(PLATFORM),linux-musl)

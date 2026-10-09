@@ -152,8 +152,6 @@ int mw_mp_finish_open (mw_db *db) {
     if (db->mp_first) {
         sh->pgsz = (uint32_t)db->store->pgsz;
         atomic_store(&sh->committed_epoch, atomic_load(&db->epoch));
-        atomic_store(&sh->log_pos, MW_LOG_POS(1, db->log_off));
-        atomic_store(&sh->log_ready, db->logfile_size);                 // (what the file holds now: written bytes)
         atomic_store(&sh->base_epoch, db->base_epoch);
         atomic_store(&sh->compact_T, db->base_epoch);
         atomic_store(&sh->schema_epoch, 1);

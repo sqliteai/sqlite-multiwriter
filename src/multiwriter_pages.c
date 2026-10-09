@@ -530,7 +530,6 @@ int mw_db_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uint32_
         pthread_mutex_unlock(&db->admit_mu);
         return rc;
     }
-    if (db->log_off > (1ull << 30) - (64ull << 20)) { mw_db_compactor_kick(db); return SQLITE_FULL; }   // the shared log must stay inside its mapping
     if (lane && lane->mp_held) {                                 // (relocation: gate and lock are ours already; the caller finishes with mw_db_publish_finish)
         uint64_t my_epoch = 0;
         int rc = mw_shared_publish(db, lane, v, pgnos, images, n, ws_dbsize, snap_dbsize, sync, &my_epoch);

@@ -4,27 +4,22 @@
 //
 //  Multi-process mode (URI mw_mp=1): several processes, each with several connections, on one database.
 //
-//  The shared commit log is the sequencer. Shared state lives in "<db>-mwlock", mmapped by every process:
-//  the committed epoch and log end, the db_version counter, the compaction target, and a registry of
-//  *slots* (one per lane: pid, snapshot epoch, lowest unresolved db_version) and *processes*.
-//  Each process keeps its own in-memory page store and brings it up to date by tailing the log.
+//  The shared header "<db>-mwlock", mmapped by every process, holds the publication lock, the committed epoch and log end, the db_version counter, the compaction
+//  target, and a registry of *slots* (one per lane: pid, snapshot epoch, lowest unresolved db_version) and *processes*. The version index and the segmented log
+//  are in multiwriter_shared.c and multiwriter_seglog.c; no process keeps a private copy of the versions.
 //
-//  Commit (multiwriter_pages.c, under mw_mp_lock = in-process mutex + fcntl lock):
-//      catch up on the log  ->  validate against the (now complete) local store  ->  assign the next epoch
-//      -> install + append the record (+ fsync if synchronous>=FULL)  ->  publish committed_epoch/log_end.
-//  Publication is therefore serialised across ALL processes (one short critical section, fsync included at
-//  synchronous=FULL: no cross-process group commit). Execution, page reads, validation of the next
-//  transaction, rebases and reads are fully parallel.
+//  Commit (multiwriter_pages.c, under mw_mp_lock = in-process mutex + the ticket lock of the header):
+//      validate against the shared index  ->  assign the next epoch  ->  append the record to the log (+ fsync if synchronous>=FULL)
+//      ->  publish committed_epoch/log_end.
+//  Publication is therefore serialised across ALL processes (one short critical section, fsync included at synchronous=FULL: no cross-process group commit).
+//  Execution, page reads, validation of the next transaction, rebases and reads are fully parallel.
 //
-//  Snapshot: a lane first catches up, then takes db->epoch. A snapshot must not fall below the compaction
-//  target announced in the header (protocol below), so compaction never overwrites state a live snapshot
-//  still needs.
+//  Snapshot: a lane takes the committed epoch. A snapshot must not fall below the compaction target announced in the header (protocol below), so compaction never
+//  overwrites state a live snapshot still needs.
 //
-//  Crashes: a process that dies loses only its uncommitted work (its record is visible only once the header
-//  is updated, and that happens inside the publication lock, which the kernel releases on death). Its slots
-//  are recognised by kill(pid, 0) and ignored/reclaimed, so it neither holds back compaction nor the
-//  db_version export ceiling. If every process died, the next opener recovers from the log like a single
-//  process would.
+//  Crashes: a process that dies loses only its uncommitted work (its record is visible only once the header is updated, and that happens inside the publication
+//  lock; a lock left by a dead process is detected with kill(pid, 0) and taken over). Its slots are ignored and reclaimed, so it neither holds back compaction nor
+//  the db_version export ceiling. If every process died, the next opener recovers from the log like a single process would.
 //
 
 #include <errno.h>
@@ -137,8 +132,7 @@ int mw_mp_open (mw_db *db) {
             db->shm->magic = MP_MAGIC;
         }
         db->mp = true;
-        // Register this process *before* the log is opened, and remember the log generation we start from: if the log is reset or rewritten
-        // while we replay it, the catch-up sees a different generation and repositions instead of trusting the file we opened.
+        // Register this process *before* the log is opened, so that its snapshots are accounted for from the start.
         db->mp_proc = -1;
         for (int i = 0; i < MW_MP_PROCS && db->mp_proc < 0; i++) {
             if (fcntl_lock(db->mp_pubfd, MP_LOCK_LIVE(i), F_WRLCK, false) != 0) continue;     // held by a live process: next entry
@@ -180,7 +174,7 @@ void mw_mp_close (mw_db *db, bool *sole) {
     *sole = flock(db->mp_lockfd, LOCK_EX | LOCK_NB) == 0;                // nobody else holds it: last process
 }
 
-// MARK: - publication lock, catch-up -
+// MARK: - publication lock -
 
 #if defined(__aarch64__)
 #define MP_RELAX() __asm__ __volatile__("yield")
@@ -210,7 +204,7 @@ static bool mp_ticket_lock (void) { static _Atomic int c = MW_KNOB_UNSET; return
 
 // The publication lock as a FIFO ticket queue in the shared header. With the polling lock every waiting process woke up every 50 us (64 processes: over a million
 // wake-ups a second competing with the holder for the cores); here only the first two in the queue poll fast, the others sleep for about as long as the processes ahead
-// of them need, and the lock goes to the next ticket in order. Waiting processes apply the commits published meanwhile, so the holder has only the last record left.
+// of them need, and the lock goes to the next ticket in order.
 void mw_mp_lock (mw_db *db) {
     pthread_mutex_lock(&db->mp_mu);
     mw_shm *sh = db->shm;
@@ -225,7 +219,7 @@ void mw_mp_lock (mw_db *db) {
             if (s == t) {
                 int32_t exp = 0;
                 if (atomic_compare_exchange_strong_explicit(&sh->pub_owner, &exp, me, memory_order_acquire, memory_order_relaxed)) { return; }
-                if (exp != me && (polls & 31) == 31 && !pid_alive(db, exp) && atomic_compare_exchange_strong(&sh->pub_owner, &exp, me)) { if (db->mp_req) mw_shared_repair(db); return; }   // the holder died
+                if (exp != me && (polls & 31) == 31 && !pid_alive(db, exp) && atomic_compare_exchange_strong(&sh->pub_owner, &exp, me)) { mw_shared_repair(db); return; }   // the holder died
             } else if (s > t) {                                                                             // our ticket was skipped (we looked dead for too long): a new one
                 t = atomic_fetch_add(&sh->pub_ticket, 1);
                 atomic_store(&sh->pub_tk_pid[t % 1024], me);
@@ -256,7 +250,7 @@ void mw_mp_lock (mw_db *db) {
         if (atomic_load_explicit(&sh->pub_owner, memory_order_relaxed) == 0 && atomic_compare_exchange_strong_explicit(&sh->pub_owner, &exp, me, memory_order_acquire, memory_order_relaxed)) return;
         if ((spin & 255) == 255) {
             int32_t owner = atomic_load(&sh->pub_owner);
-            if (owner != 0 && owner != me && !pid_alive(db, owner) && atomic_compare_exchange_strong(&sh->pub_owner, &owner, me)) { if (db->mp_req) mw_shared_repair(db); }     // steal from a dead process
+            if (owner != 0 && owner != me && !pid_alive(db, owner) && atomic_compare_exchange_strong(&sh->pub_owner, &owner, me)) mw_shared_repair(db);     // steal from a dead process
             if (atomic_load(&sh->pub_owner) == me) return;
         }
         if (spin < 400) MP_RELAX();
@@ -406,9 +400,8 @@ void mw_mp_writing (mw_lane *lane, bool on) {
 
 // MARK: - admission control (many processes) -
 //
-// With N processes every commit costs every process a catch-up, all of them contend for the one publication lock, and past ~32 processes the throughput *falls* with N
-// (64: 5k, 128: 2k tx/s against 9.6k at 32). It engages with more than 1.5 processes per core.. Only a limited number of writer transactions may be in flight at once; the others sleep before taking their snapshot (a
-// sleeping process has nothing to catch up yet). FIFO tickets order the waiters, the first few poll the slot table, the rest sleep in proportion to their distance. A wait is
+// With N processes all of them contend for the one publication lock, and past ~32 processes the throughput *falls* with N
+// (64: 5k, 128: 2k tx/s against 9.6k at 32). It engages with more than 1.5 processes per core.. Only a limited number of writer transactions may be in flight at once; the others sleep before taking their snapshot. FIFO tickets order the waiters, the first few poll the slot table, the rest sleep in proportion to their distance. A wait is
 // bounded (a transaction that cannot get a slot in 50 ms goes ahead without one) so that a holder that stays open for long, or a dead one, can never stop the others.
 static int mp_admit_cap (int nprocs) {
     static _Atomic int c = MW_KNOB_UNSET;

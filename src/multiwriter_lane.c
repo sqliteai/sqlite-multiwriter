@@ -173,10 +173,10 @@ static bool multirow_insert (const char *sql) {
     return false;
 }
 static bool stmt_is_point (mw_lane *lane, sqlite3_stmt *st, const char *sql) {
-    if (multirow_insert(sql)) return false;
     rd_ent *c = lane->rd_cache;
     if (!c) { c = lane->rd_cache = sqlite3_malloc64(RD_CACHE * sizeof *c); if (!c) return false; memset(c, 0, RD_CACHE * sizeof *c); }
     for (int i = 0; i < RD_CACHE; i++) if (c[i].sql && strcmp(c[i].sql, sql) == 0) return c[i].point;
+    if (multirow_insert(sql)) return false;                  // (after the lookup: a statement that is repeated pays nothing; one that is new every time is not kept)
     bool point = bytecode_is_point(sqlite3_db_handle(st), sql);
     int slot = lane->rd_cache_next++ % RD_CACHE;
     sqlite3_free(c[slot].sql); c[slot].sql = sqlite3_mprintf("%s", sql); c[slot].point = c[slot].sql ? point : false;

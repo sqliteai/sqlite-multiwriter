@@ -2,7 +2,7 @@
 //  multiwriter_seglog.h
 //  sqlite-multiwriter
 //
-//  Segmented commit log for the shared mode of multi-process Multi-Writer (mw_mp=2): "<db>-mw.<N>", N = 1, 2, ...
+//  Segmented commit log for the multi-process mode of Multi-Writer (mw_mp=1): "<db>-mw.<N>", N = 1, 2, ...
 //
 //  A segment is a file of fixed size (16 MB by default; a bigger commit gets a segment of its own), written once through a shared mapping and never rewritten:
 //    header (64 B): same layout as the single-file log (magic, page size, base_epoch, salt, cksum)

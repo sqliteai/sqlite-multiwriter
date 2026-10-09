@@ -2,15 +2,15 @@
 //  multiwriter_shared.c
 //  sqlite-multiwriter
 //
-//  Shared mode of multi-process Multi-Writer (URI mw_mp=2): the version index and the page images are shared by every process, nobody keeps a private store.
+//  Multi-process Multi-Writer (URI mw_mp=1): the version index and the page images are shared by every process, nobody keeps a private store.
 //
 //    "<db>-mwidx"   the shared version index (multiwriter_shidx.h): page, snapshot epoch -> where the page image is
 //    "<db>-mw.<N>"  the segmented log (multiwriter_seglog.h): the page images, durable, appended once, deleted when compacted
 //    "<db>-mwlock"  the shared header (multiwriter_mp.c): publication lock, committed epoch, registry of snapshots, compaction target, liveness
 //
 //  A read is an index lookup and a copy from a mapped segment; a commit is validated against the index and appended to the log by the publisher, under the publication
-//  lock, once, for everybody; nobody has to apply anything: the work per commit that every process used to do (and the memory of its copy of the versions) is gone.
-//  Compaction, snapshots registration (the floor under which versions may be freed) and process liveness are those of the other multi-process mode.
+//  lock, once, for everybody; nobody has to apply anything.
+//  Compaction, the registration of snapshots (the floor under which versions may be freed) and process liveness are in multiwriter_mp.c.
 //
 
 #include "multiwriter_os.h"

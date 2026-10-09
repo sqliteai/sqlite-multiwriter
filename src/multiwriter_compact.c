@@ -45,8 +45,7 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
     uint64_t t0 = now_ns();
     int rc = SQLITE_OK;
 
-    uint64_t T = mw_db_oldest_active_snapshot(db), visible = atomic_load(&db->epoch);
-    if (visible < T) T = visible;
+    uint64_t T = mw_db_oldest_active_snapshot(db);                  // (never above the visible epoch: the scan starts from it)
     uint64_t base = db->base_epoch;
     if (T <= base) goto done;                                      // nothing new to materialise (or pinned by an old reader)
     if (db->has_log) {   // (commits with synchronous < FULL are visible before they are on the disk: the log has them there before their pages go into the file, or a power failure leaves the file ahead of the log)

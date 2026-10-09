@@ -1,4 +1,4 @@
-// Shared mode of multi-process Multi-Writer (URI mw_mp=2): the shared version index and the segmented log.
+// Multi-process Multi-Writer (URI mw_mp=1): the shared version index and the segmented log.
 // Small segments (MW_SEG_MB=1) so that every test rolls and trims many of them.
 #include <dirent.h>
 #include <fcntl.h>
@@ -10,7 +10,7 @@
 
 static int open_sh (const char *path, sqlite3 **db) {
     char uri[400];
-    snprintf(uri, sizeof uri, "file:%s?mw=1&mw_mp=2&mw_gc=16", path);
+    snprintf(uri, sizeof uri, "file:%s?mw=1&mw_mp=1&mw_gc=16", path);
     int rc = sqlite3_open_v2(uri, db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc == SQLITE_OK) { sqlite3_extended_result_codes(*db, 1); sqlite3_busy_timeout(*db, 0); }
     return rc;

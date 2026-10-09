@@ -75,7 +75,7 @@ typedef struct mw_shm {
     _Atomic int32_t   hot_tk_pid[256];    // pid that took each ticket (a queued process that died is skipped)
     _Atomic int       hot_held;
     _Atomic int32_t   hot_owner;          // pid of the process holding the turn (a dead holder's turn is released by the waiters)
-    // shared mode (segmented log + shared index, mw_mp=2)
+    // multi-process mode (segmented log + shared index)
     _Atomic uint32_t  seg_min;            // oldest segment file that still exists
     _Atomic uint32_t  seg_next_ready;     // id of the next segment when it is fully prepared (0 = not yet)
     _Atomic uint32_t  sl_seg;             // writer cursor: segment the next record goes to
@@ -355,7 +355,7 @@ struct mw_db {
     int               mp_lockfd, mp_pubfd, mp_proc;   // mp_lockfd: flock membership + shared header; mp_pubfd: fcntl byte locks only (BSD mixes the two kinds)
     char             *mp_path, *mp_pubpath;
     mw_shm           *shm;
-    pthread_mutex_t   mp_mu;               // serialises publication and catch-up inside this process
+    pthread_mutex_t   mp_mu;               // serialises publication inside this process
     _Atomic int       failed;              // sticky I/O failure: no further commits
     _Atomic uint64_t  next_epoch;          // last *assigned* epoch (>= epoch; the difference is in-flight commits)
     _Atomic uint64_t  n_pages_published, n_log_sync_ns;
@@ -581,7 +581,7 @@ static inline uint64_t mw_log_end_locked (mw_db *db) {
     return v;
 }
 
-// ---- shared mode (mw_mp=2): multiwriter_shared.c ----
+// ---- multi-process mode (mw_mp=1): multiwriter_shared.c ----
 mw_store *mw_store_create_light (int pgsz, uint32_t base_dbsize);       // a store without version chains: only pgsz / reserved / base_dbsize
 int       mw_shared_open (mw_db *db);                                    // index + segmented log (after mw_mp_open); the first opener recovers
 int       mw_shared_open_finish (mw_db *db);                             // after mw_mp_finish_open: publishes the log position in the header

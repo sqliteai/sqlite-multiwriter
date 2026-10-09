@@ -56,6 +56,8 @@ Isolation is snapshot isolation, not serializable: write skew is possible (`docs
 
 Add `mw_rebase=1` to either. `vfs=multiwriter` is all it takes to turn the engine on (the SQLite connection has to be opened with `SQLITE_OPEN_URI`).
 
+Choosing the VFS with the `zVfs` argument of `sqlite3_open_v2` and a plain file name does not turn the engine on: the database opens as stock SQLite, because SQLite also opens the databases of `ATTACH` and `VACUUM INTO` through the VFS and those must stay as they are. Write the name as a URI with the VFS or with `mw=1`: `file:app.db?vfs=multiwriter` or `file:app.db?mw=1` (with `SQLITE_OPEN_URI`).
+
 ## Install
 
 Every release has the extension for each platform ([releases](https://github.com/sqliteai/sqlite-multiwriter/releases/latest); `make extension` builds it for the machine you are on). Load it into a SQLite that

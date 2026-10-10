@@ -42,7 +42,7 @@ uint64_t mw_vfs_event_count (mw_event_t ev) { return (ev < MW_EV_COUNT) ? atomic
 void mw_vfs_events_reset (void) { for (int i = 0; i < MW_EV_COUNT; ++i) { atomic_store(&mw_counts[i], 0); tl_cnt[i] = 0; } tl_n = 0; }
 // Statement hook (sqlite3_trace_v2): recognises DDL/VACUUM, raises the schema barrier before it runs and gives it back, if it is still idle, when the statement ends.
 static bool mw_is_ddl_sql (const char *sql) {
-    while (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r') sql++;
+    sql = mw_sql_skip(sql);
     static const char *kw[] = { "CREATE", "DROP", "ALTER", "REINDEX", "VACUUM" };
     for (unsigned i = 0; i < sizeof(kw) / sizeof(kw[0]); i++) if (sqlite3_strnicmp(sql, kw[i], (int)strlen(kw[i])) == 0) return true;
     return false;

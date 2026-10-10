@@ -581,6 +581,16 @@ static inline uint64_t mw_log_end_locked (mw_db *db) {
     return v;
 }
 
+// The first token of an SQL text as sqlite3_sql() gives it: after white space and comments ("/* req:1 */ SELECT ...", "-- note\nUPDATE ..."): the text of a statement keeps them.
+static inline const char *mw_sql_skip (const char *p) {
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f') p++;
+        if (p[0] == '-' && p[1] == '-') { while (*p && *p != '\n') p++; continue; }
+        if (p[0] == '/' && p[1] == '*') { p += 2; while (*p && !(p[0] == '*' && p[1] == '/')) p++; if (*p) p += 2; continue; }
+        return p;
+    }
+}
+
 // ---- multi-process mode (mw_mp=1): multiwriter_shared.c ----
 mw_store *mw_store_create_light (int pgsz, uint32_t base_dbsize);       // a store without version chains: only pgsz / reserved / base_dbsize
 int       mw_shared_open (mw_db *db);                                    // index + segmented log (after mw_mp_open); the first opener recovers

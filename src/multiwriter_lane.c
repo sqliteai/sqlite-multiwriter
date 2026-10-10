@@ -162,13 +162,12 @@ static bool bytecode_is_point (sqlite3 *db, const char *sql) {
 }
 // An INSERT with several rows in VALUES is compiled with a coroutine, which the bytecode check refuses: say so without parsing the statement again (a bulk insert is a new text every time: the cache of
 // statements never hits, and EXPLAIN of a few KB costs more than the insert). "),(" outside of a string is the mark; one inside a string only makes a point statement look like a refused one.
-static const char *skip_ws (const char *p) { while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++; return p; }
 static bool multirow_insert (const char *sql) {
-    sql = skip_ws(sql);
+    sql = mw_sql_skip(sql);
     if (sqlite3_strnicmp(sql, "INSERT", 6) != 0 && sqlite3_strnicmp(sql, "REPLACE", 7) != 0) return false;
     for (const char *p = strchr(sql, ')'); p; p = strchr(p + 1, ')')) {
-        const char *q = skip_ws(p + 1);
-        if (*q == ',' && *skip_ws(q + 1) == '(') return true;
+        const char *q = mw_sql_skip(p + 1);
+        if (*q == ',' && *mw_sql_skip(q + 1) == '(') return true;
     }
     return false;
 }
@@ -183,7 +182,7 @@ static bool stmt_is_point (mw_lane *lane, sqlite3_stmt *st, const char *sql) {
     return point;
 }
 static int stmt_kind (const char *sql) {
-    if (sql) sql = skip_ws(sql);
+    if (sql) sql = mw_sql_skip(sql);
     if (!sql) return RD_OTHER;
     if (sqlite3_strnicmp(sql, "INSERT", 6) == 0 || sqlite3_strnicmp(sql, "REPLACE", 7) == 0 || sqlite3_strnicmp(sql, "UPDATE", 6) == 0 || sqlite3_strnicmp(sql, "DELETE", 6) == 0) return RD_DML;
     return RD_OTHER;
@@ -195,15 +194,17 @@ static bool has_word (const char *sql, const char *w) {
     return false;
 }
 static bool stmt_reads (const char *sql) {
-    while (sql && (*sql == ' ' || *sql == '\t' || *sql == '\n' || *sql == '\r' || *sql == '(')) sql++;
-    return sql && (sqlite3_strnicmp(sql, "SELECT", 6) == 0 || sqlite3_strnicmp(sql, "WITH", 4) == 0 || sqlite3_strnicmp(sql, "VALUES", 6) == 0);
+    if (!sql) return false;
+    sql = mw_sql_skip(sql);
+    while (*sql == '(') sql = mw_sql_skip(sql + 1);
+    return sqlite3_strnicmp(sql, "SELECT", 6) == 0 || sqlite3_strnicmp(sql, "WITH", 4) == 0 || sqlite3_strnicmp(sql, "VALUES", 6) == 0;
 }
 void mw_lane_stmt_note (mw_lane *lane, mw_stmt_note *n) {
     sqlite3_stmt *st = n->stmt;
     if (!n->ending) {
         if (n->autocommit) { lane->rd_dep = false; lane->rd_chg_base = sqlite3_total_changes(sqlite3_db_handle(st)); }       // (this statement starts a transaction)
         const char *sql = sqlite3_sql(st);
-        if (sql && sqlite3_strnicmp(sql, "EXPLAIN", 7) == 0) return;               // (our own: the bytecode of a statement is looked at from inside the hook)
+        if (sql && sqlite3_strnicmp(mw_sql_skip(sql), "EXPLAIN", 7) == 0) return;               // (our own: the bytecode of a statement is looked at from inside the hook)
         lane->rd_db = sqlite3_db_handle(st);
         if (stmt_reads(sql) || (sql && has_word(sql, "REPLACE"))) lane->rd_dep = true;      // (REPLACE deletes rows that no change counter counts)
         lane->rd_cur = st; lane->rd_cur_kind = stmt_kind(sql);
@@ -243,6 +244,12 @@ static bool lane_can_rebase (mw_lane *lane, const uint8_t *pg1, uint32_t snapsho
     if (pg1) {
         uint32_t c = ((uint32_t)pg1[40] << 24) | ((uint32_t)pg1[41] << 16) | ((uint32_t)pg1[42] << 8) | pg1[43];
         if (c != snapshot_cookie) return false;                  // DDL in this transaction
+        // The replay has the row changes only: a change of a field of the header that the application can set (schema format, default cache size, largest root page, text encoding, user_version,
+        // incremental vacuum, application_id: bytes 44..71) would be lost, and the commit reported as done.
+        uint8_t h[28] = {0};
+        mw_store *st = lane->db->store;
+        if (!mw_store_read(st, 1, lane->tx.snapshot_epoch, 44, 28, h)) { mw_file *f = lane->file; if (f->real->pMethods->xRead(f->real, h, 28, 44) != SQLITE_OK) return false; }
+        if (memcmp(h, pg1 + 44, 28) != 0) return false;
     }
     return true;
 }
@@ -285,7 +292,12 @@ static int lane_publish_inner (mw_lane *lane) {
         if (lane->ws_pgnos[i] == 1) pg1 = imgs[i];
     }
     if (!lane->dsz_valid || lane->dsz_epoch != lane->tx.snapshot_epoch) { lane->dsz_val = mw_store_dbsize(db->store, lane->tx.snapshot_epoch); lane->dsz_epoch = lane->tx.snapshot_epoch; lane->dsz_valid = true; }
-    if (lane->poisoned && lane->own_n > 0) { free(imgs); return MW_CONFLICT_READ; }          // (a commit of this snapshot was relocated: the next one would use the page numbers it had before; the snapshot ends and the transaction runs again)
+    if (lane->poisoned && lane->own_n > 0) {                     // (a commit of this snapshot was relocated: the next one would use the page numbers it had before; the snapshot ends and the transaction runs again)
+        free(imgs);
+        lane->tx.state = MW_TX_ABORTED;                          // (the same ending as a refused commit below: the application sees SQLITE_BUSY_SNAPSHOT, not the internal code)
+        atomic_fetch_add(&db->n_aborts, 1);
+        return SQLITE_BUSY_SNAPSHOT;
+    }
     uint32_t snap_size = lane->dsz_val;
     uint32_t cookie = lane_schema_cookie(lane);
     // pages read but not written: mark the write set in the (sorted) bitmap, walk the read list
@@ -356,7 +368,7 @@ static int lane_publish_inner (mw_lane *lane) {
             // 2. Physical conflict only on pages that it wrote (mw_rebase=1): discard its pages and replay its row changes at the latest snapshot; stock SQLite regenerates the pages.
             rc = mw_lane_rebase(lane, imgs, cookie, &epoch);
             if (rc == SQLITE_OK) lane->rb_streak = 0; else if (!lane->rb_nobackoff) { if (lane->rb_streak < 5) lane->rb_streak++; lane->rb_skip = (1 << lane->rb_streak) - 1; }      // (refused: the next conflicts of this connection are probably true ones too: they are not replayed, 1, 3, 7... in a row)
-            if (rc == SQLITE_OK) { lane->tx.state = MW_TX_COMMITTED; lane->consec_aborts = 0; }   // commit_epoch was set by the rebase (the credit granted above is spent by the next commits)
+            if (rc == SQLITE_OK) { lane->tx.state = MW_TX_COMMITTED; lane->consec_aborts = 0; lane->poisoned = true; }   // commit_epoch was set by the rebase (the credit granted above is spent by the next commits). The pages that it published are the helper's, not the images in this lane's WAL: another commit of this snapshot would build on the lane's own and overwrite what the others committed (as after a relocation)
             else if (rc != MW_CONFLICT) { lane->tx.state = MW_TX_ABORTED; atomic_fetch_add(&db->n_aborts, 1); }   // (any other failure also rolls the transaction back)
         }
     }

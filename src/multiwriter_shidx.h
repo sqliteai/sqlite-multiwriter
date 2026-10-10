@@ -77,6 +77,7 @@ uint64_t shidx_gc_floor (shidx *ix, uint64_t floor, uint64_t base);
 // Free entries (versions that fit); `need` more than that: the caller must GC or compact first.
 void shidx_gc_repair (shidx *ix);        // a publisher died inside the lock: a collection that was running is redone from every page
 uint32_t shidx_room (shidx *ix);
+void     shidx_test_overcount_free (shidx *ix);   // tests only: n_free one above what the free list holds
 // Lock-free scan (any process, while the writer works): for every page whose newest version <= `upto` is newer than `base`, calls cb(pgno, epoch, loc). The caller must keep the
 // writer's GC from freeing versions <= upto (a floor that does not pass it) while it scans.
 typedef void (*shidx_scan_fn)(void *ctx, uint32_t pgno, uint64_t epoch, uint64_t loc);

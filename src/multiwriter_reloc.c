@@ -213,6 +213,7 @@ static int reloc_phase1 (mw_lane *lane, const uint32_t *pgnos, const uint8_t *co
     c->kind = calloc(growth, 1); c->refs = calloc(growth, sizeof(uint32_t)); c->queue = malloc((size_t)growth * sizeof(uint32_t));
     P->slot_of_new = malloc((size_t)growth * sizeof(int));                 // index in the write set of each new page
     bool fail = !P->nim || !P->npg || !c->kind || !c->refs || !c->queue || !P->slot_of_new;
+    for (int i = 0; i < n && !fail; i++) if (pgnos[i] > snap_dbsize && (pgnos[i] > ws_dbsize || pgnos[i] - snap_dbsize > growth)) fail = true;      // (a page beyond the size of the commit, which SQLite does not write: the table below has `growth` slots)
     for (int i = 0; i < n && !fail; i++, P->made++) {                            // private copies, one allocation each: the store adopts them (no second copy under the mutex)
         P->nim[i] = malloc((size_t)pgsz);
         if (!P->nim[i]) { fail = true; break; }

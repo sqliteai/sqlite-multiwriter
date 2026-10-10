@@ -157,6 +157,10 @@ void mw_store_cache_base (mw_store *st, uint32_t pgno, const void *image) {
 
 static inline void size_note (mw_store *st, uint64_t epoch, uint32_t size) {       // (seq_mu held)
     uint32_t i = (uint32_t)(epoch & (MW_SIZE_RING - 1));
+    // The slot is emptied first: a reader whose snapshot is the epoch that the slot held a ring ago (1024 epochs behind) checks the epoch before and after it reads the size, and with the epoch
+    // still in place it could read the new size between the two. (An epoch that is 0 matches no snapshot.)
+    atomic_store_explicit(&st->size_ring_epoch[i], 0, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
     atomic_store_explicit(&st->size_ring_size[i], size, memory_order_relaxed);
     atomic_store_explicit(&st->size_ring_epoch[i], epoch, memory_order_release);
 }
@@ -435,6 +439,13 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
             atomic_store(&db->failed, 1);
         }
         pthread_mutex_unlock(&st->seq_mu);
+        if (!latest) {
+            // The commits behind the hole are parked in the log's sync (waiting for the prefix of the log to be written up to them, or for room in the ring), and nothing will ever
+            // write the prefix: they re-check `failed` only when they are woken.
+            pthread_mutex_lock(&db->log_mu);
+            pthread_cond_broadcast(&db->sync_cv);
+            pthread_mutex_unlock(&db->log_mu);
+        }
         if (latest) {
             stripe_set again;
             stripes_lock(st, &again, pgnos, n, NULL, 0);

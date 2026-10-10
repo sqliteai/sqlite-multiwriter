@@ -245,9 +245,39 @@ static void test_stress (int writers, int readers, int seconds) {
     shidx_unlink(path); unlink(lockp);
 }
 
+// ---- a free count that is above what the free list holds ----
+// A holder that is killed between the two stores of an allocation used to leave n_free one above the list. The index that is exactly full then took entry 0 for a version, and published it:
+// a page that has a version looked as if it had none, and was read from the file, stale. Now the entries of a commit are all taken before any is used, and an install that cannot get them all
+// fails and leaves nothing behind.
+static void test_overcount (void) {
+    char path[256]; snprintf(path, sizeof path, "%s/mw_shidx_o_%d.idx", getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid()); unlink(path);
+    shidx_params p = { 16, 10, 8, 0 };                                 // 10 entries
+    shidx *ix = shidx_open(path, &p);
+    CHECK(ix != NULL);
+    if (!ix) return;
+    uint32_t a[] = { 5, 6 }, b[] = { 7, 8 }, c[] = { 9, 10 };
+    install(ix, 2, 10, 2, a);                                           // 3 entries each (the size record and the pages)
+    install(ix, 3, 11, 2, b);
+    install(ix, 4, 12, 2, c);
+    CHECK(shidx_room(ix) == 1);
+    shidx_test_overcount_free(ix);                                      // the count says 2
+    CHECK(shidx_room(ix) == 2);
+    uint32_t d[] = { 5 };
+    uint64_t dl[] = { loc_of(5, 5) };
+    int rc = shidx_install(ix, 5, 13, 1, d, dl);                        // needs 2 entries
+    CHECK(rc != 0);
+    CHECK(shidx_head_epoch(ix, 5) == 2);                                // (nothing of it was installed)
+    uint64_t ep, loc;
+    CHECK(shidx_lookup(ix, 5, 4, &ep, &loc) && ep == 2 && loc == loc_of(5, 2));
+    CHECK(shidx_lookup(ix, 9, 4, &ep, &loc) && ep == 4 && loc == loc_of(9, 4));
+    uint32_t sz; CHECK(shidx_dbsize(ix, 4, &sz) && sz == 12);
+    shidx_close(ix); unlink(path);
+}
+
 int main (void) {
     test_functional();
     test_limits();
+    test_overcount();
     test_stress(3, 12, 4);
     MW_DONE();
 }

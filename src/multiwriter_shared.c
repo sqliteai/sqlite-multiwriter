@@ -271,7 +271,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     MW_T1(MW_ST_APPEND, ta0);
     if (rc != SQLITE_OK) { if (n > 16) free(locs); ADOPT_FREE(); return rc; }          // (the append failed before it touched anything the others can see: this commit fails, the database does not)
     uint64_t ti0 = MW_T0();
-    if (shidx_install(ix, epoch, new_dbsize, n, pgnos, locs) != 0) {                // (nothing was installed: the record is taken out of the log again, so that the log has exactly one record for the epoch that the next commit takes)
+    if (mw_fault_hit(MW_FAULT_INSTALL_ERR) || shidx_install(ix, epoch, new_dbsize, n, pgnos, locs) != 0) {                // (nothing was installed: the record is taken out of the log again, so that the log has exactly one record for the epoch that the next commit takes)
         mw_seglog_discard(db, atomic_load(&sh->pend_seg), atomic_load(&sh->pend_off));
         atomic_store(&sh->sl_seg, atomic_load(&sh->pend_seg)); atomic_store_explicit(&sh->sl_end, atomic_load(&sh->pend_off), memory_order_release);
         atomic_store_explicit(&sh->pend_epoch, 0, memory_order_release);

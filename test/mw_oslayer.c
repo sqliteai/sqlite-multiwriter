@@ -71,6 +71,20 @@ int main (void) {
     rd(f2, 0, 4, buf); CHECK(memcmp(buf, "data", 4) == 0);
     close(f1); close(f2); unlink(a);
 
+    // 4b. a descriptor that is closed while it holds a lock, and the number that is given again to another file (the log is replaced and its old descriptor closed with its lock): the new one has
+    //     to take the lock, not be told that it has it already
+    {
+        int g = open(a, O_RDWR | O_CREAT, 0600); CHECK(g >= 0);
+        CHECK(flock(g, LOCK_EX | LOCK_NB) == 0);
+        close(g);                                                               // (no LOCK_UN)
+        int g2 = open(a, O_RDWR, 0600); CHECK(g2 >= 0);
+        CHECK(flock(g2, LOCK_EX | LOCK_NB) == 0);
+        int h2 = open(a, O_RDWR, 0600); CHECK(h2 >= 0);
+        CHECK(flock(h2, LOCK_EX | LOCK_NB) != 0);                               // g2 holds it
+        CHECK(flock(h2, LOCK_SH | LOCK_NB) != 0);
+        close(h2); close(g2); unlink(a);
+    }
+
     // 5. a shared mapping of a file: what is stored through it is read from the file, and the other way
     fd = open(a, O_RDWR | O_CREAT | O_TRUNC, 0600); CHECK(fd >= 0); CHECK(ftruncate(fd, 65536) == 0);
     char *m = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

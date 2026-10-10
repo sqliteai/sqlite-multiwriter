@@ -528,7 +528,7 @@ void      mw_mp_reap_dead_slots (mw_db *db);          // frees the registry slot
 uint64_t  mw_log_scan_after (mw_db *db, uint64_t epoch, uint64_t end);
 
 // registry
-mw_db  *mw_db_acquire (const char *path, int mode, bool mp);   // mp: several processes (shared mode)   // NULL on OOM or if the file is already open in another mode
+mw_db  *mw_db_acquire (const char *path, int mode, bool mp, int *err);   // mp: several processes (shared mode)   // NULL on OOM or if the file is already open in another mode
 void    mw_db_release (mw_db *db);
 
 // snapshots (multiwriter_tx.c)

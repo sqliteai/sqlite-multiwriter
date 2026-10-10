@@ -30,6 +30,35 @@ int main (void) {
         sqlite3_close(db); db = NULL;
         char p[400]; snprintf(p, sizeof p, "%s-t", path); mw_rmfiles(p);
     }
+    // 0c. mw_mp is read like mw=: a number or a boolean, and a value that is none of them fails the open. "true" used to be read as 0, and the process then ran an engine of its own on a file that the
+    //     others share (rows of its commits were lost at the compaction). A database is open in one mode in a process: the other mode is refused with CANTOPEN (it was reported as out of memory).
+    {
+        char p[300]; snprintf(p, sizeof p, "%s-m", path);
+        char u1[400], u2[400], u3[400], u4[400];
+        snprintf(u1, sizeof u1, "file:%s?vfs=multiwriter&mw_mp=1", p);
+        snprintf(u2, sizeof u2, "file:%s?vfs=multiwriter&mw_mp=true", p);
+        snprintf(u3, sizeof u3, "file:%s?vfs=multiwriter&mw_mp=banana", p);
+        snprintf(u4, sizeof u4, "file:%s?vfs=multiwriter", p);
+        sqlite3 *x = NULL, *y = NULL, *z = NULL;
+        CHECK_RC(sqlite3_open_v2(u1, &x, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL), SQLITE_OK);
+        CHECK_RC(mw_exec(x, "CREATE TABLE t(a); INSERT INTO t VALUES (1)"), SQLITE_OK);
+        CHECK_RC(sqlite3_open_v2(u2, &y, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL), SQLITE_OK);      // the same mode: mw_mp=true is mw_mp=1
+        CHECK(mw_scalar(y, "SELECT count(*) FROM t") == 1);
+        CHECK_RC(sqlite3_open_v2(u3, &z, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL), SQLITE_CANTOPEN); sqlite3_close(z); z = NULL;
+        CHECK_RC(sqlite3_open_v2(u4, &z, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL), SQLITE_CANTOPEN); sqlite3_close(z); z = NULL;   // (threads of one process while it is open for several processes)
+        sqlite3_close(y); sqlite3_close(x); mw_rmfiles(p);
+    }
+    // 0d. PRAGMA auto_vacuum is judged as SQLite reads it: OFF, foo and 3 are NONE; FULL, INCREMENTAL, 1 and 2 are not supported
+    {
+        char p[300]; snprintf(p, sizeof p, "%s-a", path);
+        char u[400]; snprintf(u, sizeof u, "file:%s?vfs=multiwriter", p);
+        sqlite3 *x = NULL;
+        CHECK_RC(sqlite3_open_v2(u, &x, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL), SQLITE_OK);
+        const char *none[] = { "NONE", "0", "OFF", "foo", "3", "-1" }, *notnone[] = { "FULL", "incremental", "1", "2" };
+        for (unsigned i = 0; i < sizeof none / sizeof *none; i++) { char q[80]; snprintf(q, sizeof q, "PRAGMA auto_vacuum = %s", none[i]); CHECK_RC(mw_exec(x, q), SQLITE_OK); }
+        for (unsigned i = 0; i < sizeof notnone / sizeof *notnone; i++) { char q[80]; snprintf(q, sizeof q, "PRAGMA auto_vacuum = %s", notnone[i]); CHECK(mw_exec(x, q) != SQLITE_OK); }
+        sqlite3_close(x); mw_rmfiles(p);
+    }
     // 1. no SQLITE_OPEN_CREATE and no file: it fails, and nothing is created
     CHECK_RC(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL), SQLITE_CANTOPEN); sqlite3_close(db); db = NULL;
     CHECK(access(path, F_OK) != 0);

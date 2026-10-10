@@ -90,6 +90,9 @@ int mw_format_check (const char *what, const char *path, const char magic[8], co
 bool mw_fault_hit (mw_fault_t f) {
     if (!fault_fires(f)) return false;
     if (f >= MW_CRASH_MID_LOG) _exit(9);               // crash point: die right here, no cleanup
+    // MW_FAULT_DELAY_US (tests): the failure comes after a while, as that of a write that is tried again for a full disk (MW_ENOSPC_WAIT_MS) does; the commits behind it are then in the queue
+    static _Atomic int d = MW_KNOB_UNSET; int us = mw_knob_int(&d, "MW_FAULT_DELAY_US", 0);
+    if (us > 0) usleep((useconds_t)us);
     return true;
 }
 
@@ -993,7 +996,7 @@ mw_log_prep *mw_log_rewrite_prepare (mw_db *db, uint64_t base_epoch) {
     if (p->nfd < 0) { p->nfd = -1; mw_log_rewrite_abort(p); return NULL; }
     int rc = flock(p->nfd, LOCK_EX | LOCK_NB) != 0 ? SQLITE_BUSY : SQLITE_OK;
     log_hdr h; memset(&h, 0, sizeof h);
-    memcpy(h.magic, LOG_MAGIC, 8); h.version = MW_FORMAT_VERSION; h.pgsz = (uint32_t)db->store->pgsz; h.base_epoch = base_epoch; h.salt = db->log_salt; h.cksum = hdr_cksum(&h);
+    memcpy(h.magic, LOG_MAGIC, 8); h.version = MW_FORMAT_VERSION; h.features = MW_FORMAT_FEATURES; h.pgsz = (uint32_t)db->store->pgsz; h.base_epoch = base_epoch; h.salt = db->log_salt; h.cksum = hdr_cksum(&h);
     if (rc == SQLITE_OK) rc = pwrite_all(p->nfd, &h, sizeof h, 0);
     if (rc == SQLITE_OK) rc = copy_range(db->logfd, p->nfd, first, bound, LOG_HDR_SIZE);
     if (rc == SQLITE_OK) p->copied_end = bound;

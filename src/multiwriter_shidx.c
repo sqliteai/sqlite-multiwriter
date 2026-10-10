@@ -222,7 +222,9 @@ uint64_t shidx_oldest (shidx *ix) { return atomic_load_explicit(&ix->h->floor, m
 static uint32_t arena_alloc (shidx *ix) {
     hdr *h = ix->h;
     uint32_t e;
-    if (h->free_head) { e = h->free_head; h->free_head = atomic_load_explicit(&ix->arena[e].prev, memory_order_relaxed); h->n_free--; }
+    // (the count first: a holder that dies between the two stores leaves a free entry that is not counted, which only costs room; the other order left the count above what the list holds, and
+    // an install of exactly that many versions took entry 0)
+    if (h->free_head) { e = h->free_head; uint32_t next = atomic_load_explicit(&ix->arena[e].prev, memory_order_relaxed); h->n_free--; h->free_head = next; }
     else if (h->arena_top < h->max_entries) e = ++h->arena_top;
     else return 0;
     h->st_live++;
@@ -260,12 +262,24 @@ int shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint
         if (!hr) { if (hrs != hrs_small) free(hrs); return -2; }
         hrs[i + 1] = hr; __builtin_prefetch((const void *)hr, 1);
     }
+    // (the entries of the whole commit first: a count that is wrong, which a holder that died inside an allocation can leave, must not give entry 0 to a version and publish half a commit)
+    uint32_t es_small[130]; uint32_t *es = (size_t)n + 1 <= 130 ? es_small : malloc(((size_t)n + 1) * sizeof *es);
+    if (!es) { if (hrs != hrs_small) free(hrs); return -2; }
+    for (int i = 0; i <= n; i++) {
+        es[i] = arena_alloc(ix);
+        if (!es[i]) {
+            for (int k = 0; k < i; k++) arena_free(ix, es[k]);
+            if (es != es_small) free(es);
+            if (hrs != hrs_small) free(hrs);
+            return -1;
+        }
+    }
     // (the size record first, then the pages: all with the same epoch, invisible to snapshots until shidx_publish)
     for (int i = -1; i < n; i++) {
         uint32_t pgno = i < 0 ? 0 : pgnos[i];
         uint64_t loc = i < 0 ? dbsize : locs[i];
         _Atomic uint32_t *hr = hrs[i + 1];
-        uint32_t e = arena_alloc(ix);
+        uint32_t e = es[i + 1];
         ver *v = &ix->arena[e];
         uint32_t oldw = atomic_load_explicit(hr, memory_order_relaxed), old = HIDX(oldw);
         atomic_thread_fence(memory_order_release);                              // (a recycled entry: the poison of its previous life is visible before the new fields)
@@ -277,6 +291,7 @@ int shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint
         if (!q) { cand_push(ix, pgno); q = QBIT; }                              // every page with a version waits for GC: a second version, or the base passing the first
         atomic_store_explicit(hr, e | q, memory_order_release);                 // publishes the entry
     }
+    if (es != es_small) free(es);
     if (hrs != hrs_small) free(hrs);
     h->installed = epoch;
     h->st_installs++;
@@ -338,6 +353,9 @@ static uint64_t chain_gc (shidx *ix, uint32_t pgno, uint64_t f, uint64_t base, b
 static uint64_t gc_run (shidx *ix, uint64_t f, uint64_t base);
 uint64_t shidx_gc (shidx *ix, uint64_t base) { return gc_run(ix, compute_floor(ix), base); }
 uint64_t shidx_gc_floor (shidx *ix, uint64_t floor, uint64_t base) { return gc_run(ix, floor, base); }
+
+// Tests: the count of free entries above what the list holds (what a holder that was killed inside an allocation used to leave).
+void shidx_test_overcount_free (shidx *ix) { ix->h->n_free++; }
 
 uint32_t shidx_room (shidx *ix) { return ix->h->n_free + (ix->h->max_entries - ix->h->arena_top); }
 

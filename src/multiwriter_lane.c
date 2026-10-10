@@ -646,6 +646,15 @@ static int lm_unlock (sqlite3_file *pf, int l) {
 }
 static int lm_check_reserved (sqlite3_file *pf, int *out) { *out = 0; return SQLITE_OK; }
 
+// What SQLite makes of the value of PRAGMA auto_vacuum (getAutoVacuum): NONE, FULL, INCREMENTAL, or a number of which only 1 and 2 count: OFF, foo and 3 mean NONE.
+static bool auto_vacuum_is_none (const char *z) {
+    if (!sqlite3_stricmp(z, "none")) return true;
+    if (!sqlite3_stricmp(z, "full") || !sqlite3_stricmp(z, "incremental")) return false;
+    const char *p = z; if (*p == '-' || *p == '+') p++;
+    if (!*p || p[strspn(p, "0123456789")]) return true;                 // (not a number: 0)
+    long v = strtol(z, NULL, 10);
+    return !(v == 1 || v == 2);
+}
 static int pragma_is (const char *name, const char *want) { return name && sqlite3_stricmp(name, want) == 0; }
 
 static int lm_file_control (sqlite3_file *pf, int op, void *arg) {
@@ -678,7 +687,7 @@ static int lm_file_control (sqlite3_file *pf, int op, void *arg) {
             az[0] = sqlite3_mprintf("multiwriter: locking_mode=EXCLUSIVE is not supported");
             return SQLITE_ERROR;
         }
-        if (pragma_is(name, "auto_vacuum") && val && sqlite3_stricmp(val, "none") != 0 && strcmp(val, "0") != 0) {
+        if (pragma_is(name, "auto_vacuum") && val && !auto_vacuum_is_none(val)) {
             az[0] = sqlite3_mprintf("multiwriter: auto_vacuum=%s is not supported (NONE only)", val);
             return SQLITE_ERROR;
         }

@@ -78,6 +78,8 @@ static wchar_t *wide_path (const char *p) {
 #define HANDLE_OF(fd) ((HANDLE)_get_osfhandle(fd))
 
 // ---- open / close ----
+enum { FL_MAXFD = 4096 };
+static unsigned char fl_state[FL_MAXFD];                       // flock emulation: 0 none, 1 shared, 2 exclusive (indexed by descriptor; see mw_win_flock)
 int mw_win_open (const char *path, int flags, ...) {
     if (os_trace < 0) os_trace = getenv("MW_OS_TRACE") != NULL;
     if (os_trace > 0) tr("multiwriter os: open(%s, %#x)\n", path, flags);
@@ -94,6 +96,7 @@ int mw_win_open (const char *path, int flags, ...) {
     }
     int fd = _open_osfhandle((intptr_t)h, _O_BINARY | ((access & GENERIC_WRITE) ? 0 : _O_RDONLY) | ((flags & O_APPEND) ? _O_APPEND : 0));
     if (fd < 0) { CloseHandle(h); errno = EMFILE; return -1; }
+    if (fd < FL_MAXFD) fl_state[fd] = 0;                       // (a descriptor that was closed while it held a lock leaves its state behind, and the number is given again: the new file is not locked)
     return fd;
 }
 
@@ -275,8 +278,6 @@ int mw_win_msync (void *addr, size_t len, int flags) {
 //   P, the presence: every holder keeps it, shared; the exclusive holder keeps it exclusively.
 // exclusive: G exclusive, P exclusive.  shared: G shared (waits while an exclusive holder is converting or initialising), P shared, G released.  exclusive to shared: P exclusive released, P shared taken
 // (G is still ours), G released.  The bytes are far from the data: a lock on them stops no read or write.
-enum { FL_MAXFD = 4096 };
-static unsigned char fl_state[FL_MAXFD];                       // 0 none, 1 shared, 2 exclusive (indexed by descriptor)
 static const LONGLONG FL_G = (LONGLONG)1 << 41, FL_P = ((LONGLONG)1 << 41) + 1;
 
 static BOOL lock_byte (HANDLE h, LONGLONG at, BOOL exclusive, BOOL wait) {

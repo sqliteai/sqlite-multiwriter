@@ -23,14 +23,19 @@ static mw_db *mw_dbs = NULL;                 // protected by the SQLITE_MUTEX_ST
 static void mw_atfork_child (void) { for (mw_db *d = mw_dbs; d; d = d->next) d->orphaned = true; }
 static int mw_atfork_done;
 
-mw_db *mw_db_acquire (const char *path, int mode, bool mp) {
+mw_db *mw_db_acquire (const char *path, int mode, bool mp, int *err) {
+    *err = SQLITE_NOMEM;
     sqlite3_mutex *g = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MAIN);
     sqlite3_mutex_enter(g);
     if (!mw_atfork_done) { pthread_atfork(NULL, NULL, mw_atfork_child); mw_atfork_done = 1; }
     mw_db *db = mw_dbs;
     while (db && (db->orphaned || strcmp(db->path, path) != 0)) db = db->next;
     if (db) {
-        if (db->mode != mode || (mode >= 2 && db->mp_req != mp)) db = NULL;     // one database, one mode (multi-process is a property of the database)
+        if (db->mode != mode || (mode >= 2 && db->mp_req != mp)) {       // one database, one mode (multi-process is a property of the database)
+            sqlite3_log(SQLITE_CANTOPEN, "multiwriter: %s is already open in this process with another mode (mw=%d, mw_mp=%d)", path, db->mode >= 2 ? 1 : 2, db->mp_req ? 1 : 0);
+            *err = SQLITE_CANTOPEN;
+            db = NULL;
+        }
         else db->refs++;
     } else if ((db = sqlite3_malloc(sizeof(*db))) != NULL) {
         memset(db, 0, sizeof(*db));

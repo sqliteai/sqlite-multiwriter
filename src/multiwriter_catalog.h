@@ -24,6 +24,7 @@ typedef struct {
     int nrec;                           // columns stored in a record
     int alias_rec;                      // the record column of the rowid alias (-1: none)
     char **rec_name;                    // the name of the column stored in each record column; NULL for a generated one (derived: not written, not compared)
+    bool *noaff;                        // of each record column: it has no affinity (declared with no type, or BLOB): 1 and 1.0 are different values there, and an equality of values does not tell them apart
     mw_val *dflt;                       // the default of each record column (what a row written before an ALTER TABLE ADD COLUMN has in the columns it lacks); NULL: all NULL
     int nfk; char **fk_parent, **fk_to;  // foreign keys of this table: the parent table, and the parent column (NULL: its primary key)
     bool is_parent;                     // some foreign key refers to this table

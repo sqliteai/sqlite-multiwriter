@@ -418,6 +418,7 @@ static int seg_roll (mw_db *db, mw_seglog *sl, uint32_t cur, uint64_t need, uint
     // (the segment first, then the offset in it: a holder that dies between the two leaves the new segment with the old offset, which the repair of the next holder sees - there is no record at the head of the
     // new segment - and puts right; the other order would have left the old segment with an offset at its head, where the next record would overwrite the first ones)
     atomic_store_explicit(&sh->sl_seg, next, memory_order_release);
+    { static _Atomic int d = MW_KNOB_UNSET; int us = mw_knob_int(&d, "MW_TEST_ROLL_DELAY_US", 0); if (us > 0) usleep((useconds_t)us); }      // (tests: a reader that looks between the two words)
     atomic_store_explicit(&sh->sl_end, MW_SEG_HDR, memory_order_release);
     return SQLITE_OK;
 }
@@ -482,9 +483,13 @@ int mw_seglog_sync (mw_db *db, uint32_t seg, uint64_t end) {
         int32_t exp = 0;
         if (atomic_compare_exchange_strong(&sh->sy_leader, &exp, me)) {
             // The leader: one fsync for every commit written so far, by any process (the processes share one active segment).
-            uint32_t tseg = atomic_load_explicit(&sh->sl_seg, memory_order_acquire);
-            uint64_t tend = atomic_load_explicit(&sh->sl_end, memory_order_acquire);          // (complete records only: the cursor moves after the header)
-            uint64_t tpos = MW_LOG_POS(tseg, tend);
+            // How far the log is complete: log_pos, one word with the segment and the end together, stored after the record is installed (sl_seg and sl_end are two words, and a roll to the next segment
+            // moves them one after the other; sl_end moves at the append, and goes back when the install fails: a leader that took it there would have declared durable a record that is taken out again,
+            // and the commit that takes its place in the file would be acknowledged without a sync).
+            { static _Atomic int d = MW_KNOB_UNSET; int us = mw_knob_int(&d, "MW_TEST_SYNC_DELAY_US", 0); if (us > 0) usleep((useconds_t)us); }     // (tests: the leader takes its look late)
+            uint64_t tpos = atomic_load_explicit(&sh->log_pos, memory_order_acquire);
+            uint32_t tseg = (uint32_t)MW_LOG_GEN(tpos);
+            uint64_t tend = MW_LOG_END(tpos);
             if (tpos < target) { tseg = seg; tend = end; tpos = target; }
             int frc = 0;
             if (atomic_load_explicit(&sh->sy_done, memory_order_acquire) >= target) frc = 0;     // (somebody finished while we were taking over)
@@ -645,7 +650,11 @@ void mw_seglog_trim (mw_db *db, uint64_t base) {
         // the new oldest segment's header must carry the base before the old one goes (recovery reads it from there)
         char path[620]; seg_path(sl, mn + 1, path, sizeof path);
         int fd = open(path, O_RDWR);
-        if (fd >= 0) { write_hdr(sl, fd, base); mw_io_fsync(fd); close(fd); }
+        if (fd < 0) break;                                                    // (the older segment stays: it is not an error to keep a segment, it is one to lose what is in it)
+        int hrc = write_hdr(sl, fd, base);
+        if (hrc == 0) hrc = mw_io_fsync(fd);
+        close(fd);
+        if (hrc != 0) break;                                                  // (the header of the next segment does not carry the base: the log must go on from the older one)
         seg_path(sl, mn, path, sizeof path);
         unlink(path);
         mn++;

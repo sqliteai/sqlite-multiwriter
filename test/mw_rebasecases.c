@@ -4,6 +4,7 @@
 //   3. a field of the header of the file that the application sets (PRAGMA user_version) was dropped by the replay, which has the row changes only, and the commit was reported as done.
 #include "mw_test.h"
 #include "multiwriter.h"
+#include "multiwriter_internal.h"
 
 static int is_busy (int rc) { return (rc & 0xff) == SQLITE_BUSY; }
 static sqlite3 *open_uri (const char *uri) {
@@ -91,6 +92,107 @@ int main (void) {
     mw_exec(a, "ROLLBACK");
     CHECK_RC(mw_exec(a, upd), SQLITE_OK);                                   // (the retry sees both rows)
     CHECK(mw_scalar(a, "SELECT n FROM t WHERE id = 4") == 1 && mw_scalar(a, "SELECT n FROM t WHERE id = 1") == 2);
+    sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+
+    // 5. the helper that replays a commit has the synchronous level of the connection (OFF was never applied: the level that it was given at the start, 0, was taken for "set already")
+    for (int level = 0; level <= 2; level++) {
+        two("rc5", path, uri, sizeof uri, &a, &b);
+        CHECK_RC(mw_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER); INSERT INTO t VALUES (1,0),(2,0)"), SQLITE_OK);
+        char q[40]; snprintf(q, sizeof q, "PRAGMA synchronous = %d", level);
+        CHECK_RC(mw_exec(a, q), SQLITE_OK); CHECK_RC(mw_exec(b, q), SQLITE_OK);
+        CHECK_RC(mw_exec(a, "BEGIN"), SQLITE_OK); CHECK_RC(mw_exec(b, "BEGIN"), SQLITE_OK);
+        CHECK_RC(mw_exec(a, "UPDATE t SET n = n + 1 WHERE id = 1"), SQLITE_OK); CHECK_RC(mw_exec(b, "UPDATE t SET n = n + 1 WHERE id = 2"), SQLITE_OK);
+        CHECK_RC(mw_exec(b, "COMMIT"), SQLITE_OK);
+        CHECK_RC(mw_exec(a, "COMMIT"), SQLITE_OK);                          // rebased
+        void *lp = NULL; CHECK_RC(sqlite3_file_control(a, "main", MW_FCNTL_LANE_PTR, &lp), SQLITE_OK);
+        mw_lane *lane = lp;
+        int64_t got = lane && lane->rb_db ? mw_scalar(lane->rb_db, "PRAGMA synchronous") : -1;
+        printf("5. synchronous=%d: helper has %lld\n", level, (long long)got);
+        CHECK(got == level);
+        sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+    }
+    // 6. INTEGER PRIMARY KEY DESC is not the alias of the rowid: x is a column of the record (it was taken for the rowid, and stored as NULL by the replay, with the UNIQUE conflict lost)
+    two("rc6", path, uri, sizeof uri, &a, &b);
+    CHECK_RC(mw_exec(a, "CREATE TABLE t(x INTEGER PRIMARY KEY DESC, a, b DEFAULT 'd'); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<30) INSERT INTO t(x, a) SELECT i*10, i FROM n"), SQLITE_OK);
+    CHECK_RC(mw_exec(a, "BEGIN"), SQLITE_OK); CHECK_RC(mw_exec(b, "BEGIN"), SQLITE_OK);
+    CHECK_RC(mw_exec(a, "INSERT INTO t(rowid, x, a) VALUES (101, 1001, 1)"), SQLITE_OK); CHECK_RC(mw_exec(b, "INSERT INTO t(rowid, x, a) VALUES (102, 1002, 2)"), SQLITE_OK);
+    CHECK_RC(mw_exec(b, "COMMIT"), SQLITE_OK);
+    int r6 = mw_exec(a, "COMMIT");
+    printf("6. DESC key, two inserts: rc=%d, x of the row of A = %lld\n", r6, (long long)mw_scalar(a, "SELECT x FROM t WHERE rowid = 101"));
+    if (r6 != SQLITE_OK) CHECK_RC(mw_exec(a, "INSERT INTO t(rowid, x, a) VALUES (101, 1001, 1)"), SQLITE_OK);
+    CHECK(mw_scalar(a, "SELECT count(*) FROM t WHERE rowid = 101 AND x = 1001 AND a = 1") == 1);
+    CHECK(mw_scalar(a, "SELECT count(*) FROM t WHERE x IS NULL") == 0);
+    sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+    two("rc6u", path, uri, sizeof uri, &a, &b);
+    CHECK_RC(mw_exec(a, "CREATE TABLE t(x INTEGER PRIMARY KEY DESC, a); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<30) INSERT INTO t(x, a) SELECT i*10, i FROM n"), SQLITE_OK);
+    CHECK_RC(mw_exec(a, "BEGIN"), SQLITE_OK); CHECK_RC(mw_exec(b, "BEGIN"), SQLITE_OK);
+    CHECK_RC(mw_exec(a, "INSERT INTO t(rowid, x, a) VALUES (101, 1001, 1)"), SQLITE_OK); CHECK_RC(mw_exec(b, "INSERT INTO t(rowid, x, a) VALUES (102, 1001, 2)"), SQLITE_OK);
+    CHECK_RC(mw_exec(b, "COMMIT"), SQLITE_OK);
+    r6 = mw_exec(a, "COMMIT");
+    CHECK(r6 != SQLITE_OK);                                                  // the same x: a conflict, never a row with x NULL
+    mw_exec(a, "ROLLBACK");
+    CHECK((mw_exec(a, "INSERT INTO t(rowid, x, a) VALUES (101, 1001, 1)") & 0xff) == SQLITE_CONSTRAINT);
+    sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+
+    // 7. a column with no affinity: 1 and 1.0 are IS-equal and are not the same value (B changes 1 into 1.0, A divides it by two as it saw it)
+    two("rc7", path, uri, sizeof uri, &a, &b);
+    CHECK_RC(mw_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, a, c); INSERT INTO t VALUES (1, NULL, 1), (2, NULL, 2)"), SQLITE_OK);
+    CHECK_RC(mw_exec(a, "BEGIN"), SQLITE_OK); CHECK_RC(mw_exec(b, "BEGIN"), SQLITE_OK);
+    CHECK_RC(mw_exec(a, "UPDATE t SET a = c / 2 WHERE id = 1"), SQLITE_OK); CHECK_RC(mw_exec(b, "UPDATE t SET c = 1.0 WHERE id = 1"), SQLITE_OK);
+    CHECK_RC(mw_exec(b, "COMMIT"), SQLITE_OK);
+    int r7 = mw_exec(a, "COMMIT");
+    printf("7. 1 against 1.0: rc=%d\n", r7);
+    CHECK(is_busy(r7));                                                     // the row is not the one that A saw
+    mw_exec(a, "ROLLBACK");
+    CHECK_RC(mw_exec(a, "UPDATE t SET a = c / 2 WHERE id = 1"), SQLITE_OK);
+    CHECK(mw_scalar(a, "SELECT a * 10 FROM t WHERE id = 1") == 5);          // 0.5, as in the serial order
+    sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+
+    // 8. WITHOUT ROWID is what SQLite says it is, not what the text of the CREATE TABLE contains
+    for (int k = 0; k < 3; k++) {
+        const char *ddl[] = {
+            "CREATE TABLE w(a, b TEXT DEFAULT 'WITHOUT ROWID', c, PRIMARY KEY(b, a))",        // a rowid table that says so in a default
+            "CREATE TABLE w(a, b, c, PRIMARY KEY(b, a)) WITHOUT  ROWID",                       // a real one, with two blanks
+            "CREATE TABLE w(a, b, c, PRIMARY KEY(b, a)) WITHOUT /* c */ ROWID",               // and a comment in it
+        };
+        two("rc8", path, uri, sizeof uri, &a, &b);
+        char q[400]; snprintf(q, sizeof q, "%s; INSERT INTO w(a, b, c) VALUES (1, 'x', 'c1'), (2, 'y', 'c2'), (3, 'z', 'c3')", ddl[k]);
+        CHECK_RC(mw_exec(a, q), SQLITE_OK);
+        CHECK_RC(mw_exec(a, "BEGIN"), SQLITE_OK); CHECK_RC(mw_exec(b, "BEGIN"), SQLITE_OK);
+        // (a rowid table gets explicit rowids: two inserts that take the next one are a true conflict)
+        CHECK_RC(mw_exec(a, k == 0 ? "INSERT INTO w(rowid, a, b, c) VALUES (110, 10, 'p', 'A')" : "INSERT INTO w(a, b, c) VALUES (10, 'p', 'A')"), SQLITE_OK);
+        CHECK_RC(mw_exec(b, k == 0 ? "INSERT INTO w(rowid, a, b, c) VALUES (120, 20, 'q', 'B')" : "INSERT INTO w(a, b, c) VALUES (20, 'q', 'B')"), SQLITE_OK);
+        CHECK_RC(mw_exec(b, "COMMIT"), SQLITE_OK);
+        int r8 = mw_exec(a, "COMMIT");
+        mw_db_stats st; memset(&st, 0, sizeof st); sqlite3_file_control(a, "main", MW_FCNTL_DBSTATS, &st);
+        printf("8. table %d: commit rc=%d, rebases %llu\n", k, r8, (unsigned long long)st.rebases);
+        CHECK_RC(r8, SQLITE_OK);
+        CHECK(st.rebases >= 1);                                             // replayed (it was refused when the text was misread)
+        CHECK(mw_scalar(a, "SELECT count(*) FROM w") == 5 && mw_scalar(a, "SELECT count(*) FROM w WHERE (a=10 AND b='p' AND c='A') OR (a=20 AND b='q' AND c='B')") == 2);
+        sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+    }
+
+    // 9. pages with reserved bytes (a checksum or an encryption extension): the cells that the decoder reads would not end where SQLite's do; the rebase is not used, whatever the size of the row
+    mw_tmpdb(path, 256, "rc9");
+    {
+        sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
+        int rsv = 32; CHECK_RC(sqlite3_file_control(s, "main", SQLITE_FCNTL_RESERVE_BYTES, &rsv), SQLITE_OK);
+        CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL"), SQLITE_OK);
+        CHECK_RC(mw_exec(s, "CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB); INSERT INTO t VALUES (1, zeroblob(10)), (2, zeroblob(10)), (3, zeroblob(10))"), SQLITE_OK);
+        CHECK_RC(mw_exec(s, "VACUUM"), SQLITE_OK);
+        CHECK_RC(mw_exec(s, "PRAGMA wal_checkpoint(TRUNCATE)"), SQLITE_OK);
+        sqlite3_close(s);
+    }
+    snprintf(uri, sizeof uri, "file:%s?vfs=multiwriter&mw_rebase=1&mw_rebase_backoff=0", path);
+    a = open_uri(uri); b = open_uri(uri);
+    CHECK_RC(mw_exec(a, "BEGIN"), SQLITE_OK); CHECK_RC(mw_exec(b, "BEGIN"), SQLITE_OK);
+    CHECK_RC(mw_exec(a, "UPDATE t SET b = zeroblob(10) || x'01' WHERE id = 1"), SQLITE_OK); CHECK_RC(mw_exec(b, "UPDATE t SET b = zeroblob(10) || x'02' WHERE id = 2"), SQLITE_OK);
+    CHECK_RC(mw_exec(b, "COMMIT"), SQLITE_OK);
+    int r9 = mw_exec(a, "COMMIT");
+    mw_db_stats st9; memset(&st9, 0, sizeof st9); sqlite3_file_control(a, "main", MW_FCNTL_DBSTATS, &st9);
+    printf("9. reserved bytes: commit rc=%d, rebases %llu\n", r9, (unsigned long long)st9.rebases);
+    CHECK(is_busy(r9));
+    CHECK(st9.rebases == 0);
     sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
     MW_DONE();
 }

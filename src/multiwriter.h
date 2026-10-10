@@ -109,6 +109,7 @@ typedef struct { int ending; int autocommit; sqlite3_stmt *stmt; } mw_stmt_note;
 typedef enum {
     MW_FAULT_NONE = 0,
     MW_FAULT_LOG_WRITE_ERR, MW_FAULT_LOG_SYNC_ERR, MW_FAULT_ALLOC_ERR,
+    MW_FAULT_INSTALL_ERR,       // shared mode: the install of the versions in the index fails (the record is taken out of the log again)
     MW_CRASH_MID_LOG,           // half of the commit record written (torn tail)
     MW_CRASH_BEFORE_LOG,        // validated + installed, nothing written yet (crash "during prepare")
     MW_CRASH_AFTER_LOG,         // record durable, transaction not yet visible (crash "after durable write, before publish")

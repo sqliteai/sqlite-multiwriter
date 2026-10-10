@@ -245,14 +245,24 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
     f->base.pMethods = mw_pass_methods(f->real);
 
     if (mode >= 1) {
-        bool mpmode = mode >= 2 && sqlite3_uri_int64(name, "mw_mp", 0) != 0;      // (only the engine has the shared header and the segmented log: the tracking mode, mw=2, is one process)      // 0 one process (threads); anything else: several processes (the shared mode: one index of versions and one segmented log, mapped by all of them)
-        mw_db *db = mw_db_acquire(name, mode, mpmode);
+        // mw_mp: 0/1 and true/on/yes, false/off/no, as mw= (a value that is none of them fails the open: "true" read as 0 made the process run its own engine on a file that others share)
+        bool mpmode = false;
+        if (mode >= 2) {
+            const char *mv = sqlite3_uri_parameter(name, "mw_mp");
+            if (mv) {
+                if (!strcmp(mv, "0") || !sqlite3_stricmp(mv, "false") || !sqlite3_stricmp(mv, "off") || !sqlite3_stricmp(mv, "no")) mpmode = false;
+                else if (!sqlite3_stricmp(mv, "true") || !sqlite3_stricmp(mv, "on") || !sqlite3_stricmp(mv, "yes") || (*mv && !mv[strspn(mv, "0123456789")])) mpmode = true;   // (any number but 0)
+                else { sqlite3_log(SQLITE_CANTOPEN, "multiwriter: mw_mp=%s is not a number or a boolean", mv); f->real->pMethods->xClose(f->real); f->base.pMethods = NULL; return SQLITE_CANTOPEN; }
+            }
+        }   // (only the engine has the shared header and the segmented log: the tracking mode, mw=2, is one process)
+        int aerr = SQLITE_NOMEM;
+        mw_db *db = mw_db_acquire(name, mode, mpmode, &aerr);
         mw_lane *lane = db ? sqlite3_malloc(sizeof(mw_lane)) : NULL;
         if (!lane) {
             mw_db_release(db);
             f->real->pMethods->xClose(f->real);
             f->base.pMethods = NULL;
-            return SQLITE_NOMEM;
+            return db ? SQLITE_NOMEM : aerr;
         }
         mw_lane_init(lane, db);
         if (sqlite3_uri_parameter(name, "mw_fullfsync") ? sqlite3_uri_boolean(name, "mw_fullfsync", 0) : (getenv("MW_FULLFSYNC") != NULL)) mw_set_fullfsync(1);

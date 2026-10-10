@@ -178,6 +178,7 @@ static int tstmt_prepare (sqlite3 *h, const mw_tab *t, tstmt *s) {
         char *a = sqlite3_mprintf("%s,\"%w\"", cols, t->rec_name[i]); sqlite3_free(cols); cols = a;
         a = sqlite3_mprintf("%s,?%d", marks, k); sqlite3_free(marks); marks = a;
         if (t->without_rowid && i < t->npk_rec) a = sqlite3_mprintf("%s AND \"%w\"=?%d", conds, t->rec_name[i], k);
+        else if (t->noaff && t->noaff[i]) a = sqlite3_mprintf("%s AND \"%w\" COLLATE BINARY IS ?%d AND typeof(\"%w\") = typeof(?%d)", conds, t->rec_name[i], k, t->rec_name[i], k);     // (no affinity: 1 and 1.0 are IS-equal, and are different values)
         else a = sqlite3_mprintf("%s AND \"%w\" COLLATE BINARY IS ?%d", conds, t->rec_name[i], k);
         sqlite3_free(conds); conds = a;
     }
@@ -369,7 +370,11 @@ static void run_batch (mw_lane *L, rb_req **b, int n) {
     mw_db *db = L->db; rb_state *R = L->rb_state;
     uint64_t t0 = now_ns();
     if (helper_open(L) != SQLITE_OK) { for (int i = 0; i < n; i++) b[i]->state = 2; return; }
-    if (R->sync != L->sync_level) { char q[40]; snprintf(q, sizeof q, "PRAGMA synchronous=%d", L->sync_level); sqlite3_exec(L->rb_db, q, NULL, NULL, NULL); R->sync = L->sync_level; }
+    // The helper commits the whole batch: at the strongest level that any of its connections asked for (a connection with synchronous=FULL must not get a commit that is not durable because the
+    // leader of the batch has OFF).
+    int lvl = L->sync_level;
+    for (int i = 0; i < n; i++) if (b[i]->lane->sync_level > lvl) lvl = b[i]->lane->sync_level;
+    if (R->sync != lvl) { char q[40]; snprintf(q, sizeof q, "PRAGMA synchronous=%d", lvl); sqlite3_exec(L->rb_db, q, NULL, NULL, NULL); R->sync = lvl; }
     mw_lane *hl = NULL; { void *lp = NULL; if (sqlite3_file_control(L->rb_db, "main", MW_FCNTL_LANE_PTR, &lp) == SQLITE_OK) hl = lp; }
     if (db->mp) mw_mp_rebase_lock(db);                                          // (one batch at a time in all the processes)
     int attempt = 0; bool closed = false;
@@ -394,7 +399,7 @@ static void run_batch (mw_lane *L, rb_req **b, int n) {
 int mw_lane_rebase (mw_lane *lane, const uint8_t *const *imgs, uint32_t cookie, uint64_t *out_epoch) {
     mw_db *db = lane->db;
     rb_state *R = lane->rb_state;
-    if (!R) { R = calloc(1, sizeof *R); if (!R) return MW_CONFLICT; lane->rb_state = R; }
+    if (!R) { R = calloc(1, sizeof *R); if (!R) return MW_CONFLICT; R->sync = -1; lane->rb_state = R; }     // (-1: the helper's level was not set yet; 0 is a level, synchronous=OFF)
     if (!R->cat || R->cat->cookie != cookie) { state_reset_stmts(R); mw_cat_free(R->cat); R->cat = mw_cat_build(lane); if (R->cat) { R->ts = calloc((size_t)(R->cat->n ? R->cat->n : 1), sizeof *R->ts); R->nts = R->cat->n; } }
     if (!R->cat || !R->ts || !R->cat->rebasable || R->cat->cookie != cookie) { atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }
     mw_rd_result res;

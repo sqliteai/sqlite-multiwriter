@@ -88,7 +88,7 @@ static bool starts_ci (const char *s, const char *p) { while (*s == ' ' || *s ==
 
 static void tab_free (mw_tab *t) {
     free(t->name); for (int i = 0; i < t->nrec; i++) { free(t->rec_name[i]); if (t->dflt) free(t->dflt[i].p); }
-    free(t->rec_name); free(t->dflt);
+    free(t->rec_name); free(t->dflt); free(t->noaff);
     for (int i = 0; i < t->nfk; i++) { free(t->fk_parent[i]); free(t->fk_to[i]); }
     free(t->fk_parent); free(t->fk_to);
     for (int i = 0; i < t->npk; i++) free(t->pk_name[i]);
@@ -111,14 +111,32 @@ static void eval_default (sqlite3 *scratch, const char *expr, mw_val *v) {
     sqlite3_finalize(st); sqlite3_free(q);
 }
 
+// The affinity that SQLite gives a declared type (the rules of its documentation, in order): true for BLOB (none): an empty type, or one with BLOB and none of the words of the earlier rules.
+static bool type_has_no_affinity (const char *t) {
+    if (!t || !*t) return true;
+    if (strcasestr(t, "INT") || strcasestr(t, "CHAR") || strcasestr(t, "CLOB") || strcasestr(t, "TEXT")) return false;
+    return strcasestr(t, "BLOB") != NULL;
+}
+
 // understand one table with SQLite's help
 static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
     memset(t, 0, sizeof *t); t->root = r->root; t->name = strdup(r->name); t->alias_rec = -1;
     if (!r->sql || !starts_ci(r->sql, "CREATE TABLE") || starts_ci(r->sql, "CREATE VIRTUAL")) return;
     if (strncasecmp(r->name, "sqlite_", 7) == 0) return;
-    t->without_rowid = strcasestr(r->sql, "WITHOUT ROWID") != NULL;                                       // (a table named so would fool this; the scratch database rejects the statement then)
+    t->without_rowid = strcasestr(r->sql, "WITHOUT ROWID") != NULL;                                       // (the text: a default or a comment that says so fools it, and so does a second blank; below, SQLite says it)
     char *err = NULL;
     if (sqlite3_exec(scratch, r->sql, NULL, NULL, &err) != SQLITE_OK) { sqlite3_free(err); return; }
+    {   // SQLite 3.37 and later: PRAGMA table_list has a column wr
+        char *wq = sqlite3_mprintf("PRAGMA table_list(\"%w\")", r->name); sqlite3_stmt *ws = NULL;
+        if (wq && sqlite3_prepare_v2(scratch, wq, -1, &ws, NULL) == SQLITE_OK) {
+            int wrcol = -1; for (int i = 0; i < sqlite3_column_count(ws); i++) if (!strcmp(sqlite3_column_name(ws, i), "wr")) wrcol = i;
+            if (wrcol >= 0) while (sqlite3_step(ws) == SQLITE_ROW) {
+                const char *nm = (const char *)sqlite3_column_text(ws, 1);
+                if (nm && !strcasecmp(nm, r->name)) { t->without_rowid = sqlite3_column_int(ws, wrcol) != 0; break; }
+            }
+        }
+        sqlite3_finalize(ws); sqlite3_free(wq);
+    }
     char *q = sqlite3_mprintf("PRAGMA table_xinfo(\"%w\")", r->name); sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(scratch, q, -1, &st, NULL) != SQLITE_OK) { sqlite3_free(q); return; }
     sqlite3_free(q);
@@ -131,7 +149,15 @@ static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
     sqlite3_finalize(st);
     int npk = 0; for (int i = 0; i < nc; i++) if (cols[i].pk > 0) npk++;
     if (!t->without_rowid && npk == 1) for (int i = 0; i < nc; i++) if (cols[i].pk == 1 && strcasecmp(cols[i].type, "INTEGER") == 0) t->alias_pk = true;
+    if (t->alias_pk) {
+        // `x INTEGER PRIMARY KEY DESC` is not an alias of the rowid: SQLite makes an index for the key (origin "pk"), and x is a column like the others, stored in the record
+        char *iq = sqlite3_mprintf("PRAGMA index_list(\"%w\")", r->name); sqlite3_stmt *is = NULL;
+        if (iq && sqlite3_prepare_v2(scratch, iq, -1, &is, NULL) == SQLITE_OK)
+            while (sqlite3_step(is) == SQLITE_ROW) { const char *org = (const char *)sqlite3_column_text(is, 3); if (org && !strcmp(org, "pk")) t->alias_pk = false; }
+        sqlite3_finalize(is); sqlite3_free(iq);
+    }
     t->rec_name = calloc((size_t)(nc ? nc : 1), sizeof(char *));
+    t->noaff = calloc((size_t)(nc ? nc : 1), sizeof(bool));
     // the order of the columns in the record: the declaration order; in a WITHOUT ROWID table the primary key columns come first (in the order of the key), then the others
     int order[2048], no = 0;
     if (t->without_rowid) {
@@ -156,6 +182,7 @@ static void tab_parse (sqlite3 *scratch, const srow *r, mw_tab *t) {
         int i = order[j];
         if (cols[i].hidden == 2) continue;                                                                   // (generated, virtual: not stored)
         if (t->alias_pk && cols[i].pk == 1) t->alias_rec = pos;
+        if (t->noaff) t->noaff[pos] = type_has_no_affinity(cols[i].type);
         t->rec_name[pos++] = (cols[i].hidden == 3) ? NULL : strdup(cols[i].name);                            // (generated, stored: in the record, derived)
     }
     t->nrec = pos;
@@ -214,7 +241,7 @@ static void fk_graph (mw_cat *c) {
 mw_cat *mw_cat_build (mw_lane *lane) {
     uint32_t pgsz = (uint32_t)lane->db->store->pgsz; srows rows = {0};
     mw_cat *c = calloc(1, sizeof *c); if (!c) return NULL; atomic_init(&c->refs, 1); c->rebasable = true;
-    uint8_t *p1 = malloc(pgsz); if (p1 && mw_rd_snap_page(lane, 1, p1)) { c->cookie = be32(p1 + 40); if (be32(p1 + 56) != 1) { c->rebasable = false; c->why = "the text encoding is not UTF-8"; } } free(p1);
+    uint8_t *p1 = malloc(pgsz); if (p1 && mw_rd_snap_page(lane, 1, p1)) { c->cookie = be32(p1 + 40); if (be32(p1 + 56) != 1) { c->rebasable = false; c->why = "the text encoding is not UTF-8"; } else if (p1[20] != 0) { c->rebasable = false; c->why = "the pages have reserved bytes (a checksum or an encryption extension): the cells of the decoder would not end where SQLite's do"; } } free(p1);
     schema_collect(lane, 1, pgsz, &rows, 0);
     sqlite3 *scratch = NULL; sqlite3_open_v2(":memory:", &scratch, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
     c->tabs = calloc((size_t)(rows.n ? rows.n : 1), sizeof *c->tabs);

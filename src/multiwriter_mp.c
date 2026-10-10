@@ -81,9 +81,22 @@ static void mp_drop_own_stale (mw_db *db) {
             atomic_store(&sh->slots[i].snap, MW_MP_NONE); atomic_store(&sh->slots[i].minres, 0); atomic_store(&sh->slots[i].writing, 0); atomic_store(&sh->slots[i].pid, 0);
         }
     }
-    int32_t o = me; if (atomic_compare_exchange_strong(&sh->pub_owner, &o, 0)) db->mp_stale_owner = true;       // (it may have died inside a publication: the repair runs when the database is open)
+    // The publication lock is not freed here: it may have died inside a publication, and the lock free would let any committer in with a record pending (it takes the epoch of the one that is
+    // there, and appends a second record for it). It is left held by nobody that is alive (-2: no process has that pid), so that the first to lock it steals it and repairs.
+    int32_t o = me; if (atomic_compare_exchange_strong(&sh->pub_owner, &o, -2)) db->mp_stale_owner = true;       // (the repair also runs when the database is open)
     int32_t d = me; atomic_compare_exchange_strong(&sh->ddl_pid, &d, 0);
-    for (int i = 0; i < 1024; i++) { int32_t t = me; atomic_compare_exchange_strong(&sh->pub_tk_pid[i], &t, 0); }
+    for (int i = 0; i < 1024; i++) {
+        int32_t t = me; atomic_compare_exchange_strong(&sh->pub_tk_pid[i], &t, 0);
+        t = me; atomic_compare_exchange_strong(&sh->adm_tk_pid[i], &t, 0);
+    }
+    for (int i = 0; i < 64; i++) { int32_t t = me; atomic_compare_exchange_strong(&sh->adm_slot_pid[i], &t, 0); }
+    for (int i = 0; i < 256; i++) { int32_t t = me; atomic_compare_exchange_strong(&sh->hot_tk_pid[i], &t, 0); }
+    // The ones that every commit waits for: the leader of the group sync, the process that fills the next segment, the turn of the long transactions, the claim of the compaction. A process
+    // that is "alive" here (this one) is waited for by all and reaped by none: the database was hung until it ended.
+    { int32_t t = me; atomic_compare_exchange_strong(&sh->sy_leader, &t, 0); }
+    { int32_t t = me; atomic_compare_exchange_strong(&sh->log_fill_pid, &t, 0); }
+    { int32_t t = me; if (atomic_compare_exchange_strong(&sh->hot_owner, &t, 0)) atomic_store(&sh->hot_held, 0); }
+    { int32_t t = me; atomic_compare_exchange_strong(&sh->compact_req_pid, &t, 0); }
 }
 
 int mw_mp_open (mw_db *db) {

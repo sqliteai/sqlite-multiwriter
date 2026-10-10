@@ -350,8 +350,10 @@ struct mw_db {
     struct mw_seglog *sl;                  // the segmented log (shared mode)
     shidx            *ix;                  // the shared version index (shared mode)
     bool              mp_stale_owner;      // the header said that the publication lock was held by our own pid when we registered: a process that died with it (repaired once the database is open)
+    int               open_rc;             // the first open of the database in this process failed with this result and other connections still hold the struct: they get it too (see mw_lane_open_main)
     bool              mp_first;            // this process initialised the shared state
     bool              orphaned;            // inherited through fork(): the child must not use (or tear down) the parent's state; it opens its own
+    bool              closing;             // the last connection is gone and the state is being taken down (outside the registry's mutex): an opener of the same path waits until it is out
     int               mp_lockfd, mp_pubfd, mp_proc;   // mp_lockfd: flock membership + shared header; mp_pubfd: fcntl byte locks only (BSD mixes the two kinds)
     char             *mp_path, *mp_pubpath;
     mw_shm           *shm;
@@ -401,7 +403,7 @@ void mw_lane_free (mw_lane *lane);
 mw_store *mw_store_create (int pgsz, uint32_t base_dbsize);
 void      mw_store_free (mw_store *st);
 // Copies bytes [poff, poff+n) of the newest version of `pgno` with epoch <= snap. 0 if none.
-int       mw_store_read (mw_store *st, uint32_t pgno, uint64_t snap, uint32_t poff, uint32_t n, void *dst);
+int       mw_store_read (mw_store *st, uint32_t pgno, uint64_t snap, uint32_t poff, uint32_t n, void *dst);   // 1 read, 0 no version (the real file's page), -1 could not be read
 uint32_t  mw_store_dbsize (mw_store *st, uint64_t snap);          // pages, as of snap
 void      mw_store_cache_base (mw_store *st, uint32_t pgno, const void *image);   // real-file page -> epoch-0 version (bounded)
 mw_chain *mw_store_chain (mw_store *st, uint32_t pgno);            // (compaction) existing chain; caller locks the stripe

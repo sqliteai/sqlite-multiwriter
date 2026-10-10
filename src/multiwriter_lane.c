@@ -89,7 +89,9 @@ static int ws_add (mw_lane *lane, uint32_t pgno, int frame) {
 static uint32_t lane_schema_cookie (mw_lane *lane) {
     uint8_t c[4] = {0};
     mw_store *st = lane->db->store;
-    if (!mw_store_read(st, 1, lane->tx.snapshot_epoch, 40, 4, c)) {
+    int rr = mw_store_read(st, 1, lane->tx.snapshot_epoch, 40, 4, c);
+    if (rr < 0) { memset(c, 0xFF, 4); }                                       // (could not be read: a cookie that no snapshot has: the commit is refused, and run again)
+    else if (rr == 0) {
         mw_file *f = lane->file;
         f->real->pMethods->xRead(f->real, c, 4, 40);
     }
@@ -254,7 +256,9 @@ static bool lane_can_rebase (mw_lane *lane, const uint8_t *pg1, uint32_t snapsho
         // incremental vacuum, application_id: bytes 44..71) would be lost, and the commit reported as done.
         uint8_t h[28] = {0};
         mw_store *st = lane->db->store;
-        if (!mw_store_read(st, 1, lane->tx.snapshot_epoch, 44, 28, h)) { mw_file *f = lane->file; if (f->real->pMethods->xRead(f->real, h, 28, 44) != SQLITE_OK) return false; }
+        int hr = mw_store_read(st, 1, lane->tx.snapshot_epoch, 44, 28, h);
+        if (hr < 0) return false;
+        if (hr == 0) { mw_file *f = lane->file; if (f->real->pMethods->xRead(f->real, h, 28, 44) != SQLITE_OK) return false; }
         if (memcmp(h, pg1 + 44, 28) != 0) return false;
     }
     return true;
@@ -601,7 +605,9 @@ static int lm_read (sqlite3_file *pf, void *buf, int n, sqlite3_int64 off) {
         uint32_t take = (uint32_t)st->pgsz - poff;
         if ((int)take > remaining) take = (uint32_t)remaining;
         if (lane->readcheck && lane->snapshot_held && pgno != 1) rs_mark(lane, pgno);
-        if (!mw_store_read(st, pgno, snap, poff, take, dst)) {
+        int sr = mw_store_read(st, pgno, snap, poff, take, dst);
+        if (sr < 0) return SQLITE_IOERR_READ;
+        if (sr == 0) {
             int rc = mw_io_hit(MW_IO_READ, NULL) ? SQLITE_IOERR_READ : pass_io->xRead(pf, dst, (int)take, o);
             if (rc == SQLITE_OK && poff == 0 && take == (uint32_t)st->pgsz) mw_store_cache_base(st, pgno, dst);
             if (rc != SQLITE_OK) {
@@ -790,7 +796,12 @@ int mw_lane_open_main (mw_file *f, mw_lane *lane) {
     if (pgsz < 512 || (pgsz & (pgsz - 1))) return SQLITE_NOTADB;
 
     sqlite3_mutex_enter(db->mu);
-    if (!db->store) {
+    if (!db->store && db->open_rc) {
+        // The first open failed (a damaged log, a lock held elsewhere) while others had joined it: the state that it left (the descriptor of the log with its lock, the header, the segments) is
+        // taken down when the last of them lets go. To run the opening again on top of it leaked the descriptor and its lock for the life of the process, and every later open of the database
+        // was refused as busy, whatever was wrong. They all get the result of the first.
+        rc = db->open_rc;
+    } else if (!db->store) {
         db->store = db->mp_req ? mw_store_create_light(pgsz, (uint32_t)(size / pgsz)) : mw_store_create(pgsz, (uint32_t)(size / pgsz));
         if (db->store && db->base_cache_bytes) db->store->base_limit = db->base_cache_bytes;
         if (!db->store) rc = SQLITE_NOMEM;
@@ -800,7 +811,7 @@ int mw_lane_open_main (mw_file *f, mw_lane *lane) {
             if (rc == SQLITE_OK) rc = db->mp_req ? mw_shared_open(db) : mw_log_open(db, pgsz);    // create the commit log or recover committed state from it
             if (rc == SQLITE_OK && db->mp) rc = mw_mp_finish_open(db);
             if (rc == SQLITE_OK && db->mp_req) rc = mw_shared_open_finish(db);
-            if (rc != SQLITE_OK) { mw_store_free(db->store); db->store = NULL; }
+            if (rc != SQLITE_OK) { mw_store_free(db->store); db->store = NULL; db->open_rc = rc; }
         }
     } else if (db->store->pgsz != pgsz) rc = SQLITE_MISUSE;
     sqlite3_mutex_leave(db->mu);

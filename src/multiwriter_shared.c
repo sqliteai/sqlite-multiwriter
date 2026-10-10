@@ -42,7 +42,7 @@ static int real_fd (mw_db *db) {
 int mw_shared_read (mw_db *db, uint32_t pgno, uint64_t snap, uint32_t poff, uint32_t n, void *dst) {
     uint64_t ep, loc;
     if (!shidx_lookup(db->ix, pgno, snap, &ep, &loc)) return 0;                 // no version: the real file
-    return mw_seglog_read(db, loc, poff, n, dst) ? 1 : 0;                       // (the segment is gone: the version is in the real file, which holds the same page)
+    return mw_seglog_read(db, loc, poff, n, dst);                               // 1 read; 0 the segment is gone (the version is in the real file, which holds the same page); -1 it could not be read: an error, not the real file's page
 }
 
 uint32_t mw_shared_dbsize (mw_db *db, uint64_t snap) {
@@ -56,7 +56,9 @@ uint64_t mw_shared_head_epoch (mw_db *db, uint32_t pgno) { return shidx_head_epo
 bool mw_shared_head_image (mw_db *db, uint32_t pgno, uint8_t *dst, uint64_t *epoch) {
     uint64_t ep, loc;
     if (!shidx_lookup(db->ix, pgno, UINT64_MAX, &ep, &loc)) return false;
-    if (!mw_seglog_read(db, loc, 0, (uint32_t)db->store->pgsz, dst)) {            // its segment was deleted: the real file has it
+    int rr = mw_seglog_read(db, loc, 0, (uint32_t)db->store->pgsz, dst);
+    if (rr < 0) return false;                                                       // (not known to be anywhere else: the caller refuses what it wanted it for)
+    if (rr == 0) {                                                                  // its segment was deleted: the real file has it
         int fd = real_fd(db);
         size_t pgsz = (size_t)db->store->pgsz;
         if (fd < 0 || pread(fd, dst, pgsz, (off_t)(pgno - 1) * (off_t)pgsz) != (ssize_t)pgsz) return false;
@@ -83,7 +85,12 @@ int mw_shared_open (mw_db *db) {
     char *ixp = mw_sidecar_path(db->path, "mwidx");
     if (!ixp) return SQLITE_NOMEM;
     if (db->mp_first) shidx_unlink(ixp);                                        // volatile: rebuilt from the log below
-    shidx_params p = { 24, 4u << 20, MW_MP_SLOTS, 0, (uint32_t)mw_file_mode(db->path) };
+    // The index covers the page numbers below 2^max_pages_log2 (the directory costs 2^(n-12) words, the table of blocks 2^n of them, a sparse file: 64 GB of 4 KB pages at 24). A database that
+    // is bigger than that, or that is about to be, gets an index that covers twice its size: with the fixed 24 the commit that needed a page above it failed at the publication with
+    // SQLITE_FULL, after its work was done, for ever.
+    uint32_t lg = 24;
+    for (uint64_t want = (uint64_t)db->store->base_dbsize * 2; lg < 32 && ((uint64_t)1 << lg) < want; ) lg++;
+    shidx_params p = { lg, 4u << 20, MW_MP_SLOTS, 0, (uint32_t)mw_file_mode(db->path) };
     const char *e = getenv("MW_IDX_ENTRIES");
     if (e && atoi(e) > 1000) p.max_entries = (uint32_t)atoi(e);
     shidx_gc_hook = gc_crash_point;
@@ -141,6 +148,7 @@ void mw_shared_close (mw_db *db, bool sole) {
 // MARK: - a publisher died inside the publication lock -
 // The lock is taken from a process that is gone. If it had appended its record and not yet made the commit visible, the record is complete (finish the commit: install its pages, its
 // metadata, publish) or torn (undo: the cursor goes back, the header is cleared). Either way nobody else saw the commit, and the log has exactly one record for every epoch.
+static void shared_gc (mw_db *db);
 void mw_shared_repair (mw_db *db) {
     mw_shm *sh = db->shm;
     if (db->ix) shidx_gc_repair(db->ix);
@@ -150,7 +158,8 @@ void mw_shared_repair (mw_db *db) {
             uint64_t e2 = 0, s2 = 0, l2 = 0; uint32_t d2 = 0, x2 = 0; int n2 = 0; uint32_t *pg2 = NULL; uint64_t *lc2 = NULL;
             int prc = mw_seglog_peek(db, cs, MW_SEG_HDR, &e2, &d2, &n2, &pg2, &lc2, &x2, &l2, &s2);
             free(pg2); free(lc2);
-            if (prc != SQLITE_OK) { atomic_store_explicit(&sh->sl_end, MW_SEG_HDR, memory_order_release); }
+            if (prc == SQLITE_NOTFOUND) { atomic_store_explicit(&sh->sl_end, MW_SEG_HDR, memory_order_release); }
+            else if (prc != SQLITE_OK) { atomic_store(&sh->broken, 1); return; }                       // (the segment could not be looked at: not known to be empty, and the next append would overwrite it)
         }
     }
     uint64_t pe = atomic_load_explicit(&sh->pend_epoch, memory_order_acquire);
@@ -160,6 +169,7 @@ void mw_shared_repair (mw_db *db) {
     if (pe != committed + 1) { atomic_store(&sh->pend_epoch, 0); return; }                         // (it did get visible: nothing to do)
     uint64_t epoch = 0, size = 0, ext_loc = 0; uint32_t dbsize = 0, ext_len = 0; int n = 0; uint32_t *pgnos = NULL; uint64_t *locs = NULL;
     int rc = mw_seglog_peek(db, seg, off, &epoch, &dbsize, &n, &pgnos, &locs, &ext_len, &ext_loc, &size);
+    if (rc != SQLITE_OK && rc != SQLITE_NOTFOUND) { atomic_store(&sh->broken, 1); return; }          // (could not be read: not known to be torn, and to undo it could undo a record that was complete)
     if (rc != SQLITE_OK || epoch != pe) {                                                         // torn or never written: undo
         mw_seglog_discard(db, seg, off);
         atomic_store(&sh->sl_seg, seg); atomic_store_explicit(&sh->sl_end, off, memory_order_release);
@@ -167,7 +177,15 @@ void mw_shared_repair (mw_db *db) {
         return;
     }
     // complete: finish it (installing twice what the dead one had already installed only adds equal versions)
-    if (shidx_room(db->ix) >= (uint32_t)n + 2) shidx_install(db->ix, epoch, dbsize, n, pgnos, locs);
+    // (what the dead one had installed already is kept, and the rest is installed: it is the one record that is in the log for this epoch, and what is in the index has to be all of it. The room
+    // that is left is the room that was there before it began, less the entries that it took: the check of room of the publication does not cover installing it again from the start)
+    int irc = shidx_install_missing(db->ix, epoch, dbsize, n, pgnos, locs);
+    if (irc == -1) { shared_gc(db); irc = shidx_install_missing(db->ix, epoch, dbsize, n, pgnos, locs); }
+    if (irc != 0) {                                                                                  // no room even then: not published half, the commits stop until the next open replays the log
+        atomic_store(&sh->broken, 1);
+        free(pgnos); free(locs);
+        return;
+    }
                                                 // (the owner maps follow commits by their pages: this one's were not applied: rebuilt at the next use)
     atomic_store(&sh->sl_seg, seg); atomic_store_explicit(&sh->sl_end, off + size, memory_order_release);
     atomic_store(&db->next_epoch, epoch);
@@ -222,7 +240,7 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
                 }
                 if (used && bufs) {
                     uint8_t *oldp = bufs, *newp = bufs + pgsz;
-                    bool have_old = mw_shared_read(db, pg, sn, 0, (uint32_t)pgsz, oldp) != 0;
+                    bool have_old = mw_shared_read(db, pg, sn, 0, (uint32_t)pgsz, oldp) > 0;
                     if (!have_old) { mw_file *f = lane->file; have_old = f->real->pMethods->xRead(f->real, oldp, (int)pgsz, (sqlite3_int64)(pg - 1) * (sqlite3_int64)pgsz) == SQLITE_OK; }
                     uint64_t he2;
                     if (have_old && mw_shared_head_image(db, pg, newp, &he2) && mw_interior_routes_same(oldp, newp, (int)pgsz, db->store->reserved, used, nused)) {
@@ -391,7 +409,7 @@ int mw_shared_compact (mw_db *db, mw_compact_result *out) {
     shidx_scan(db->ix, base, T, cmp_collect, &c);
     rc = c.rc;
     for (uint32_t i = 0; i < c.n && rc == SQLITE_OK; i++) {
-        if (!mw_seglog_read(db, c.locs[i], 0, (uint32_t)c.pgsz, c.page)) { rc = SQLITE_IOERR_READ; break; }
+        if (mw_seglog_read(db, c.locs[i], 0, (uint32_t)c.pgsz, c.page) != 1) { rc = SQLITE_IOERR_READ; break; }
         ssize_t w = mw_io_pwrite(fd, c.page, c.pgsz, (off_t)(c.list[i] - 1) * (off_t)c.pgsz);
         if (w != (ssize_t)c.pgsz) rc = SQLITE_IOERR_WRITE; else out->pages_written++;
     }

@@ -176,7 +176,9 @@ static int reloc_phase1 (mw_lane *lane, const uint32_t *pgnos, const uint8_t *co
     if (i1 < 0 || (uint32_t)nnew != growth) return NA(2);          // page 1 must be written, and the new pages must be the whole range
     // page 1 may differ from the snapshot's only in the change counter, the in-header size and version-valid-for
     uint8_t *snap1 = P->snap1;
-    if (!mw_store_read(st, 1, lane->tx.snapshot_epoch, 0, 100, snap1)) {           // (page 1 never written since the file was created: the real file's)
+    int r1 = mw_store_read(st, 1, lane->tx.snapshot_epoch, 0, 100, snap1);
+    if (r1 < 0) return NA(3);
+    if (r1 == 0) {                                                                 // (page 1 never written since the file was created: the real file's)
         mw_file *f = lane->file;
         if (!f || f->real->pMethods->xRead(f->real, snap1, 100, 0) != SQLITE_OK) return NA(3);
     }
@@ -318,7 +320,9 @@ int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgno
                     uint64_t eh = 0;
                     if (nown >= 65 || !mw_store_head_image(st, pgnos[slot], theirs, &eh)) { rc = NA(31); break; }
                     if (eh <= lane->tx.snapshot_epoch) continue;                // (no longer newer than our snapshot)
-                    if (!mw_store_read(st, pgnos[slot], lane->tx.snapshot_epoch, 0, (uint32_t)pgsz, basei)) {
+                    int br = mw_store_read(st, pgnos[slot], lane->tx.snapshot_epoch, 0, (uint32_t)pgsz, basei);
+                    if (br < 0) { rc = NA(31); break; }
+                    if (br == 0) {
                         mw_file *f = lane->file;
                         if (!f || f->real->pMethods->xRead(f->real, basei, pgsz, (sqlite3_int64)(pgnos[slot] - 1) * pgsz) != SQLITE_OK) { rc = NA(31); break; }
                     }

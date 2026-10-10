@@ -51,7 +51,7 @@ uint64_t mw_seglog_bytes (mw_db *db);                                   // bytes
 
 // ---- readers (any thread, any process) ----
 // Copies n bytes at `off` of the page image at `loc` into dst. false: the segment does not exist (any more).
-bool mw_seglog_read (mw_db *db, uint64_t loc, uint32_t off, uint32_t n, void *dst);
+int  mw_seglog_read (mw_db *db, uint64_t loc, uint32_t off, uint32_t n, void *dst);        // 1 read, 0 the segment is gone, -1 it could not be read
 
 // ---- what a dead publisher left ----
 int  mw_seglog_peek (mw_db *db, uint32_t seg, uint64_t off, uint64_t *epoch, uint32_t *dbsize, int *n, uint32_t **pgnos, uint64_t **locs, uint32_t *ext_len, uint64_t *ext_loc, uint64_t *size);

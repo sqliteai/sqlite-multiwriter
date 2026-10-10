@@ -66,6 +66,8 @@ uint64_t shidx_committed (shidx *ix);
 // Installs the pages of one commit (and the database size) at `epoch` (must be committed()+1) but does not publish it yet. Returns 0, or -1 when the arena is full
 // (run shidx_gc, or compact and raise the base) -- nothing was installed then.
 int      shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *locs);
+int      shidx_install_missing (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *locs);   // as shidx_install, for what a publisher that died inside it has not installed yet
+extern void (*shidx_install_hook)(int done);           // called after each entry is linked (tests: a crash point inside an install)
 void     shidx_publish (shidx *ix, uint64_t epoch);             // makes everything installed up to `epoch` visible to new snapshots
 uint64_t shidx_head_epoch (shidx *ix, uint32_t pgno);           // newest version's epoch, 0 if none (commit validation)
 // Frees what no snapshot can see. `base`: state <= base is in the real file, a chain whose only version is <= base is dropped altogether (and so is page `pgno`'s

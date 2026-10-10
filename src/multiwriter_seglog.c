@@ -115,7 +115,11 @@ static void map_drop (segmap *m) {                                  // (map_mu h
 }
 
 // The mapping of `seg` with a use counted (release with map_release), or NULL: the file does not exist, or the slot is taken by a segment that is still in use.
-static segmap *map_acquire (mw_seglog *sl, uint32_t seg) {
+// why: 0 mapped; MW_MAP_GONE the segment does not exist (it was compacted away and trimmed, or has no header yet); MW_MAP_BUSY its slot is in use by another segment (try again);
+// MW_MAP_ERR it could not be opened or mapped (descriptors, memory, an I/O error): what is in it is not known to be gone.
+enum { MW_MAP_GONE = 1, MW_MAP_BUSY = 2, MW_MAP_ERR = 3 };
+static segmap *map_acquire_why (mw_seglog *sl, uint32_t seg, int *why) {
+    *why = 0;
     segmap *m = &sl->maps[seg % MW_SEG_MAPS];
     for (int attempt = 0; attempt < 2; attempt++) {
         if (atomic_load_explicit(&m->seg, memory_order_acquire) == seg && !atomic_load(&m->dying)) {
@@ -129,24 +133,27 @@ static segmap *map_acquire (mw_seglog *sl, uint32_t seg) {
                 // (dying first, users second, both seq_cst: a reader that counted itself in before sees dying, or we see its count; reading users alone let a reader
                 // slip in between the check and the unmap)
                 atomic_store(&m->dying, 1);
-                if (atomic_load(&m->users) != 0) { atomic_store(&m->dying, 0); pthread_mutex_unlock(&sl->map_mu); return NULL; }     // the slot's segment is still being read
+                if (atomic_load(&m->users) != 0) { atomic_store(&m->dying, 0); pthread_mutex_unlock(&sl->map_mu); *why = MW_MAP_BUSY; return NULL; }     // the slot's segment is still being read
                 map_drop(m);
             }
             char path[600]; seg_path(sl, seg, path, sizeof path);
             int fd = open(path, O_RDWR);
-            if (fd < 0) { pthread_mutex_unlock(&sl->map_mu); return NULL; }
+            if (fd < 0) { int e = errno; pthread_mutex_unlock(&sl->map_mu); *why = e == ENOENT ? MW_MAP_GONE : MW_MAP_ERR; return NULL; }
             struct stat sb;
-            if (fstat(fd, &sb) != 0 || sb.st_size < MW_SEG_HDR) { close(fd); pthread_mutex_unlock(&sl->map_mu); return NULL; }
+            if (fstat(fd, &sb) != 0) { close(fd); pthread_mutex_unlock(&sl->map_mu); *why = MW_MAP_ERR; return NULL; }
+            if (sb.st_size < MW_SEG_HDR) { close(fd); pthread_mutex_unlock(&sl->map_mu); *why = MW_MAP_GONE; return NULL; }
             void *p = mw_io_mmap(NULL, (size_t)sb.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            if (p == MAP_FAILED) { close(fd); pthread_mutex_unlock(&sl->map_mu); return NULL; }
+            if (p == MAP_FAILED) { close(fd); pthread_mutex_unlock(&sl->map_mu); *why = MW_MAP_ERR; return NULL; }
             m->base = p; m->len = (size_t)sb.st_size; m->fd = fd;
             atomic_store(&m->dying, 0);
             atomic_store_explicit(&m->seg, seg, memory_order_release);
         }
         pthread_mutex_unlock(&sl->map_mu);
     }
+    *why = MW_MAP_BUSY;
     return NULL;
 }
+static segmap *map_acquire (mw_seglog *sl, uint32_t seg) { int why; return map_acquire_why(sl, seg, &why); }
 static void map_release (segmap *m) { atomic_fetch_sub(&m->users, 1); }
 
 // MARK: - segment files -
@@ -388,8 +395,13 @@ void mw_seglog_close (mw_db *db) {
 // an earlier one that sits in the old.
 static int seg_roll (mw_db *db, mw_seglog *sl, uint32_t cur, uint64_t need, uint64_t first_epoch) {
     mw_shm *sh = db->shm;
-    segmap *m = map_acquire(sl, cur);
-    if (m) { mw_io_msync(m->base, m->len, MS_SYNC); if (mw_io_fsync(m->fd) != 0) { map_release(m); return SQLITE_IOERR_FSYNC; } map_release(m); }
+    segmap *m = NULL; int why = 0;
+    for (int tries = 0; tries < 2000; tries++) { m = map_acquire_why(sl, cur, &why); if (m || why != MW_MAP_BUSY) break; sched_yield(); }
+    if (!m && why != MW_MAP_GONE) return SQLITE_IOERR_FSYNC;      // (the segment that is being left cannot be mapped: it is not known to be on the disk, and the roll would go on without it)
+    if (m) {
+        if (mw_io_msync(m->base, m->len, MS_SYNC) != 0 || mw_io_fsync(m->fd) != 0) { map_release(m); return SQLITE_IOERR_FSYNC; }
+        map_release(m);
+    }
     uint32_t next = cur + 1;
     uint64_t base = atomic_load(&sh->base_epoch);
     char final_[620]; seg_path(sl, next, final_, sizeof final_);
@@ -571,21 +583,29 @@ void mw_seglog_prefill_bg (mw_db *db) {
 
 // MARK: - readers -
 
-bool mw_seglog_read (mw_db *db, uint64_t loc, uint32_t off, uint32_t n, void *dst) {
+// 1: read. 0: the segment is gone (it was compacted and trimmed: what it held is in the real file). -1: it could not be mapped or read (descriptors, memory, an I/O error): the page is
+// not known to be anywhere else, and the caller must not take it for the one in the real file.
+int mw_seglog_read (mw_db *db, uint64_t loc, uint32_t off, uint32_t n, void *dst) {
     mw_seglog *sl = db->sl;
-    segmap *m = map_acquire(sl, MW_LOC_SEG(loc));
-    if (!m) return false;
+    segmap *m = NULL; int why = 0;
+    for (int tries = 0; tries < 2000; tries++) {
+        m = map_acquire_why(sl, MW_LOC_SEG(loc), &why);
+        if (m || why != MW_MAP_BUSY) break;
+        sched_yield();                                           // (the slot of this segment is held by another one that is being read: a moment)
+    }
+    if (!m) return why == MW_MAP_GONE ? 0 : -1;
     uint64_t at = (uint64_t)MW_LOC_OFF(loc) + off;
-    if (at + n > m->len) { map_release(m); return false; }
+    if (at + n > m->len) { map_release(m); return 0; }
     memcpy(dst, m->base + at, n);
     map_release(m);
-    return true;
+    return 1;
 }
 
 // A record at (seg, off), if it is complete and valid. Used to finish or discard what a publisher that died inside the publication lock left behind.
 int mw_seglog_peek (mw_db *db, uint32_t seg, uint64_t off, uint64_t *epoch, uint32_t *dbsize, int *n, uint32_t **pgnos, uint64_t **locs, uint32_t *ext_len, uint64_t *ext_loc, uint64_t *size) {
     mw_seglog *sl = db->sl; int rc = SQLITE_NOTFOUND;
-    segmap *m = map_acquire(sl, seg); if (!m) return SQLITE_NOTFOUND;
+    int why = 0; segmap *m = map_acquire_why(sl, seg, &why);
+    if (!m) return why == MW_MAP_GONE ? SQLITE_NOTFOUND : why == MW_MAP_BUSY ? SQLITE_BUSY : SQLITE_CANTOPEN;     // (only a segment that is not there has no record: the others are not known)
     rec_hdr r;
     if (off + REC_HDR_SIZE > m->len) goto out;
     memcpy(&r, m->base + off, sizeof r);

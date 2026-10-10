@@ -247,9 +247,12 @@ static void cand_push (shidx *ix, uint32_t pgno) {
     if (h->cand_n < h->max_cands) ix->cand[h->cand_n++] = pgno + 1; else h->cand_overflow = 1;
 }
 
-int shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *locs) {
+void (*shidx_install_hook)(int done);                                 // (tests: called after each entry of an install is linked)
+
+static int install_impl (shidx *ix, uint64_t epoch, uint32_t dbsize, bool with_size, int n, const uint32_t *pgnos, const uint64_t *locs) {
     hdr *h = ix->h;
-    uint32_t need = (uint32_t)n + 1;
+    const int i0 = with_size ? -1 : 0;                                    // (the size record is item -1)
+    uint32_t need = (uint32_t)n + (with_size ? 1u : 0u);
     uint32_t room = h->n_free + (h->max_entries - h->arena_top);
     if (room < need) return -1;
     for (int i = 0; i < n; i++) if ((pgnos[i] >> BLOCK_BITS) >= h->dir_n || pgnos[i] == 0) return -2;
@@ -257,7 +260,7 @@ int shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint
     // a hundred rows of metadata touches a hundred cells of a file of some hundred MB, and one miss after the other was most of its time under the publication lock)
     _Atomic uint32_t *hrs_small[130]; _Atomic uint32_t **hrs = (size_t)n + 1 <= 130 ? hrs_small : malloc(((size_t)n + 1) * sizeof *hrs);
     if (!hrs) return -2;
-    for (int i = -1; i < n; i++) {
+    for (int i = i0; i < n; i++) {
         _Atomic uint32_t *hr = head_ref(ix, i < 0 ? 0 : pgnos[i], true);
         if (!hr) { if (hrs != hrs_small) free(hrs); return -2; }
         hrs[i + 1] = hr; __builtin_prefetch((const void *)hr, 1);
@@ -265,7 +268,7 @@ int shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint
     // (the entries of the whole commit first: a count that is wrong, which a holder that died inside an allocation can leave, must not give entry 0 to a version and publish half a commit)
     uint32_t es_small[130]; uint32_t *es = (size_t)n + 1 <= 130 ? es_small : malloc(((size_t)n + 1) * sizeof *es);
     if (!es) { if (hrs != hrs_small) free(hrs); return -2; }
-    for (int i = 0; i <= n; i++) {
+    for (int i = 0; i < (int)need; i++) {
         es[i] = arena_alloc(ix);
         if (!es[i]) {
             for (int k = 0; k < i; k++) arena_free(ix, es[k]);
@@ -275,11 +278,11 @@ int shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint
         }
     }
     // (the size record first, then the pages: all with the same epoch, invisible to snapshots until shidx_publish)
-    for (int i = -1; i < n; i++) {
+    for (int i = i0; i < n; i++) {
         uint32_t pgno = i < 0 ? 0 : pgnos[i];
         uint64_t loc = i < 0 ? dbsize : locs[i];
         _Atomic uint32_t *hr = hrs[i + 1];
-        uint32_t e = es[i + 1];
+        uint32_t e = es[i - i0];
         ver *v = &ix->arena[e];
         uint32_t oldw = atomic_load_explicit(hr, memory_order_relaxed), old = HIDX(oldw);
         atomic_thread_fence(memory_order_release);                              // (a recycled entry: the poison of its previous life is visible before the new fields)
@@ -290,12 +293,30 @@ int shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint
         uint32_t q = oldw & QBIT;
         if (!q) { cand_push(ix, pgno); q = QBIT; }                              // every page with a version waits for GC: a second version, or the base passing the first
         atomic_store_explicit(hr, e | q, memory_order_release);                 // publishes the entry
+        if (shidx_install_hook) shidx_install_hook(i - i0 + 1);
     }
     if (es != es_small) free(es);
     if (hrs != hrs_small) free(hrs);
     h->installed = epoch;
     h->st_installs++;
     return 0;
+}
+
+int shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *locs) { return install_impl(ix, epoch, dbsize, true, n, pgnos, locs); }
+
+// The commit that a publisher that died inside shidx_install had begun: what is in the index at this epoch already (the size record, the first pages) is left as it is, and the rest is
+// installed. The same call finishes a commit of which nothing was installed.
+int shidx_install_missing (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *locs) {
+    const bool with_size = shidx_head_epoch(ix, 0) != epoch;
+    uint32_t pg_small[130]; uint64_t lc_small[130];
+    uint32_t *pg = (size_t)n <= 130 ? pg_small : malloc((size_t)n * sizeof *pg); uint64_t *lc = (size_t)n <= 130 ? lc_small : malloc((size_t)n * sizeof *lc);
+    if (!pg || !lc) { if (pg != pg_small) free(pg); if (lc != lc_small) free(lc); return -2; }
+    int m = 0;
+    for (int i = 0; i < n; i++) if (shidx_head_epoch(ix, pgnos[i]) != epoch) { pg[m] = pgnos[i]; lc[m] = locs[i]; m++; }
+    int rc = install_impl(ix, epoch, dbsize, with_size, m, pg, lc);
+    if (pg != pg_small) free(pg);
+    if (lc != lc_small) free(lc);
+    return rc;
 }
 
 void shidx_publish (shidx *ix, uint64_t epoch) { atomic_store_explicit(&ix->h->committed, epoch, memory_order_release); }

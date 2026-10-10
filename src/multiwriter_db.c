@@ -20,16 +20,32 @@ static mw_db *mw_dbs = NULL;                 // protected by the SQLITE_MUTEX_ST
 // inherited database: they are marked orphaned (skipped by the registry, never torn down: closing an inherited connection must not compact, unlink or
 // unlock what the parent still uses) and connections opened in the child get a fresh state of their own. Connections inherited across fork() must
 // not be used in the child (as with any SQLite connection).
-static void mw_atfork_child (void) { for (mw_db *d = mw_dbs; d; d = d->next) d->orphaned = true; }
+// The mutex of the registry (SQLITE_MUTEX_STATIC_MAIN, which SQLite itself takes in sqlite3_open) is held across the fork, so that the child does not get it locked by a thread that does not exist
+// there: the thread that forks takes it in prepare, and leaves it in the parent and in the child.
+static void mw_atfork_prepare (void) { sqlite3_mutex_enter(sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MAIN)); }
+static void mw_atfork_parent (void) { sqlite3_mutex_leave(sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MAIN)); }
+static void mw_atfork_child (void) {
+    for (mw_db *d = mw_dbs; d; d = d->next) d->orphaned = true;
+    sqlite3_mutex_leave(sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MAIN));
+}
 static int mw_atfork_done;
 
 mw_db *mw_db_acquire (const char *path, int mode, bool mp, int *err) {
     *err = SQLITE_NOMEM;
     sqlite3_mutex *g = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MAIN);
     sqlite3_mutex_enter(g);
-    if (!mw_atfork_done) { pthread_atfork(NULL, NULL, mw_atfork_child); mw_atfork_done = 1; }
-    mw_db *db = mw_dbs;
-    while (db && (db->orphaned || strcmp(db->path, path) != 0)) db = db->next;
+    if (!mw_atfork_done) { pthread_atfork(mw_atfork_prepare, mw_atfork_parent, mw_atfork_child); mw_atfork_done = 1; }
+    mw_db *db;
+    for (;;) {
+        db = mw_dbs;
+        while (db && (db->orphaned || strcmp(db->path, path) != 0)) db = db->next;
+        if (!db || !db->closing) break;
+        // the last connection of this database let go and the state is being taken down: the log is locked and the files are in use until it is done. Waited for outside the mutex
+        // (the teardown is a compaction: it does not hold it either).
+        sqlite3_mutex_leave(g);
+        usleep(500);
+        sqlite3_mutex_enter(g);
+    }
     if (db) {
         if (db->mode != mode || (mode >= 2 && db->mp_req != mp)) {       // one database, one mode (multi-process is a property of the database)
             sqlite3_log(SQLITE_CANTOPEN, "multiwriter: %s is already open in this process with another mode (mw=%d, mw_mp=%d)", path, db->mode >= 2 ? 1 : 2, db->mp_req ? 1 : 0);
@@ -109,10 +125,16 @@ void mw_db_release (mw_db *db) {
     sqlite3_mutex *g = sqlite3_mutex_alloc(SQLITE_MUTEX_STATIC_MAIN);
     sqlite3_mutex_enter(g);
     if (--db->refs == 0) {
-        for (mw_db **pp = &mw_dbs; *pp; pp = &(*pp)->next) {
-            if (*pp == db) { *pp = db->next; break; }
+        if (db->orphaned) {                                          // (inherited through fork(): unlinked from the registry, deliberately leaked)
+            for (mw_db **pp = &mw_dbs; *pp; pp = &(*pp)->next) if (*pp == db) { *pp = db->next; break; }
+            sqlite3_mutex_leave(g);
+            return;
         }
-        if (db->orphaned) { sqlite3_mutex_leave(g); return; }        // (inherited through fork(): unlinked from the registry, deliberately leaked)
+        // The state is taken down below with the mutex of the registry let go: that is a compaction of the whole log, an fsync, the unlink of files. It stays in the registry, marked, so that
+        // an open of the same path waits for it and does not find the log locked; an open of any other database is not held up by it (every sqlite3_open of the process takes that mutex).
+        db->closing = true;
+        sqlite3_mutex_leave(g);
+        { static _Atomic int d = MW_KNOB_UNSET; int us = mw_knob_int(&d, "MW_TEST_CLOSE_DELAY_US", 0); if (us > 0) usleep((useconds_t)us); }     // (tests: a close that takes a while)
         assert(db->active == NULL);
         // last connection gone: stop the compactor, materialise everything into the real file (it is then an
         // ordinary SQLite database again) and drop the log. If the database failed, the log is kept for recovery.
@@ -168,7 +190,11 @@ void mw_db_release (mw_db *db) {
         pthread_mutex_destroy(&db->ddl_mu);
         sqlite3_mutex_free(db->mu);
         sqlite3_free(db->path);
+        sqlite3_mutex_enter(g);
+        for (mw_db **pp = &mw_dbs; *pp; pp = &(*pp)->next) if (*pp == db) { *pp = db->next; break; }
+        sqlite3_mutex_leave(g);
         sqlite3_free(db);
+        return;
     }
     sqlite3_mutex_leave(g);
 }

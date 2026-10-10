@@ -117,6 +117,7 @@ static int chain_find (const mw_chain *c, uint64_t snap) {
 
 static inline uint64_t chain_head_epoch (const mw_chain *c) { return c && c->n > 0 ? c->v[c->n - 1].epoch : 0; }
 
+// 1: read from a version of the store; 0: no version (the real file has the page); -1: there is one, and it could not be read (a segment that cannot be mapped): not the real file's page.
 int mw_store_read (mw_store *st, uint32_t pgno, uint64_t snap, uint32_t poff, uint32_t n, void *dst) {
     if (st->shared_db) return mw_shared_read(st->shared_db, pgno, snap, poff, n, dst);
     mw_chain *c = chain_get(st, pgno, false);
@@ -363,7 +364,9 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
         }
         if (mw_debug_on()) { for (int i = 0; i < n; i++) if (chain_head_epoch(chains[i]) > snap_for(v, pgnos[i])) fprintf(stderr, "CPAGE %u snapdb=%u ws_db=%u newpage=%d\n", pgnos[i], snap_dbsize, ws_dbsize, pgnos[i] > snap_dbsize); }
         for (int i = 0; i < n && rc == SQLITE_OK; i++) {
-            if (chain_head_epoch(chains[i]) > snap_for(v, pgnos[i])) { atomic_fetch_add(&db->n_page_conflicts, 1); rc = MW_CONFLICT; if (mw_debug_on()) fprintf(stderr, "CONFLICT page %u of %d\n", pgnos[i], n); }
+            // (a page of the transaction's own earlier commit has to be at that epoch still: a version that was rolled back (its append failed) is gone, and what was built on it is not valid)
+            const uint64_t se = snap_for(v, pgnos[i]), he = chain_head_epoch(chains[i]);
+            if (he > se || (se > v->snapshot_epoch && he < se)) { atomic_fetch_add(&db->n_page_conflicts, 1); rc = MW_CONFLICT; if (mw_debug_on()) fprintf(stderr, "CONFLICT page %u of %d\n", pgnos[i], n); }
         }
         free(used);
         // a schema change invalidates everything the transaction did, even on other pages
@@ -429,6 +432,11 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
         // The record never made it. If nothing was assigned after us we can take the commit back cleanly:
         // uninstall, return the log space. Otherwise a successor may already sit behind the hole: the
         // database is failed (sticky) and recovers by reopening (the log stops at the hole).
+        // The stripes of the pages first, then seq_mu (the order of the publication): the epoch is given back and the versions uninstalled under the same hold of the stripes. With the stripes
+        // taken after the epoch was given back, a relocation or a commit could take that epoch in between, build on the version that is about to go (its page 1, its interior pages), and have
+        // its own version of the epoch freed by the uninstall that is looking for the one of this commit.
+        stripe_set again;
+        stripes_lock(st, &again, pgnos, n, NULL, 0);
         mw_spinlock(&st->seq_mu);
         bool latest = atomic_load(&db->next_epoch) == epoch && MW_LOG_OFF(db) == log_off + mw_log_record_size(db, n, 0);
         if (latest) {
@@ -439,16 +447,8 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
             atomic_store(&db->failed, 1);
         }
         pthread_mutex_unlock(&st->seq_mu);
-        if (!latest) {
-            // The commits behind the hole are parked in the log's sync (waiting for the prefix of the log to be written up to them, or for room in the ring), and nothing will ever
-            // write the prefix: they re-check `failed` only when they are woken.
-            pthread_mutex_lock(&db->log_mu);
-            pthread_cond_broadcast(&db->sync_cv);
-            pthread_mutex_unlock(&db->log_mu);
-        }
+        { static _Atomic int d = MW_KNOB_UNSET; int us = mw_knob_int(&d, "MW_TEST_ROLLBACK_DELAY_US", 0); if (us > 0) usleep((useconds_t)us); }     // (tests: the time between giving the epoch back and the uninstall)
         if (latest) {
-            stripe_set again;
-            stripes_lock(st, &again, pgnos, n, NULL, 0);
             for (int i = 0; i < n; i++) {
                 mw_chain *c = chain_get(st, pgnos[i], false);
                 if (c && c->n > 0 && c->v[c->n - 1].epoch == epoch) {
@@ -456,12 +456,19 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
                     atomic_fetch_sub(&st->versions, 1); atomic_fetch_sub(&st->versions_allocated, 1); atomic_fetch_sub(&st->bytes, (uint64_t)st->pgsz);
                 }
             }
-            if (wrote_p1 && atomic_load_explicit(&st->p1_head_epoch, memory_order_acquire) == epoch) {       // (page 1 of the commit that never was must not be the head that later commits see, or a relocation's copy of it)
+            if (wrote_p1 && atomic_load_explicit(&st->p1_head_epoch, memory_order_acquire) == epoch) {       // (page 1 of the commit that never was must not be the head that later commits see, or a relocation would build on it)
                 atomic_store_explicit(&st->p1_cookie, p1_prev_cookie, memory_order_relaxed);
                 atomic_store_explicit(&st->p1_head_epoch, p1_prev_head, memory_order_release);
             }
             if (db->p1_cache_epoch == epoch) db->p1_cache_epoch = 0;
-            stripes_unlock(st, &again);
+        }
+        stripes_unlock(st, &again);
+        if (!latest) {
+            // The commits behind the hole are parked in the log's sync (waiting for the prefix of the log to be written up to them, or for room in the ring), and nothing will ever
+            // write the prefix: they re-check `failed` only when they are woken.
+            pthread_mutex_lock(&db->log_mu);
+            pthread_cond_broadcast(&db->sync_cv);
+            pthread_mutex_unlock(&db->log_mu);
         }
         mw_db_wake_all_visibility(db);
         return rc;

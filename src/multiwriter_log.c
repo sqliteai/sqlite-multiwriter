@@ -76,6 +76,13 @@ static bool fault_fires (mw_fault_t f) {
     return atomic_fetch_sub(&fault_left[f], 1) == 1;
 }
 
+// Tests: the append that is armed waits here, after its place was assigned and before its bytes are written (as one that is slow to be scheduled does).
+static void fault_stall (mw_fault_t f) {
+    if (!fault_fires(f)) return;
+    static _Atomic int d = MW_KNOB_UNSET; int us = mw_knob_int(&d, "MW_FAULT_DELAY_US", 0);
+    if (us > 0) usleep((useconds_t)us);
+}
+
 // 0: this library can read the file. The header of a file of the engine whose checksum does not check out is a damaged one (the caller decides), not one of another format.
 int mw_format_check (const char *what, const char *path, const char magic[8], const char *expected, uint32_t version, uint64_t features) {
     if (memcmp(magic, expected, 8) != 0) {
@@ -637,6 +644,7 @@ static int append_staged (mw_db *db, uint64_t off, uint64_t epoch, uint32_t dbsi
     size_t pgsz = (size_t)db->store->pgsz;
     size_t body = (size_t)n * (4 + pgsz) + ext_len;
     uint64_t size = REC_HDR_SIZE + (uint64_t)body, end = off + size, R = db->stage_r;
+    fault_stall(MW_FAULT_APPEND_STALL);
     if (mw_fault_hit(MW_FAULT_LOG_WRITE_ERR)) return SQLITE_IOERR_WRITE;
     rec_hdr r = { .magic = REC_MAGIC, .npages = (uint32_t)n, .epoch = epoch, .dbsize = dbsize, .pgsz = (uint32_t)pgsz, .ext_len = ext_len, .cksum = 0 };
     // checksum straight from the sources (same value as over the contiguous record)
@@ -1020,8 +1028,8 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch, mw_log_prep *prep) {
     // The size records cannot be used to find it: local GC prunes them up to this process's oldest snapshot, which in
     // multi-process mode can be newer than base_epoch (a missing record would make the new log start after base+1: a gap).
     // Scan the headers instead.
-    uint64_t tail_off = prep ? prep->tail_off : db->logmap ? mw_log_scan_after(db, base_epoch, MW_LOG_OFF(db)) : 0;
-    if (tail_off == 0) { mw_log_rewrite_abort(prep); return SQLITE_OK; }  // no map: leave the log alone
+    uint64_t tail_off = prep ? prep->tail_off : 0;
+    if (!prep && !db->logmap) { return SQLITE_OK; }                          // no map: leave the log alone
     // wait for in-flight record writes (bounded)
     for (int spin = 0; spin < 200000; spin++) {
         pthread_mutex_lock(&db->log_mu);
@@ -1034,6 +1042,10 @@ int mw_log_rewrite_tail (mw_db *db, uint64_t base_epoch, mw_log_prep *prep) {
         sched_yield();
     }
     uint64_t end = MW_LOG_OFF(db);
+    // (the scan after the wait: a record that is assigned and not written yet starts at the end of the file, and the scan reads its header through the mapping, which is beyond the file when
+    // that is on a page boundary: the process died of SIGBUS. Now every record that is assigned is in the file)
+    if (!prep) tail_off = mw_log_scan_after(db, base_epoch, end);
+    if (tail_off == 0) { mw_log_rewrite_abort(prep); return SQLITE_OK; }
     if (tail_off > end || (prep && prep->copied_end > end)) { mw_log_rewrite_abort(prep); return SQLITE_OK; }
     char *tmp; int nfd; int rc = SQLITE_OK;
     uint64_t pos = tail_off, out = LOG_HDR_SIZE;

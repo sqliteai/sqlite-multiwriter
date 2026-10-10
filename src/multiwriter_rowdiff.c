@@ -52,7 +52,9 @@ bool mw_rd_snap_page (mw_lane *lane, uint32_t pgno, uint8_t *dst) {
     mw_store *st = lane->db->store;
     uint32_t pgsz = (uint32_t)st->pgsz;
     if (pgno == 0 || pgno > lane->dsz_val) return false;
-    if (mw_store_read(st, pgno, lane->tx.snapshot_epoch, 0, pgsz, dst)) return true;
+    int sr = mw_store_read(st, pgno, lane->tx.snapshot_epoch, 0, pgsz, dst);
+    if (sr < 0) return false;
+    if (sr > 0) return true;
     mw_file *f = lane->file;
     return f->real->pMethods->xRead(f->real, dst, (int)pgsz, (sqlite3_int64)(pgno - 1) * pgsz) == SQLITE_OK;
 }

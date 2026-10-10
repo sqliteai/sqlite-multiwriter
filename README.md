@@ -64,7 +64,7 @@ Every release has the extension for each platform ([releases](https://github.com
 allows extensions, then open the database with the VFS:
 
     .load ./multiwriter                              -- the sqlite3 shell (multiwriter.so, .dylib or .dll)
-    SELECT mw_version();                             -- 0.5.2
+    SELECT mw_version();                             -- 0.6.0
 
 From C:
 
@@ -256,6 +256,10 @@ What to know before relying on it (details and measurements in `docs/design.md`)
 - Interior pages of an index (and so of a WITHOUT ROWID table) that were rewritten make the transactions that read through them retry: the shortcut that spares that retry for table b-trees is not safe for indexes.
 
 **Verification** (`make test`, `make test-mp`, `make test-io`, `test/sanitize.sh`, `test/hunt.sh`; SQLite's own Tcl suite through the VFS in `docs/sqlite-test-suite.md`): a randomised serializability check with threads and killed processes, a power-loss test on ext4 (Docker only), thousands of runs of the hunt, not days. Not verified: other file systems, TSan with processes, a machine that loses power on hardware.
+
+## Changelog
+
+What changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

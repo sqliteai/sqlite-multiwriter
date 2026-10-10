@@ -335,6 +335,8 @@ struct mw_db {
     pthread_cond_t    rb_qcv;
     void             *rb_qhead, *rb_qtail;
     bool              rb_leader;
+    pthread_mutex_t   cat_mu;              // the catalog of the schema as it was last built by any lane of this database (multiwriter_rebase.c): one build for all of them, not one for each connection
+    mw_cat           *cat_shared;          //   (its cookie says which schema; immutable once built)
     _Atomic uint64_t  n_gate_closures, n_backpressure;
     struct mw_vis_slot *vis;               // visibility ordering: epoch E becomes visible only after E-1; waiters are woken one by one
 
@@ -396,6 +398,7 @@ void mw_lane_methods_init (const sqlite3_io_methods *pass);   // once, from mw_v
 const sqlite3_io_methods *mw_vfs_pass_io (void);
 int  mw_lane_open_main (mw_file *f, mw_lane *lane);          // sets f->base.pMethods
 int  mw_lane_open_wal (mw_file *f, const char *name);        // no real file: memory only
+void mw_lane_trim (mw_lane *lane);
 void mw_lane_reset (mw_lane *lane, bool keep_header);                          // drop the private WAL + invalidate the wal-index header
 void mw_lane_free (mw_lane *lane);
 

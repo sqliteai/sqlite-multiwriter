@@ -546,6 +546,21 @@ void mw_lane_reset (mw_lane *lane, bool keep_header) {
     if (!keep_header && lane->nshm > 0 && lane->shm[0]) memset(lane->shm[0], 0, 96);
 }
 
+// A connection that ran one big transaction kept what it grew to for as long as it lived (the buffer of the frames, the lists of pages: 66 MB of heap after a transaction of 600000 rows and 50
+// small ones, for each connection that ever did that). What is above these sizes is given back when the next snapshot begins, with nothing in use; below them a connection keeps its buffers
+// (they are what makes the small transactions cheap).
+#define MW_TRIM_WAL_BYTES  ((size_t)16 << 20)
+#define MW_TRIM_LIST       65536
+#define MW_TRIM_RS_BYTES   ((size_t)4 << 20)
+void mw_lane_trim (mw_lane *lane) {
+    if (lane->wal.size == 0 && lane->wal.cap > MW_TRIM_WAL_BYTES) { sqlite3_free(lane->wal.buf); lane->wal.buf = NULL; lane->wal.cap = 0; }
+    if (lane->ws_n == 0 && lane->ws_cap > MW_TRIM_LIST) { sqlite3_free(lane->ws_pgnos); sqlite3_free(lane->ws_frame); lane->ws_pgnos = NULL; lane->ws_frame = NULL; lane->ws_cap = 0; }
+    if (lane->own_n == 0 && lane->own_cap > MW_TRIM_LIST) { sqlite3_free(lane->own_pg); sqlite3_free(lane->own_ep); lane->own_pg = NULL; lane->own_ep = NULL; lane->own_cap = 0; }
+    if (lane->rs_n == 0 && !lane->rs_overflow && (lane->rs_cap > MW_TRIM_LIST || lane->rs_bits_cap > MW_TRIM_RS_BYTES)) {      // (the bytes are all zero when nothing is in the list)
+        sqlite3_free(lane->rs_list); sqlite3_free(lane->rs_bits); lane->rs_list = NULL; lane->rs_bits = NULL; lane->rs_cap = 0; lane->rs_bits_cap = 0;
+    }
+}
+
 void mw_lane_free (mw_lane *lane) {
     if (!lane) return;
     mw_lane_reloc_discard(lane);

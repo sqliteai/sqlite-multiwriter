@@ -146,6 +146,7 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
         lane->rs_overflow = false;
     }
     lane->ws_n = 0;                 // write set of the previous transaction stays inspectable until now
+    mw_lane_trim(lane);
     atomic_fetch_add(&db->n_snapshots, 1);
     MW_T1(MW_ST_SNAPBEGIN, tsb0);
 }

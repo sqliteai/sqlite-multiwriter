@@ -194,5 +194,30 @@ int main (void) {
     CHECK(is_busy(r9));
     CHECK(st9.rebases == 0);
     sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+    // 10. the catalog that the replay uses is built once for the database and kept for its schema cookie: a connection that rebases after another one changed the schema (ADD COLUMN) must have the
+    //     new one, not the one that the others built (a stale one refuses every rebase, for ever), and a connection that has not rebased before gets the shared one
+    {
+        two("rc10", path, uri, sizeof uri, &a, &b);
+        sqlite3 *c = open_uri(uri), *d = open_uri(uri);
+        CHECK_RC(mw_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER); INSERT INTO t VALUES (1,0),(2,0),(3,0),(4,0),(5,0)"), SQLITE_OK);
+        mw_db_stats st0; memset(&st0, 0, sizeof st0);
+        for (int round = 0; round < 2; round++) {
+            sqlite3 *x = round == 0 ? a : c, *y = round == 0 ? b : d;                              // (round 1: connections that have never rebased, after the schema change)
+            CHECK_RC(mw_exec(x, "BEGIN"), SQLITE_OK); CHECK_RC(mw_exec(x, "UPDATE t SET n = n + 1 WHERE id = 1"), SQLITE_OK);
+            CHECK_RC(mw_exec(y, "UPDATE t SET n = n + 1 WHERE id = 5"), SQLITE_OK);
+            CHECK_RC(mw_exec(x, "COMMIT"), SQLITE_OK);
+            if (round == 0) CHECK_RC(mw_exec(b, "ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'z'"), SQLITE_OK);
+        }
+        CHECK(mw_scalar(a, "SELECT n FROM t WHERE id = 1") == 2 && mw_scalar(a, "SELECT n FROM t WHERE id = 5") == 2);
+        // a again, with the new schema (its catalog is the old one: the cookie changed)
+        CHECK_RC(mw_exec(a, "BEGIN"), SQLITE_OK); CHECK_RC(mw_exec(a, "UPDATE t SET n = n + 1, extra = 'q' WHERE id = 2"), SQLITE_OK);
+        CHECK_RC(mw_exec(b, "UPDATE t SET n = n + 1 WHERE id = 4"), SQLITE_OK);
+        CHECK_RC(mw_exec(a, "COMMIT"), SQLITE_OK);
+        CHECK(mw_scalar(a, "SELECT n FROM t WHERE id = 2") == 1 && mw_scalar(a, "SELECT n FROM t WHERE id = 4") == 1);
+        mw_db_stats st; memset(&st, 0, sizeof st); sqlite3_file_control(a, "main", MW_FCNTL_DBSTATS, &st);
+        printf("10. shared catalog: rebases %llu\n", (unsigned long long)st.rebases);
+        CHECK(st.rebases >= 3);
+        sqlite3_close(a); sqlite3_close(b); sqlite3_close(c); sqlite3_close(d); mw_rmdb(path);
+    }
     MW_DONE();
 }

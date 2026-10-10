@@ -395,12 +395,26 @@ static void run_batch (mw_lane *L, rb_req **b, int n) {
     atomic_fetch_add(&db->n_rebase_ns, now_ns() - t0);
 }
 
+// The catalog of the schema with this cookie: the one that another lane built if there is one (a build is ~20 us a table, and every connection built its own, again at every schema change), else
+// built here and kept for the next. A schema with the same cookie is the same schema: the replay relies on it already.
+static mw_cat *cat_get (mw_lane *lane, uint32_t cookie) {
+    mw_db *db = lane->db; mw_cat *c;
+    pthread_mutex_lock(&db->cat_mu);
+    if (db->cat_shared && db->cat_shared->cookie == cookie) c = mw_cat_ref(db->cat_shared);
+    else {
+        c = mw_cat_build(lane);
+        if (c && c->cookie == cookie) { mw_cat_free(db->cat_shared); db->cat_shared = mw_cat_ref(c); }
+    }
+    pthread_mutex_unlock(&db->cat_mu);
+    return c;
+}
+
 // The commit of `lane` conflicted on pages that it wrote: replay its row changes. SQLITE_OK: committed at *out_epoch (the lane's own pages are not published); MW_CONFLICT: refused.
 int mw_lane_rebase (mw_lane *lane, const uint8_t *const *imgs, uint32_t cookie, uint64_t *out_epoch) {
     mw_db *db = lane->db;
     rb_state *R = lane->rb_state;
     if (!R) { R = calloc(1, sizeof *R); if (!R) return MW_CONFLICT; R->sync = -1; lane->rb_state = R; }     // (-1: the helper's level was not set yet; 0 is a level, synchronous=OFF)
-    if (!R->cat || R->cat->cookie != cookie) { state_reset_stmts(R); mw_cat_free(R->cat); R->cat = mw_cat_build(lane); if (R->cat) { R->ts = calloc((size_t)(R->cat->n ? R->cat->n : 1), sizeof *R->ts); R->nts = R->cat->n; } }
+    if (!R->cat || R->cat->cookie != cookie) { state_reset_stmts(R); mw_cat_free(R->cat); R->cat = cat_get(lane, cookie); if (R->cat) { R->ts = calloc((size_t)(R->cat->n ? R->cat->n : 1), sizeof *R->ts); R->nts = R->cat->n; } }
     if (!R->cat || !R->ts || !R->cat->rebasable || R->cat->cookie != cookie) { atomic_fetch_add(&db->n_unrebasable, 1); return MW_CONFLICT; }
     mw_rd_result res;
     mw_rowdiff_compute(lane, imgs, R->cat, &res);                               // (in parallel: every connection decodes its own pages)

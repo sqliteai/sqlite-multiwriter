@@ -3,6 +3,11 @@
 All notable changes of sqlite-multiwriter are recorded here, newest first. The version is `MW_VERSION` in `src/multiwriter.h`; a version that is not released yet is pushed to `main` and released by the CI.
 The format of the files on disk (`-mwlock`, `-mwidx`, `-mw.N`, `-mw`) is the same in the versions listed here.
 
+## Unreleased
+
+### Changed
+- Documentation: the wording of the isolation limits in the README and in the changelog says what is prevented (the classic write skew, by the validation of the reads) and where it is still possible, instead of "write skew is possible".
+
 ## 0.6.2 - 2026-10-10
 
 ### Changed
@@ -52,7 +57,7 @@ A release of fixes found by a review of every source file; each one was reproduc
 - Android: `make all PLATFORM=android ARCH=...` builds the test programs for an emulator or a device (the suite passes on Android 14 arm64); iOS simulator: the whole suite passes.
 
 ### Known and not changed
-- Write skew is possible (snapshot isolation with read validation, not serializable); see the README.
+- Isolation is snapshot isolation plus the validation of the pages a transaction read, which refuses the classic write skew (two transactions that each read what the other writes). Write skew is still possible with `mw_readcheck=0`, for the reads of page 1 (the header of the file), and across attached databases, which are not atomic together. Serializability is tested (`mw_writeskew`, `mw_serial`), not proved; see the README and `docs/design.md`.
 - Small items from the review that were open are in the Unreleased section above.
 
 ## 0.5.2 - 2026-10-09

@@ -3,6 +3,15 @@
 All notable changes of sqlite-multiwriter are recorded here, newest first. The version is `MW_VERSION` in `src/multiwriter.h`; a version that is not released yet is pushed to `main` and released by the CI.
 The format of the files on disk (`-mwlock`, `-mwidx`, `-mw.N`, `-mw`) is the same in the versions listed here.
 
+## Unreleased
+
+### Changed
+- Compaction writes the changed pages in order of page number and the adjacent ones with one write (runs of up to 64 pages): 19000 pages (75 MB) in 16 ms against 54 ms with threads and 11 ms against 57 ms with processes (page cache, `fsync` included); scattered pages 39 -> 20 ms and 31 -> 8 ms.
+- The rewrite of the log by compaction (one process) copies what came in meanwhile up to the part that is written to the file, not the part that is durable (which with `synchronous` below FULL lags far behind), and in up to four rounds: the part copied with the commits stopped went from about 100 MB to a few, and the stop from 12 ms to 4 ms for each compaction under 8 writer threads (190k commits/s). The rest of the stop (3.7 ms) is the swap of the mapping.
+
+### Added
+- Test `mw_compactruns` (runs longer than 64 pages, single pages, gaps, a growing database; both modes; the file opened with the stock VFS).
+
 ## 0.6.1 - 2026-10-10
 
 ### Fixed

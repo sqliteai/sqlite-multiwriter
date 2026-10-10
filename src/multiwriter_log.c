@@ -994,7 +994,7 @@ static int copy_range (int from_fd, int to_fd, uint64_t from, uint64_t to, uint6
 void mw_log_rewrite_abort (mw_log_prep *p) { if (!p) return; if (p->nfd >= 0) close(p->nfd); if (p->tmp) { unlink(p->tmp); sqlite3_free(p->tmp); } free(p); }
 mw_log_prep *mw_log_rewrite_prepare (mw_db *db, uint64_t base_epoch) {
     if (db->mp || db->mp_req || db->logfd < 0 || !db->store || atomic_load(&db->log_mode) != 2) return NULL;
-    uint64_t E; pthread_mutex_lock(&db->log_mu); E = db->synced_off; pthread_mutex_unlock(&db->log_mu);          // (everything below is in the file, whole records)
+    uint64_t E; pthread_mutex_lock(&db->log_mu); E = db->flushed_off; pthread_mutex_unlock(&db->log_mu);          // (everything below is in the file, whole records: not the durable part, synced_off, which with synchronous<FULL lags far behind and left a copy of all that came in meanwhile for the part under the lock)
     uint64_t first = 0; uint64_t bound = scan_fd_after(db, base_epoch, LOG_HDR_SIZE, E, &first);
     if (!first) return NULL;
     mw_log_prep *p = calloc(1, sizeof *p); if (!p) return NULL;
@@ -1008,10 +1008,14 @@ mw_log_prep *mw_log_rewrite_prepare (mw_db *db, uint64_t base_epoch) {
     if (rc == SQLITE_OK) rc = pwrite_all(p->nfd, &h, sizeof h, 0);
     if (rc == SQLITE_OK) rc = copy_range(db->logfd, p->nfd, first, bound, LOG_HDR_SIZE);
     if (rc == SQLITE_OK) p->copied_end = bound;
-    if (rc == SQLITE_OK && bound > first) {                                                      // a second round: what came in while the first one was copied
-        pthread_mutex_lock(&db->log_mu); E = db->synced_off; pthread_mutex_unlock(&db->log_mu);
+    for (int round = 0; rc == SQLITE_OK && bound > first && round < 4; round++) {                  // more rounds: what came in while the last one was copied (what is left is copied under the lock, which stops the commits)
+        pthread_mutex_lock(&db->log_mu); E = db->flushed_off; pthread_mutex_unlock(&db->log_mu);
         uint64_t b2 = scan_fd_after(db, UINT64_MAX, bound, E, NULL);
-        if (b2 > bound && copy_range(db->logfd, p->nfd, bound, b2, LOG_HDR_SIZE + (bound - first)) == SQLITE_OK) p->copied_end = b2;
+        if (b2 <= bound) break;
+        if (copy_range(db->logfd, p->nfd, bound, b2, LOG_HDR_SIZE + (bound - first)) != SQLITE_OK) break;
+        const bool small = b2 - bound < ((uint64_t)1 << 20);
+        p->copied_end = bound = b2;
+        if (small) break;
     }
     if (rc == SQLITE_OK && mw_io_fsync(p->nfd) != 0) rc = SQLITE_IOERR_FSYNC;                      // (the bulk is on the disk before the lock is taken)
     if (rc != SQLITE_OK) { mw_log_rewrite_abort(p); return NULL; }

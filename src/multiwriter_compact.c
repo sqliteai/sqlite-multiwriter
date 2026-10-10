@@ -33,6 +33,8 @@ static uint64_t now_ns (void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+static int cmp_u32c (const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
+
 int mw_db_compact (mw_db *db, mw_compact_result *out) {
     if (db->mp_req) return mw_shared_compact(db, out);
     mw_compact_result local;
@@ -69,22 +71,44 @@ int mw_db_compact (mw_db *db, mw_compact_result *out) {
     st->dirty_head = 0;
     pthread_mutex_unlock(&st->list_mu);
     uint32_t detached = head;                                      // (kept for step 3)
-    for (uint32_t h = head; h && rc == SQLITE_OK; ) {
-        uint32_t pgno = h - 1;
-        bool have = false;
-        pthread_mutex_t *mu = &st->stripes[pgno % MW_STRIPES].mu;
-        mw_chain *c = mw_store_chain(st, pgno);
-        mw_spinlock(mu);
-        h = c->dirty_next;
-        int k = -1;
-        for (int lo = 0, hi = c->n - 1; lo <= hi; ) { int mid = (lo + hi) / 2; if (c->v[mid].epoch <= T) { k = mid; lo = mid + 1; } else hi = mid - 1; }
-        if (k >= 0 && c->v[k].epoch > base) { memcpy(page, c->v[k].data, pgsz); have = true; }
-        pthread_mutex_unlock(mu);
-        if (!have) continue;
-        ssize_t w = mw_io_pwrite(db->fd_real, page, pgsz, (off_t)(pgno - 1) * (off_t)pgsz);
-        if (w != (ssize_t)pgsz) rc = SQLITE_IOERR_WRITE;
-        else out->pages_written++;
+    // The pages are written in order of page number, the adjacent ones with one write: the dirty list is in the order the pages were first written, which is the order of the commits, and one
+    // pwrite for each page of a 4 KB that a neighbour could have shared.
+    uint32_t npg = 0, capg = 1024; uint32_t *order = malloc((size_t)capg * sizeof *order);
+    for (uint32_t h = head; h && order; ) {
+        if (npg == capg) { capg *= 2; uint32_t *no = realloc(order, (size_t)capg * sizeof *order); if (!no) { free(order); order = NULL; break; } order = no; }
+        order[npg++] = h - 1;
+        mw_chain *c = mw_store_chain(st, h - 1);
+        pthread_mutex_t *mu = &st->stripes[(h - 1) % MW_STRIPES].mu;
+        mw_spinlock(mu); h = c->dirty_next; pthread_mutex_unlock(mu);
     }
+    enum { RUNMAX = 64 };
+    uint8_t *run = order ? malloc((size_t)RUNMAX * pgsz) : NULL;
+    if (!order || !run) { free(order); free(run); rc = SQLITE_NOMEM; goto done_pages; }
+    qsort(order, npg, sizeof *order, cmp_u32c);
+    for (uint32_t i = 0; i < npg && rc == SQLITE_OK; ) {
+        uint32_t first = 0; int n = 0;
+        for (; i < npg && n < RUNMAX; i++) {                       // (a run of pages that are adjacent in the file and that have a version to write)
+            uint32_t pgno = order[i];
+            if (n > 0 && pgno != first + (uint32_t)n) break;
+            pthread_mutex_t *mu = &st->stripes[pgno % MW_STRIPES].mu;
+            mw_chain *c = mw_store_chain(st, pgno);
+            mw_spinlock(mu);
+            int k = -1;
+            for (int lo = 0, hi = c->n - 1; lo <= hi; ) { int mid = (lo + hi) / 2; if (c->v[mid].epoch <= T) { k = mid; lo = mid + 1; } else hi = mid - 1; }
+            bool have = k >= 0 && c->v[k].epoch > base;
+            if (have) memcpy(run + (size_t)n * pgsz, c->v[k].data, pgsz);
+            pthread_mutex_unlock(mu);
+            if (!have) { if (n == 0) continue; else { i++; break; } }     // (a page with nothing to write ends the run)
+            if (n == 0) first = pgno;
+            n++;
+        }
+        if (n > 0) {
+            ssize_t w = mw_io_pwrite(db->fd_real, run, (size_t)n * pgsz, (off_t)(first - 1) * (off_t)pgsz);
+            if (w != (ssize_t)((size_t)n * pgsz)) rc = SQLITE_IOERR_WRITE; else out->pages_written += (uint64_t)n;
+        }
+    }
+    free(order); free(run);
+done_pages:;
     free(page);
     // File size at T from the in-header database size of page 1 as of T (exact: SQLite maintains it on every commit that
     // changes the size). The size *records* cannot be used here: in multi-process mode T can be older than this

@@ -407,11 +407,19 @@ int mw_shared_compact (mw_db *db, mw_compact_result *out) {
     if (!c.page) { rc = SQLITE_NOMEM; goto done_busy; }
     shidx_scan(db->ix, base, T, cmp_collect, &c);
     rc = c.rc;
-    for (uint32_t i = 0; i < c.n && rc == SQLITE_OK; i++) {
-        if (mw_seglog_read(db, c.locs[i], 0, (uint32_t)c.pgsz, c.page) != 1) { rc = SQLITE_IOERR_READ; break; }
-        ssize_t w = mw_io_pwrite(fd, c.page, c.pgsz, (off_t)(c.list[i] - 1) * (off_t)c.pgsz);
-        if (w != (ssize_t)c.pgsz) rc = SQLITE_IOERR_WRITE; else out->pages_written++;
+    // (in order of page number: the adjacent pages go to the file with one write)
+    enum { RUNMAX = 64 };
+    uint8_t *run = malloc((size_t)RUNMAX * c.pgsz);
+    if (!run) rc = SQLITE_NOMEM;
+    for (uint32_t i = 0; i < c.n && rc == SQLITE_OK; ) {
+        uint32_t first = c.list[i]; int n = 0;
+        for (; i < c.n && n < RUNMAX && c.list[i] == first + (uint32_t)n; i++, n++)
+            if (mw_seglog_read(db, c.locs[i], 0, (uint32_t)c.pgsz, run + (size_t)n * c.pgsz) != 1) { rc = SQLITE_IOERR_READ; break; }
+        if (rc != SQLITE_OK) break;
+        ssize_t w = mw_io_pwrite(fd, run, (size_t)n * c.pgsz, (off_t)(first - 1) * (off_t)c.pgsz);
+        if (w != (ssize_t)((size_t)n * c.pgsz)) rc = SQLITE_IOERR_WRITE; else out->pages_written += (uint64_t)n;
     }
+    free(run);
     uint32_t size_pages = 0;
     if (rc == SQLITE_OK && shidx_dbsize(db->ix, T, &size_pages) && size_pages && mw_io_ftruncate(fd, (off_t)size_pages * (off_t)c.pgsz) != 0) rc = SQLITE_IOERR_TRUNCATE;
     if (rc == SQLITE_OK && mw_io_fsync(fd) != 0) rc = SQLITE_IOERR_FSYNC;

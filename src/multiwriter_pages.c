@@ -529,7 +529,7 @@ fail_free:
 }
 
 // Admission limit for synchronous<FULL (MW_ADMIT; 0 = unlimited). Default: the number of cores, at most 16 and at least 4 (measured: 64 agents 34k -> 49k with 16 on 18 cores).
-static int admit_cap (void) { static _Atomic int c = MW_KNOB_UNSET; long n = sysconf(_SC_NPROCESSORS_ONLN); return mw_knob_int(&c, "MW_ADMIT", n < 4 ? 4 : n > 16 ? 16 : (int)n); }
+static int admit_cap (void) { static _Atomic int c = MW_KNOB_UNSET; static long ncpu = 0; long n = ncpu; if (!n) { n = sysconf(_SC_NPROCESSORS_ONLN); ncpu = n; } return mw_knob_int(&c, "MW_ADMIT", n < 4 ? 4 : n > 16 ? 16 : (int)n); }
 
 int mw_db_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uint32_t *pgnos, const uint8_t *const *images, int n, uint32_t ws_dbsize, uint32_t snap_dbsize, int sync, uint64_t *out_epoch) {
     if (!db->mp) {

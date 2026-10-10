@@ -43,6 +43,28 @@ int main (void) {
     sqlite3_finalize(sel);
     CHECK(mw_scalar(a, "SELECT sum(v) FROM t") == 7);              // a's first + b's; the refused one left no trace
 
+    // many pages: a commit of more than 64 pages, then single rows (pages already in the list of what the snapshot wrote, and new ones), in one read snapshot; every one of them must be
+    // found in the list of the pages this connection wrote (a page missing from it is a conflict with itself)
+    CHECK_RC(mw_exec(a, "CREATE TABLE big(id INTEGER PRIMARY KEY, v INTEGER, pad TEXT)"), SQLITE_OK);
+    CHECK_RC(mw_exec(a, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 3000) INSERT INTO big SELECT x, 0, printf('%0100d', x) FROM c"), SQLITE_OK);
+    CHECK_RC(mw_exec(b, "SELECT 1"), SQLITE_OK);
+    CHECK_RC(sqlite3_prepare_v2(a, "SELECT id FROM big ORDER BY id", -1, &sel, NULL), SQLITE_OK);
+    CHECK_RC(sqlite3_step(sel), SQLITE_ROW);
+    CHECK_RC(mw_exec(a, "UPDATE big SET v=v+1"), SQLITE_OK);                                       // (about 100 pages: the list is built from a commit of more than 64)
+    ok = 0;
+    for (int i = 0; i < 40; i++) {
+        char sql[80]; snprintf(sql, sizeof sql, "UPDATE big SET v=v+1 WHERE id=%d", 1 + (i * 73) % 3000);
+        if (mw_exec(a, sql) == SQLITE_OK) ok++;
+    }
+    CHECK(ok == 40);
+    for (int i = 0; i < 40; i++) {                                                                  // (the same rows again: the pages are in the list: one entry for each)
+        char sql[80]; snprintf(sql, sizeof sql, "UPDATE big SET v=v+1 WHERE id=%d", 1 + (i * 73) % 3000);
+        if (mw_exec(a, sql) == SQLITE_OK) ok++;
+    }
+    CHECK(ok == 80);
+    sqlite3_finalize(sel);
+    CHECK(mw_scalar(a, "SELECT sum(v) FROM big") == 3000 + 80);
+
     sqlite3_close(a); sqlite3_close(b);
     mw_rmdb(path);
     MW_DONE();

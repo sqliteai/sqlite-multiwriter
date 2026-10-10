@@ -414,9 +414,10 @@ void mw_mp_writing (mw_lane *lane, bool on) {
 // With N processes all of them contend for the one publication lock, and past ~32 processes the throughput *falls* with N
 // (64: 5k, 128: 2k tx/s against 9.6k at 32). It engages with more than 1.5 processes per core.. Only a limited number of writer transactions may be in flight at once; the others sleep before taking their snapshot. FIFO tickets order the waiters, the first few poll the slot table, the rest sleep in proportion to their distance. A wait is
 // bounded (a transaction that cannot get a slot in 50 ms goes ahead without one) so that a holder that stays open for long, or a dead one, can never stop the others.
+static long mp_ncpu (void) { static long ncpu = 0; long n = ncpu; if (!n) { n = sysconf(_SC_NPROCESSORS_ONLN); if (n < 1) n = 1; ncpu = n; } return n; }     // (a system call per transaction otherwise)
 static int mp_admit_cap (int nprocs) {
     static _Atomic int c = MW_KNOB_UNSET;
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    long n = mp_ncpu();
     int big = (int)(n * 2 < 2 ? 2 : n * 2 > 64 ? 64 : n * 2), small = (int)(n / 3 < 2 ? 2 : n / 3 > 16 ? 16 : n / 3);
     // 2 per core while the processes are up to ~14 per core; beyond that (1000 processes on 18 cores) a small number of writers at a time does better: 6 against 36 there is 7.3k against 5.2k tx/s
     int v = mw_knob_int(&c, "MW_MP_ADMIT", 0); if (v <= 0) v = nprocs > 14 * (int)n ? small : big;       // (0: not set; the default depends on the processes now there)
@@ -444,7 +445,7 @@ int mw_mp_admit (mw_lane *lane) {
     if (lane->adm_check++ % 64 == 0) {                                     // (how many processes are there? not worth a scan per transaction)
         int n = 0; for (int i = 0; i < MW_MP_PROCS; i++) if (atomic_load_explicit(&sh->procs[i].pid, memory_order_relaxed) > 0) n++;
         static _Atomic int from_c = MW_KNOB_UNSET;
-        const int from = mw_knob_int(&from_c, "MW_MP_ADMIT_FROM", (int)(sysconf(_SC_NPROCESSORS_ONLN) * 3 / 2));     // (below ~1.5 processes per core admission costs 10% and gains nothing)
+        const int from = mw_knob_int(&from_c, "MW_MP_ADMIT_FROM", (int)(mp_ncpu() * 3 / 2));     // (below ~1.5 processes per core admission costs 10% and gains nothing)
         atomic_store_explicit(&db->mp_nprocs, n, memory_order_relaxed);
         lane->adm_crowded = n > cap && n > from;
     }
@@ -495,7 +496,6 @@ void mw_mp_admit_release (mw_lane *lane) {
     if (lane->adm_slot < 0) return;
     MW_T1(MW_ST_ADM_HOLD, lane->adm_t0);
     if (mw_timing_on) { int busy = 0; int cap = mp_admit_cap(atomic_load(&lane->db->mp_nprocs)); for (int i = 0; i < cap; i++) if (atomic_load(&lane->db->shm->adm_slot_pid[i]) != 0) busy++; mw_count_add(MW_C_ADM_BUSY, (uint64_t)busy); mw_count_add(MW_C_ADM_SAMPLES, 1); uint64_t tk = atomic_load(&lane->db->shm->adm_ticket), ad = atomic_load(&lane->db->shm->adm_admitted); mw_count_add(MW_C_ADM_WAITERS, tk > ad ? tk - ad : 0); }
-    { struct timespec nw; clock_gettime(CLOCK_MONOTONIC, &nw); atomic_store(&lane->db->shm->adm_slot_rel_ns[lane->adm_slot], (uint64_t)nw.tv_sec * 1000000000ull + (uint64_t)nw.tv_nsec); }
     atomic_store_explicit(&lane->db->shm->adm_slot_pid[lane->adm_slot], 0, memory_order_release);
     lane->adm_slot = -1;
     { mw_shm *sh = lane->db->shm; uint64_t adm = atomic_load(&sh->adm_admitted); if (atomic_load(&sh->adm_ticket) > adm) adm_wake_head(sh, adm); }          // a slot is free: the head waiter takes it

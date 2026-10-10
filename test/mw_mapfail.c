@@ -74,7 +74,7 @@ int main (void) {
         sqlite3 *d; if (sqlite3_open_v2(uri, &d, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) _exit(2);
         sqlite3_busy_timeout(d, 0);
         mw_scalar(d, "SELECT count(*) FROM t");
-        no_more_descriptors(); int n = 0;
+        no_more_descriptors();
         int rc = mw_exec(d, "INSERT INTO t VALUES (1000, 'W')");
         (void)!write(pw[1], &rc, sizeof rc);
         _exit(0);

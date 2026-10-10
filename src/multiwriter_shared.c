@@ -309,7 +309,6 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
     mw_fault_hit(MW_CRASH_AFTER_LOG);
     mw_fault_hit(MW_CRASH_AFTER_VISIBLE);
     if (!lane && sync) { int src = mw_seglog_sync(db, seg, end); if (src != SQLITE_OK) { atomic_store(&db->failed, 1); return src; } }
-    atomic_store(&sh->procs[db->mp_proc].applied, epoch);
     if (db->gc_interval > 0 && (atomic_fetch_add(&db->publishes_since_gc, 1) + 1) >= (uint64_t)db->gc_interval) { atomic_store(&db->publishes_since_gc, 0); shared_gc(db); }
     if (db->log_max_bytes && mw_seglog_bytes(db) > mw_log_limit(db)) {
         mw_db_compactor_kick(db);

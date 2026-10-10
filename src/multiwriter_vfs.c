@@ -8,6 +8,7 @@
 
 #include <stdatomic.h>
 #include <string.h>
+#include <ctype.h>
 #include "multiwriter_internal.h"
 #include "multiwriter_io.h"
 
@@ -41,10 +42,43 @@ static void tl_init (void) { pthread_key_create(&tl_key, tl_exit); }
 uint64_t mw_vfs_event_count (mw_event_t ev) { return (ev < MW_EV_COUNT) ? atomic_load(&mw_counts[ev]) + tl_cnt[ev] : 0; }
 void mw_vfs_events_reset (void) { for (int i = 0; i < MW_EV_COUNT; ++i) { atomic_store(&mw_counts[i], 0); tl_cnt[i] = 0; } tl_n = 0; }
 // Statement hook (sqlite3_trace_v2): recognises DDL/VACUUM, raises the schema barrier before it runs and gives it back, if it is still idle, when the statement ends.
+// The next word of a statement (an identifier, quoted or not) in lower case, and what follows it. Comments and spaces before it are skipped; "" for the end or for a character that is not part of one.
+static const char *ddl_word (const char *p, char *out, size_t cap) {
+    p = mw_sql_skip(p);
+    size_t n = 0; char close = 0;
+    if (*p == '"' || *p == '`') close = *p++; else if (*p == '[') { close = ']'; p++; }
+    while (*p && (close ? *p != close : (isalnum((unsigned char)*p) || *p == '_'))) { if (n + 1 < cap) out[n++] = (char)tolower((unsigned char)*p); p++; }
+    if (close && *p == close) p++;
+    out[n] = 0;
+    return p;
+}
+// A statement that changes only the temporary schema (CREATE TEMP ..., CREATE TABLE temp.x, DROP TABLE temp.x, ALTER TABLE temp.x): it does not touch the database file, so the barrier that
+// waits (up to 2 s) for the write transactions of the other connections, and holds off the ones that come after, is not needed. Anything that is not clearly that is a change of the schema.
+static bool mw_is_temp_ddl (const char *sql) {
+    char w[32]; const char *p = ddl_word(sql, w, sizeof w);
+    bool create = strcmp(w, "create") == 0, drop = strcmp(w, "drop") == 0, alter = strcmp(w, "alter") == 0;
+    if (!create && !drop && !alter) return false;
+    p = ddl_word(p, w, sizeof w);
+    if (create) {
+        if (strcmp(w, "unique") == 0) p = ddl_word(p, w, sizeof w);
+        if (strcmp(w, "temp") == 0 || strcmp(w, "temporary") == 0) return true;
+        if (strcmp(w, "virtual") == 0) p = ddl_word(p, w, sizeof w);
+    }
+    if (strcmp(w, "table") && strcmp(w, "view") && strcmp(w, "trigger") && strcmp(w, "index")) return false;
+    p = ddl_word(p, w, sizeof w);
+    if (strcmp(w, "if") == 0) {                                                                 // IF NOT EXISTS / IF EXISTS
+        p = ddl_word(p, w, sizeof w);
+        if (strcmp(w, "not") == 0) p = ddl_word(p, w, sizeof w);
+        if (strcmp(w, "exists") != 0) return false;
+        p = ddl_word(p, w, sizeof w);
+    }
+    p = mw_sql_skip(p);
+    return strcmp(w, "temp") == 0 && *p == '.';                                                  // (the schema name, then a dot)
+}
 static bool mw_is_ddl_sql (const char *sql) {
     sql = mw_sql_skip(sql);
     static const char *kw[] = { "CREATE", "DROP", "ALTER", "REINDEX", "VACUUM" };
-    for (unsigned i = 0; i < sizeof(kw) / sizeof(kw[0]); i++) if (sqlite3_strnicmp(sql, kw[i], (int)strlen(kw[i])) == 0) return true;
+    for (unsigned i = 0; i < sizeof(kw) / sizeof(kw[0]); i++) if (sqlite3_strnicmp(sql, kw[i], (int)strlen(kw[i])) == 0) return !mw_is_temp_ddl(sql);
     return false;
 }
 static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {

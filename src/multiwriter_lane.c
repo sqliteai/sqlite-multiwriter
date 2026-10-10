@@ -441,14 +441,20 @@ static int lane_commit_frame (mw_lane *lane, int k, uint32_t dbsize) {
             lane->own_cap = cap;
         }
         const uint64_t ce = lane->tx.commit_epoch;
-        for (int i = 0; i < lane->ws_n; i++) { lane->own_ep[lane->own_n] = ce; lane->own_pg[lane->own_n++] = lane->ws_pgnos[i]; }
-        // sorted by page, and for equal pages the latest commit first; one entry for each page, with the epoch of the commit that wrote it last
-        { int n = lane->own_n; pe_t *t = malloc((size_t)n * sizeof *t);
+        // The list is sorted by page with one entry for each page (the epoch of the commit that wrote it last). This commit's pages (distinct, with the newest epoch) are sorted and merged in
+        // from the back: linear in the list, not a sort of everything it has grown to over the commits of a long snapshot.
+        { int nn = lane->ws_n, no = lane->own_n; pe_t tb[64], *t = nn <= 64 ? tb : malloc((size_t)nn * sizeof *t);
           if (!t) { lane->commit_base = 0; return rc; }
-          for (int i = 0; i < n; i++) { t[i].pg = lane->own_pg[i]; t[i].ep = lane->own_ep[i]; }
-          qsort(t, (size_t)n, sizeof *t, cmp_pe);
-          int u = 0; for (int i = 0; i < n; i++) if (i == 0 || t[i].pg != lane->own_pg[u - 1]) { lane->own_pg[u] = t[i].pg; lane->own_ep[u] = t[i].ep; u++; }
-          lane->own_n = u; free(t); }
+          for (int i = 0; i < nn; i++) { t[i].pg = lane->ws_pgnos[i]; t[i].ep = ce; }
+          if (nn > 1) qsort(t, (size_t)nn, sizeof *t, cmp_pe);
+          int dup = 0; for (int i = 0, j = 0; i < no && j < nn; ) { if (lane->own_pg[i] < t[j].pg) i++; else if (lane->own_pg[i] > t[j].pg) j++; else { dup++; i++; j++; } }
+          int i = no - 1, j = nn - 1, k = no + nn - dup - 1;
+          while (j >= 0) {
+              if (i >= 0 && lane->own_pg[i] > t[j].pg) { lane->own_pg[k] = lane->own_pg[i]; lane->own_ep[k] = lane->own_ep[i]; k--; i--; }
+              else { if (i >= 0 && lane->own_pg[i] == t[j].pg) i--; lane->own_pg[k] = t[j].pg; lane->own_ep[k] = t[j].ep; k--; j--; }
+          }
+          lane->own_n = no + nn - dup;
+          if (t != tb) free(t); }
         lane->own_epoch = lane->tx.commit_epoch;
     }
     return rc;

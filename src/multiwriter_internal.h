@@ -41,7 +41,7 @@ typedef struct {
 } mw_mp_slot;
 typedef struct {
     _Atomic int32_t  pid;
-    _Atomic uint64_t applied;             // epoch this process has applied from the log
+    _Atomic uint64_t applied;             // (not used any more; kept for the layout of the header)
 } mw_mp_proc;
 #define MW_LOG_END(p) ((p) & (((uint64_t)1 << 40) - 1))
 #define MW_LOG_GEN(p) ((p) >> 40)
@@ -66,7 +66,7 @@ typedef struct mw_shm {
     _Atomic uint64_t  adm_ticket, adm_admitted;  // admission control of writer transactions across processes (see mw_mp_admit): FIFO tickets, highest ticket processed
     _Atomic uint32_t  adm_wake[1024];      // admission: the word the waiter with ticket t sleeps on at [t % 1024]; changed + woken when it is its turn
     _Atomic int32_t   adm_tk_pid[1024];    // pid that took each ticket (a queued process that died is skipped)
-    _Atomic uint64_t  adm_slot_rel_ns[64];   // when each slot was last released (CLOCK_MONOTONIC, ns): the gap until the next grab is measured
+    _Atomic uint64_t  adm_slot_rel_ns[64];   // (not used any more; kept for the layout of the header)
     _Atomic int32_t   adm_slot_pid[64];   // slot holders (pid, 0 = free); a dead holder's slot is freed by the waiters
     _Atomic int32_t   ddl_pid;            // process running a schema change (exclusive schema barrier across processes), 0 = none
     _Atomic int64_t   dbv_counter;        // highest db_version ever reserved

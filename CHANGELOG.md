@@ -3,6 +3,21 @@
 All notable changes of sqlite-multiwriter are recorded here, newest first. The version is `MW_VERSION` in `src/multiwriter.h`; a version that is not released yet is pushed to `main` and released by the CI.
 The format of the files on disk (`-mwlock`, `-mwidx`, `-mw.N`, `-mw`) is the same in the versions listed here.
 
+## Unreleased
+
+### Fixed
+- **Slots of dead processes.** A process killed while it cleaned the slot of a dead one left that slot at -1 for ever (the slots, 8192 of them, were lost one by one); the cleaner marks the slot with its own pid now and the next one takes it over, and it checks the owner again after it took the slot (a process that was given the same pid keeps it). The same in the registry of the shared index.
+- **Ticket ring of the publication lock.** With 1024 or more tickets outstanding a new ticket shared its place with the one at the head, the dead owner of the head was never skipped and every commit hung. No more than 1024 are out now. A dead ticket in the queue also cost 160 ms to skip (a thousand of them minutes); a waiter that wakes up or has just skipped one looks at the head at once.
+
+### Added
+- Tests `mw_slotstuck`, `mw_ticketring`, and `mw_rebasecases` 11 (the ON CONFLICT clauses of a table give what a serial execution gives, or the commit is refused).
+- README: what a schema change waits for and what a transaction that overlapped it gets.
+
+### Looked at, no change
+- `PRAGMA data_version` changes at every read transaction in the engine (every snapshot starts with a cold page cache): it was already in the limits of the README; it cannot be used to detect the commits of other connections.
+- ON CONFLICT clauses (`REPLACE`, `IGNORE`, `NOT NULL ON CONFLICT REPLACE`) in rebased commits: the result is what a serial execution gives (the other writer first); no defect found.
+- Entries of the shared index that a process killed inside the garbage collection leaves between cutting a chain and freeing it: they are not on the free list until the index is rebuilt (the next open after every process has left); the loss is bounded by one chain per kill.
+
 ## 0.6.0 - 2026-10-10
 
 A release of fixes found by a review of every source file; each one was reproduced first and has a test that fails without it. No change of the interface.
@@ -29,7 +44,7 @@ A release of fixes found by a review of every source file; each one was reproduc
 
 ### Known and not changed
 - Write skew is possible (snapshot isolation with read validation, not serializable); see the README.
-- Small items from the review that are open: reclaim of a snapshot slot after a pid reuse in a rare interleaving, a ticket ring of 1024 (more waiters than that share slots), some leaks of index entries in the chain GC, `data_version` that changes at every read.
+- Small items from the review that were open are in the Unreleased section above.
 
 ## 0.5.2 - 2026-10-09
 

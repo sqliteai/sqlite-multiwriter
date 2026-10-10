@@ -77,7 +77,7 @@ static void mp_drop_own_stale (mw_db *db) {
     mw_shm *sh = db->shm; const int32_t me = (int32_t)getpid();
     for (int i = 0; i < MW_MP_SLOTS; i++) {
         int32_t p = atomic_load(&sh->slots[i].pid);
-        if (p == me && atomic_compare_exchange_strong(&sh->slots[i].pid, &p, -1)) {
+        if (p == me && atomic_compare_exchange_strong(&sh->slots[i].pid, &p, -(me + 1))) {
             atomic_store(&sh->slots[i].snap, MW_MP_NONE); atomic_store(&sh->slots[i].minres, 0); atomic_store(&sh->slots[i].writing, 0); atomic_store(&sh->slots[i].pid, 0);
         }
     }
@@ -216,27 +216,52 @@ static bool mp_ticket_lock (void) { static _Atomic int c = MW_KNOB_UNSET; return
 // The publication lock as a FIFO ticket queue in the shared header. With the polling lock every waiting process woke up every 50 us (64 processes: over a million
 // wake-ups a second competing with the holder for the cores); here only the first two in the queue poll fast, the others sleep for about as long as the processes ahead
 // of them need, and the lock goes to the next ticket in order.
+// A ticket of the publication lock. The ring that holds the pid and the wake word of each ticket has 1024 places: a ticket 1024 or more ahead of the one that is served would share them with it, and
+// the newcomer (alive) would hide the dead owner of the ticket at the head, which nobody would ever skip. So no more than 1024 tickets are outstanding: when they are all out (that many processes
+// queued, or that many dead ones in front that are not skipped yet) the newcomer skips the dead head itself and waits for the others.
+static uint64_t take_ticket (mw_db *db) {
+    mw_shm *sh = db->shm; const int32_t me = (int32_t)getpid();
+    uint64_t stall_s = UINT64_MAX, stall_ns = 0;
+    for (;;) {
+        uint64_t s = atomic_load_explicit(&sh->pub_serving, memory_order_acquire), t = atomic_load_explicit(&sh->pub_ticket, memory_order_relaxed);
+        if (t - s < 1024) {
+            if (atomic_compare_exchange_weak(&sh->pub_ticket, &t, t + 1)) { atomic_store(&sh->pub_tk_pid[t % 1024], me); return t; }
+            continue;
+        }
+        int32_t pid = atomic_load(&sh->pub_tk_pid[s % 1024]);
+        if (pid > 0 && pid != me && !pid_alive(db, pid)) {
+            if (atomic_compare_exchange_strong(&sh->pub_serving, &s, s + 1)) atomic_store_explicit(&sh->pub_tk_pid[s % 1024], 0, memory_order_relaxed);
+            continue;
+        }
+        if (pid == 0) {                                                                                 // (the head never wrote its pid: as in the queue below, skipped after half a second with the lock free)
+            uint64_t nowns = mw_stage_now();
+            if (stall_s != s) { stall_s = s; stall_ns = nowns; }
+            else if (nowns - stall_ns > 500000000ull && atomic_load(&sh->pub_owner) == 0 && atomic_compare_exchange_strong(&sh->pub_serving, &s, s + 1)) stall_s = UINT64_MAX;
+        } else stall_s = UINT64_MAX;
+        struct timespec ts = { 0, 100000 }; nanosleep(&ts, NULL);
+    }
+}
 void mw_mp_lock (mw_db *db) {
     pthread_mutex_lock(&db->mp_mu);
     mw_shm *sh = db->shm;
     int32_t me = (int32_t)getpid();
     if (mp_ticket_lock()) {
-        uint64_t t = atomic_fetch_add(&sh->pub_ticket, 1);
-        atomic_store(&sh->pub_tk_pid[t % 1024], me);
+        uint64_t t = take_ticket(db);
         uint64_t stall_s = UINT64_MAX, stall_ns = 0;                                                    // (the ticket being served and since when: one whose owner never wrote its pid)
+        bool look = false;                                                                                  // (look at the head now: a wait that timed out, or a ticket that was just skipped, and not every 32nd poll: a dead ticket cost 160 ms, a thousand of them minutes)
         for (unsigned polls = 0; ; polls++) {
+            const bool chk = look || (polls & 31) == 31; look = false;
             uint32_t wk = atomic_load_explicit(&sh->pub_wake[t % 1024], memory_order_acquire);          // (sampled before the queue is looked at: a wake in between is not lost)
             uint64_t s = atomic_load_explicit(&sh->pub_serving, memory_order_acquire);
             if (s == t) {
                 int32_t exp = 0;
                 if (atomic_compare_exchange_strong_explicit(&sh->pub_owner, &exp, me, memory_order_acquire, memory_order_relaxed)) { return; }
-                if (exp != me && (polls & 31) == 31 && !pid_alive(db, exp) && atomic_compare_exchange_strong(&sh->pub_owner, &exp, me)) { mw_shared_repair(db); return; }   // the holder died
+                if (exp != me && chk && !pid_alive(db, exp) && atomic_compare_exchange_strong(&sh->pub_owner, &exp, me)) { mw_shared_repair(db); return; }   // the holder died
             } else if (s > t) {                                                                             // our ticket was skipped (we looked dead for too long): a new one
-                t = atomic_fetch_add(&sh->pub_ticket, 1);
-                atomic_store(&sh->pub_tk_pid[t % 1024], me);
+                t = take_ticket(db);
                 stall_s = UINT64_MAX;
                 continue;
-            } else if (s < t && (polls & 31) == 31) {
+            } else if (s < t && chk) {
                 int32_t pid = atomic_load(&sh->pub_tk_pid[s % 1024]);
                 if (pid == 0) {                                                                         // the owner of this ticket has not written its pid: it is a moment from it, or it died between taking the ticket and that, and nobody would ever skip it
                     uint64_t nowns = mw_stage_now();
@@ -246,14 +271,14 @@ void mw_mp_lock (mw_db *db) {
                         stall_s = UINT64_MAX;
                     }
                 } else stall_s = UINT64_MAX;
-                if (pid > 0 && (pid != me && !pid_alive(db, pid))) { if (getenv("MW_DEBUG")) fprintf(stderr, "pid %d: skipping ticket %llu of pid %d (owner %d)\n", (int)me, (unsigned long long)s, (int)pid, (int)atomic_load(&sh->pub_owner)); if (atomic_compare_exchange_strong(&sh->pub_serving, &s, s + 1)) atomic_store_explicit(&sh->pub_tk_pid[s % 1024], 0, memory_order_relaxed); }   // (slot cleared once its ticket is past: a dead pid left by the ticket 1024 earlier must not get a fresh ticket skipped) a queued process that gave up (-1) or died: skip its ticket
+                if (pid > 0 && (pid != me && !pid_alive(db, pid))) { if (getenv("MW_DEBUG")) fprintf(stderr, "pid %d: skipping ticket %llu of pid %d (owner %d)\n", (int)me, (unsigned long long)s, (int)pid, (int)atomic_load(&sh->pub_owner)); if (atomic_compare_exchange_strong(&sh->pub_serving, &s, s + 1)) { atomic_store_explicit(&sh->pub_tk_pid[s % 1024], 0, memory_order_relaxed); look = true; continue; } }   // (slot cleared once its ticket is past: a dead pid left by the ticket 1024 earlier must not get a fresh ticket skipped) a queued process that gave up (-1) or died: skip its ticket
             }
             uint64_t ahead = s < t ? t - s : 0;
             if (polls == 3000 && getenv("MW_DEBUG")) fprintf(stderr, "pid %d: lock stuck: ticket %llu serving %llu owner %d tk_pid[s] %d shared %d\n", (int)me, (unsigned long long)t, (unsigned long long)s, (int)atomic_load(&sh->pub_owner), (int)atomic_load(&sh->pub_tk_pid[s % 1024]), (int)db->mp_req);
             static _Atomic int fast_c = MW_KNOB_UNSET, per_c = MW_KNOB_UNSET, cap_c = MW_KNOB_UNSET;
             const int fast = mw_knob_int(&fast_c, "MW_MP_FAST", 2); (void)per_c; (void)cap_c;
             if (ahead <= (uint64_t)fast) { if (polls < 400) MP_RELAX(); else sched_yield(); }
-            else { mw_wait_u32(&sh->pub_wake[t % 1024], wk, 5000); }                                    // (woken by the unlock that brings us within 2 of the head; the timeout is for the liveness checks above)
+            else { mw_wait_u32(&sh->pub_wake[t % 1024], wk, 5000); look = true; }                                    // (woken by the unlock that brings us within 2 of the head; the timeout is for the liveness checks above)
         }
     }
     for (unsigned spin = 0; ; spin++) {
@@ -288,17 +313,19 @@ bool mw_mp_pid_alive (mw_db *db, int32_t pid) { return pid_alive(db, pid); }
 
 static void slot_reclaim_dead (mw_db *db);
 void mw_mp_reap_dead_slots (mw_db *db) { slot_reclaim_dead(db); }
+// A slot that is being cleaned holds -(pid of the cleaner + 1): a cleaner that is killed half way leaves a slot that the next one takes over (it was a plain -1, which nobody ever freed: the slot
+// was lost for ever). The cleaner looks again at the owner after it took the slot: a process that was given the pid of the dead one, and took the slot in between, is alive and keeps it.
 static void slot_reclaim_dead (mw_db *db) {
-    mw_shm *sh = db->shm;
+    mw_shm *sh = db->shm; const int32_t mark = -((int32_t)getpid() + 1);
     for (int i = 0; i < MW_MP_SLOTS; i++) {
         int32_t pid = atomic_load(&sh->slots[i].pid);
-        if (pid > 0 && !pid_alive(db, pid)) {          // (-1 is a reclaimer at work: never reclaim it twice)
-            if (atomic_compare_exchange_strong(&sh->slots[i].pid, &pid, -1)) {           // -1 = being cleaned
-                atomic_store(&sh->slots[i].snap, MW_MP_NONE);
-                atomic_store(&sh->slots[i].minres, 0);
-                atomic_store(&sh->slots[i].pid, 0);
-            }
-        }
+        if (pid > 0 ? pid_alive(db, pid) : (pid == 0 || pid == mark || pid_alive(db, -pid - 1))) continue;     // (a slot being cleaned by a live process is left to it)
+        if (!atomic_compare_exchange_strong(&sh->slots[i].pid, &pid, mark)) continue;
+        if (pid > 0 && pid_alive(db, pid)) { atomic_store(&sh->slots[i].pid, pid); continue; }
+        atomic_store(&sh->slots[i].snap, MW_MP_NONE);
+        atomic_store(&sh->slots[i].minres, 0);
+        atomic_store(&sh->slots[i].writing, 0);
+        atomic_store(&sh->slots[i].pid, 0);
     }
 }
 

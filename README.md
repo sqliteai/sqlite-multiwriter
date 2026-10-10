@@ -242,6 +242,7 @@ What to know before relying on it (details and measurements in `docs/design.md`)
 
 **Isolation and retries**
 - Snapshot isolation with first-committer-wins on pages, plus validation of the pages read. Not proved serializable: the reads of page 1 (the header of the file) are not validated, `mw_readcheck=0` turns the validation off (write skew becomes possible), and transactions on attached databases are not atomic across the files. The application must retry a transaction that fails with `SQLITE_BUSY_SNAPSHOT` (the whole transaction).
+- A schema change waits up to 2 s for the write transactions of the other connections to end, then goes ahead; a transaction that overlapped it fails on the schema cookie with `SQLITE_BUSY_SNAPSHOT` when it tries to write, and is retried (as a stock WAL reader that tries to write after a commit). A change of the temporary schema does not wait.
 - Throughput of one database is bounded by the publication of a commit (about 40 us in the processes mode) and by true conflicts: many writers on the same row serialise, and the rebase does not help them.
 
 **The rebase (`mw_rebase=1`, opt in)** replays a commit that lost only on pages it shares with others, row by row, instead of refusing it. It is never wrong, but it often does not apply, and then the commit is refused and retried as without it:

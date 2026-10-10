@@ -449,7 +449,9 @@ int shidx_reap (shidx *ix, bool (*alive)(int32_t pid, void *ctx), void *ctx) {
     int n = 0;
     for (uint32_t i = 0; i < ix->h->nslots; i++) {
         int32_t pid = atomic_load(&ix->slots[i].pid);
-        if (pid > 0 && !alive(pid, ctx) && atomic_compare_exchange_strong(&ix->slots[i].pid, &pid, -1)) {
+        // (a slot that is being cleaned holds -(pid of the cleaner + 1): one whose cleaner died is taken over)
+        const int32_t mark = -((int32_t)getpid() + 1);
+        if (pid != 0 && pid != mark && (pid > 0 ? !alive(pid, ctx) : !alive(-pid - 1, ctx)) && atomic_compare_exchange_strong(&ix->slots[i].pid, &pid, mark)) {
             atomic_store(&ix->slots[i].snap, NONE);
             atomic_store(&ix->slots[i].pid, 0);
             n++;

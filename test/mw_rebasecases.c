@@ -219,5 +219,30 @@ int main (void) {
         CHECK(st.rebases >= 3);
         sqlite3_close(a); sqlite3_close(b); sqlite3_close(c); sqlite3_close(d); mw_rmdb(path);
     }
+    // 11. ON CONFLICT clauses of the table: the replay gives what a serial execution (the other writer first, then this one) gives, or the commit is refused
+    {
+        struct { const char *ddl, *sa, *sb; int a_ok; const char *check; long long want; } cs[] = {
+            { "CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT UNIQUE ON CONFLICT REPLACE, n)", "INSERT INTO t VALUES (5, 'X', 'a')", "INSERT INTO t VALUES (7, 'X', 'b')", 1,
+              "SELECT count(*) FROM t WHERE u = 'X' AND id = 5", 1 },                                              // (A's row replaces B's, as it would after it)
+            { "CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT UNIQUE ON CONFLICT REPLACE, n)", "UPDATE t SET u = 'u20' WHERE id = 100", "UPDATE t SET n = 'changed' WHERE id = 200", 0,
+              "SELECT count(*) FROM t WHERE id = 200 AND n = 'changed'", 1 },                                       // (the row that A's REPLACE deletes was changed: refused)
+            { "CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, u TEXT, n)", "INSERT INTO t VALUES (5, 'a', 'a')", "INSERT INTO t VALUES (5, 'b', 'b')", 1,
+              "SELECT count(*) FROM t WHERE id = 5 AND u = 'a'", 1 },
+            { "CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT, n NOT NULL ON CONFLICT REPLACE DEFAULT 'dflt')", "INSERT INTO t VALUES (5, 'X', NULL)", "UPDATE t SET u = 'q' WHERE id = 10", 1,
+              "SELECT count(*) FROM t WHERE id = 5 AND n = 'dflt'", 1 },
+        };
+        for (unsigned k = 0; k < sizeof cs / sizeof *cs; k++) {
+            two("rc11", path, uri, sizeof uri, &a, &b);
+            char q[400]; snprintf(q, sizeof q, "%s; INSERT INTO t(id, u, n) VALUES (10,'u1','n1'),(20,'u2','n2'),(100,'u10','n10'),(200,'u20','n20')", cs[k].ddl);
+            CHECK_RC(mw_exec(a, q), SQLITE_OK);
+            CHECK_RC(mw_exec(a, "BEGIN"), SQLITE_OK); CHECK_RC(mw_exec(a, cs[k].sa), SQLITE_OK);
+            CHECK_RC(mw_exec(b, "BEGIN"), SQLITE_OK); CHECK_RC(mw_exec(b, cs[k].sb), SQLITE_OK); CHECK_RC(mw_exec(b, "COMMIT"), SQLITE_OK);
+            int rc = mw_exec(a, "COMMIT"); if (rc != SQLITE_OK) mw_exec(a, "ROLLBACK");
+            printf("11.%u commit of A rc=%d\n", k, rc);
+            if (cs[k].a_ok) CHECK_RC(rc, SQLITE_OK); else CHECK(is_busy(rc));
+            CHECK(mw_scalar(b, cs[k].check) == cs[k].want);
+            sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+        }
+    }
     MW_DONE();
 }

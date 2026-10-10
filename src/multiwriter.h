@@ -23,10 +23,10 @@ extern "C" {
 #endif
 
 // The version of the extension: the single place it is written (the Makefile, the packages and the release read it from here).
-#define MW_VERSION "0.6.0"
+#define MW_VERSION "0.6.1"
 #define MW_VERSION_MAJOR 0
 #define MW_VERSION_MINOR 6
-#define MW_VERSION_PATCH 0
+#define MW_VERSION_PATCH 1
 #define MW_VERSION_NUMBER (MW_VERSION_MAJOR * 1000000 + MW_VERSION_MINOR * 1000 + MW_VERSION_PATCH)
 #if defined(MW_LOADABLE) && defined(_WIN32)
 #define MW_API __declspec(dllexport)         // the loadable extension exports its entry points and nothing else

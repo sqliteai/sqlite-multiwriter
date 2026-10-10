@@ -3,7 +3,7 @@
 All notable changes of sqlite-multiwriter are recorded here, newest first. The version is `MW_VERSION` in `src/multiwriter.h`; a version that is not released yet is pushed to `main` and released by the CI.
 The format of the files on disk (`-mwlock`, `-mwidx`, `-mw.N`, `-mw`) is the same in the versions listed here.
 
-## Unreleased
+## 0.6.1 - 2026-10-10
 
 ### Fixed
 - **Slots of dead processes.** A process killed while it cleaned the slot of a dead one left that slot at -1 for ever (the slots, 8192 of them, were lost one by one); the cleaner marks the slot with its own pid now and the next one takes it over, and it checks the owner again after it took the slot (a process that was given the same pid keeps it). The same in the registry of the shared index.

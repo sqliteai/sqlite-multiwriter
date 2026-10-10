@@ -36,8 +36,10 @@ mw_db *mw_db_acquire (const char *path, int mode, bool mp) {
         memset(db, 0, sizeof(*db));
         db->path = sqlite3_mprintf("%s", path);
         db->mu = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
-        if (!db->path || !db->mu) {
+        db->vis = sqlite3_malloc(MW_VIS_SLOTS * sizeof(struct mw_vis_slot));       // (the commits wait for their turn on these: a database without them cannot be used)
+        if (!db->path || !db->mu || !db->vis) {
             sqlite3_free(db->path);
+            sqlite3_free(db->vis);
             sqlite3_free(db);
             db = NULL;
         } else {
@@ -66,8 +68,7 @@ mw_db *mw_db_acquire (const char *path, int mode, bool mp) {
             pthread_cond_init(&db->compactor_cv, NULL);
             db->log_max_bytes = 32ull << 20;
             pthread_cond_init(&db->sync_cv, NULL);
-            db->vis = sqlite3_malloc(MW_VIS_SLOTS * sizeof(struct mw_vis_slot));
-            for (int i = 0; db->vis && i < MW_VIS_SLOTS; i++) { pthread_mutex_init(&db->vis[i].mu, NULL); pthread_cond_init(&db->vis[i].cv, NULL); atomic_init(&db->vis[i].waiters, 0); atomic_init(&db->vis[i].ready, 0); }
+            for (int i = 0; i < MW_VIS_SLOTS; i++) { pthread_mutex_init(&db->vis[i].mu, NULL); pthread_cond_init(&db->vis[i].cv, NULL); atomic_init(&db->vis[i].waiters, 0); atomic_init(&db->vis[i].ready, 0); }
             pthread_mutex_init(&db->ddl_mu, NULL);
             pthread_cond_init(&db->ddl_cv, NULL);
             db->next = mw_dbs;

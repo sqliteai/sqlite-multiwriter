@@ -245,7 +245,7 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
     f->base.pMethods = mw_pass_methods(f->real);
 
     if (mode >= 1) {
-        bool mpmode = sqlite3_uri_int64(name, "mw_mp", 0) != 0;      // 0 one process (threads); anything else: several processes (the shared mode: one index of versions and one segmented log, mapped by all of them)
+        bool mpmode = mode >= 2 && sqlite3_uri_int64(name, "mw_mp", 0) != 0;      // (only the engine has the shared header and the segmented log: the tracking mode, mw=2, is one process)      // 0 one process (threads); anything else: several processes (the shared mode: one index of versions and one segmented log, mapped by all of them)
         mw_db *db = mw_db_acquire(name, mode, mpmode);
         mw_lane *lane = db ? sqlite3_malloc(sizeof(mw_lane)) : NULL;
         if (!lane) {

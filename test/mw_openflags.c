@@ -19,6 +19,17 @@ int main (void) {
             char p[400]; snprintf(p, sizeof p, "%s-v%u", path, i); mw_rmfiles(p);
         }
     }
+    // 0b. mw_mp belongs to the engine (mw=1): in the experimental mode (mw=2) there is no shared header, and the database opens as one process (it used to crash)
+    {
+        char u[400]; snprintf(u, sizeof u, "file:%s-t?vfs=multiwriter&mw=2&mw_mp=1", path);
+        CHECK_RC(sqlite3_open_v2(u, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL), SQLITE_OK);
+        CHECK_RC(mw_exec(db, "CREATE TABLE t(a); INSERT INTO t VALUES (1)"), SQLITE_OK);
+        CHECK(mw_scalar(db, "SELECT count(*) FROM t") == 1);
+        mw_db_stats st; memset(&st, 0, sizeof st);
+        CHECK_RC(sqlite3_file_control(db, "main", MW_FCNTL_DBSTATS, &st), SQLITE_OK);
+        sqlite3_close(db); db = NULL;
+        char p[400]; snprintf(p, sizeof p, "%s-t", path); mw_rmfiles(p);
+    }
     // 1. no SQLITE_OPEN_CREATE and no file: it fails, and nothing is created
     CHECK_RC(sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL), SQLITE_CANTOPEN); sqlite3_close(db); db = NULL;
     CHECK(access(path, F_OK) != 0);

@@ -343,7 +343,8 @@ static int group_once (mw_lane *L, rb_state *R, rb_req **b, int n) {
     sqlite3_finalize(sv);
     for (int i = 0; i < n; i++) {
         rb_req *rq = b[i];
-        if (rq->cookie != cookie || rq->fk != b[0]->fk) { rq->state = 2; continue; }                // (the schema changed meanwhile)
+        // (the schema changed meanwhile; and the batch is replayed with the catalog of its leader, so a request of another snapshot is replayed only if that snapshot had the same schema: the cookie)
+        if (rq->cookie != cookie || rq->cookie != R->cat->cookie || rq->fk != b[0]->fk) { rq->state = 2; continue; }
         sqlite3_exec(h, "SAVEPOINT g", NULL, NULL, NULL);
         int r = replay_req(h, R, rq);
         if (r == SQLITE_OK) { sqlite3_exec(h, "RELEASE g", NULL, NULL, NULL); rq->state = 1; ok++; }

@@ -105,7 +105,7 @@ static uint32_t lane_schema_cookie (mw_lane *lane) {
 // reading (another table, a subquery), no virtual table. What a foreign key adds is allowed: the lookup of the parent row (a read cursor, one seek), the scan of the child table for a parent that is deleted
 // (a loop on a read cursor that only compares columns and counts), the sub-programs of its actions. They are repeated by SQLite in the replay, which runs with the foreign keys on. An UPDATE or DELETE that changed no row has read that the row is absent: also a read.
 enum { RD_OTHER = 0, RD_DML };
-typedef struct { char *sql; bool point; } rd_ent;
+typedef struct { char *sql; bool point; uint64_t gen; } rd_ent;       // gen: the schema generation of the database when the answer was found (an index that is dropped changes it)
 enum { RD_CACHE = 32 };
 enum { BC_MAX = 400 };
 typedef struct { char op[24]; int addr, p1, p2; } bc_op;
@@ -174,11 +174,17 @@ static bool multirow_insert (const char *sql) {
 static bool stmt_is_point (mw_lane *lane, sqlite3_stmt *st, const char *sql) {
     rd_ent *c = lane->rd_cache;
     if (!c) { c = lane->rd_cache = sqlite3_malloc64(RD_CACHE * sizeof *c); if (!c) return false; memset(c, 0, RD_CACHE * sizeof *c); }
-    for (int i = 0; i < RD_CACHE; i++) if (c[i].sql && strcmp(c[i].sql, sql) == 0) return c[i].point;
-    if (multirow_insert(sql)) return false;                  // (after the lookup: a statement that is repeated pays nothing; one that is new every time is not kept)
+    // The answer depends on the schema (the same text of an UPDATE ... WHERE email = ? is one row while a UNIQUE index exists and a scan of the table after it is dropped): it is kept for the
+    // generation of the schema in which it was found, and found again when a schema change was committed since.
+    const uint64_t gen = atomic_load(&lane->db->schema_generation);
+    int slot = -1;
+    for (int i = 0; i < RD_CACHE; i++) if (c[i].sql && strcmp(c[i].sql, sql) == 0) { if (c[i].gen == gen) return c[i].point; slot = i; break; }
+    if (slot < 0 && multirow_insert(sql)) return false;      // (after the lookup: a statement that is repeated pays nothing; one that is new every time is not kept)
     bool point = bytecode_is_point(sqlite3_db_handle(st), sql);
-    int slot = lane->rd_cache_next++ % RD_CACHE;
-    sqlite3_free(c[slot].sql); c[slot].sql = sqlite3_mprintf("%s", sql); c[slot].point = c[slot].sql ? point : false;
+    if (slot < 0) slot = lane->rd_cache_next++ % RD_CACHE;
+    if (!c[slot].sql || strcmp(c[slot].sql, sql) != 0) { sqlite3_free(c[slot].sql); c[slot].sql = sqlite3_mprintf("%s", sql); }
+    c[slot].point = c[slot].sql ? point : false;
+    c[slot].gen = gen;
     return point;
 }
 static int stmt_kind (const char *sql) {
@@ -802,14 +808,30 @@ int mw_lane_open_main (mw_file *f, mw_lane *lane) {
 // Private lanes require the database file to be in WAL mode (the pager then never rewrites the
 // header from a lane). New/rollback-mode files are converted with a private stock connection on
 // the underlying VFS; if a real WAL is left over from stock use it is checkpointed by that close.
+// The first 100 bytes of the file, read through the VFS that SQLite itself uses. Not with fopen: closing any descriptor of a file drops all the POSIX locks that the process holds on it,
+// the shared locks that the open lanes of this process hold included (another process would take the file); the unix VFS of SQLite keeps the descriptor open when others hold locks.
+static bool read_db_header (const char *path, uint8_t h[100]) {
+    sqlite3_vfs *v = mw_root_vfs();
+    sqlite3_file *f = sqlite3_malloc64((sqlite3_uint64)v->szOsFile);
+    if (!f) return false;
+    memset(f, 0, (size_t)v->szOsFile);
+    int out = 0;
+    bool ok = false;
+    if (v->xOpen(v, path, f, SQLITE_OPEN_READONLY | SQLITE_OPEN_MAIN_DB, &out) == SQLITE_OK) {
+        ok = f->pMethods && f->pMethods->xRead(f, h, 100, 0) == SQLITE_OK;
+        if (f->pMethods) f->pMethods->xClose(f);
+    }
+    sqlite3_free(f);
+    return ok;
+}
+
 // True if the file is a database in WAL mode with no real -wal that holds committed frames: what the engine can open without writing to it.
 bool mw_path_is_clean_wal_db (const char *path) {
     size_t n = strlen(path); char *wp = malloc(n + 5); if (!wp) return false;
     memcpy(wp, path, n); memcpy(wp + n, "-wal", 5);
     struct stat sb; bool stale = stat(wp, &sb) == 0 && sb.st_size > 0; free(wp);
-    FILE *fp = fopen(path, "rb"); if (!fp) return false;
-    uint8_t h[100]; size_t got = fread(h, 1, sizeof h, fp); fclose(fp);
-    return got == sizeof h && h[18] == 2 && h[19] == 2 && !stale;
+    uint8_t h[100];
+    return read_db_header(path, h) && h[18] == 2 && h[19] == 2 && !stale;
 }
 
 int mw_ensure_wal_db (const char *path) {
@@ -825,12 +847,9 @@ int mw_ensure_wal_db (const char *path) {
         stale_wal = stat(wp, &sb) == 0 && sb.st_size > 0;
         free(wp);
     }
-    FILE *fp = fopen(path, "rb");
-    if (fp) {
+    {
         uint8_t h[100];
-        size_t n = fread(h, 1, sizeof h, fp);
-        fclose(fp);
-        if (n == sizeof h && h[18] == 2 && h[19] == 2 && !stale_wal) return SQLITE_OK;
+        if (read_db_header(path, h) && h[18] == 2 && h[19] == 2 && !stale_wal) return SQLITE_OK;
     }
     sqlite3 *c = NULL;
     int rc = sqlite3_open_v2(path, &c, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_PRIVATECACHE, mw_root_vfs()->zName);
@@ -840,5 +859,15 @@ int mw_ensure_wal_db (const char *path) {
         if (rc == SQLITE_OK && stale_wal) rc = sqlite3_exec(c, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL);
     }
     sqlite3_close(c);
+    if (rc == SQLITE_OK) {
+        // The conversion and the checkpoint are not taken for granted: a checkpoint that another process blocks reports success, and a file that is not in WAL mode would have its writes
+        // dropped by the lane (lm_write): refuse to open rather than lose commits.
+        uint8_t h[100];
+        if (!read_db_header(path, h) || h[18] != 2 || h[19] != 2) rc = SQLITE_BUSY;
+        if (rc == SQLITE_OK && stale_wal) {
+            size_t n = strlen(path); char *wp = malloc(n + 5);
+            if (wp) { memcpy(wp, path, n); memcpy(wp + n, "-wal", 5); struct stat sb; if (stat(wp, &sb) == 0 && sb.st_size > 0) rc = SQLITE_BUSY; free(wp); }
+        }
+    }
     return rc;
 }

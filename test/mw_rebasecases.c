@@ -1,4 +1,4 @@
-// Three ways in which a rebased commit used to lose something (found by a review of the sources, each reproduced before it was fixed):
+// Ways in which a rebased commit used to lose something (found by a review of the sources, each reproduced before it was fixed):
 //   1. after a commit of a snapshot was rebased, a later commit of the same snapshot was built on the connection's own page and overwrote what the other writer had committed (lost update);
 //   2. a comment in front of a SELECT ("/* req:1 */ SELECT ...") hid that the transaction had read: write skew was let through with the rebase;
 //   3. a field of the header of the file that the application sets (PRAGMA user_version) was dropped by the replay, which has the row changes only, and the commit was reported as done.
@@ -73,6 +73,24 @@ int main (void) {
         CHECK_RC(mw_exec(a, "BEGIN; UPDATE t SET n = n + 1 WHERE id = 1; PRAGMA user_version = 7; COMMIT"), SQLITE_OK);
         CHECK(mw_scalar(a, "PRAGMA user_version") == 7 && mw_scalar(a, "SELECT n FROM t WHERE id = 1") == 1);
     }
+    sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
+        // 4. the answer "this statement changes one row" depends on the schema: the same text with a UNIQUE index is a point statement, and without it (the index is dropped) it reads the table.
+    //    A row that another writer inserts meanwhile has to be seen by it: the commit is refused, not replayed without that row.
+    two("rc4", path, uri, sizeof uri, &a, &b);
+    CHECK_RC(mw_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, email TEXT, n INTEGER); CREATE UNIQUE INDEX ie ON t(email); INSERT INTO t VALUES (1,'a',0),(2,'b',0),(3,'c',0)"), SQLITE_OK);
+    const char *upd = "UPDATE t SET n = n + 1 WHERE email = 'a'";
+    CHECK_RC(mw_exec(a, upd), SQLITE_OK);
+    CHECK_RC(mw_exec(a, "DROP INDEX ie"), SQLITE_OK);
+    CHECK_RC(mw_exec(a, "BEGIN"), SQLITE_OK); CHECK_RC(mw_exec(b, "BEGIN"), SQLITE_OK);
+    CHECK_RC(mw_exec(a, upd), SQLITE_OK);
+    CHECK_RC(mw_exec(b, "INSERT INTO t VALUES (4,'a',0)"), SQLITE_OK);
+    CHECK_RC(mw_exec(b, "COMMIT"), SQLITE_OK);
+    int r4 = mw_exec(a, "COMMIT");
+    printf("4. after DROP INDEX: commit rc=%d\n", r4);
+    CHECK(is_busy(r4));
+    mw_exec(a, "ROLLBACK");
+    CHECK_RC(mw_exec(a, upd), SQLITE_OK);                                   // (the retry sees both rows)
+    CHECK(mw_scalar(a, "SELECT n FROM t WHERE id = 4") == 1 && mw_scalar(a, "SELECT n FROM t WHERE id = 1") == 2);
     sqlite3_close(a); sqlite3_close(b); mw_rmdb(path);
     MW_DONE();
 }

@@ -3,7 +3,7 @@
 All notable changes of sqlite-multiwriter are recorded here, newest first. The version is `MW_VERSION` in `src/multiwriter.h`; a version that is not released yet is pushed to `main` and released by the CI.
 The format of the files on disk (`-mwlock`, `-mwidx`, `-mw.N`, `-mw`) is the same in the versions listed here.
 
-## Unreleased
+## 0.6.2 - 2026-10-10
 
 ### Changed
 - Compaction writes the changed pages in order of page number and the adjacent ones with one write (runs of up to 64 pages): 19000 pages (75 MB) in 16 ms against 54 ms with threads and 11 ms against 57 ms with processes (page cache, `fsync` included); scattered pages 39 -> 20 ms and 31 -> 8 ms.

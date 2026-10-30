@@ -3,7 +3,7 @@
 All notable changes of sqlite-multiwriter are recorded here, newest first. The version is `MW_VERSION` in `src/multiwriter.h`; a version that is not released yet is pushed to `main` and released by the CI.
 The format of the files on disk (`-mwlock`, `-mwidx`, `-mw.N`, `-mw`) is the same in the versions listed here.
 
-## Unreleased
+## 0.6.4 - 2026-10-30
 
 ### Fixed
 - The first open of a private lane ignored the result of `sqlite3_auto_extension()` that registers the trace hook of the schema barrier, and remembered the registration as done: after an error (`SQLITE_NOMEM`) the connection opened without the hook, and no later open registered it. The open now fails with the error and the next one tries again (issue #5).

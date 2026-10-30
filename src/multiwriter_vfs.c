@@ -322,10 +322,17 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
             // The schema-barrier trace hook must be on every private-lane connection. Auto-extensions run right
             // after xOpen inside sqlite3_open_v2(), so registering at the first private-lane open is in time for it
             // (and keeps stock/passthrough users free of the global registration).
+            // A failed registration fails the open (a connection without the hook would be unsafe) and is retried by the next one.
             static int hook_registered = 0;
-            if (!hook_registered) { sqlite3_auto_extension((void (*)(void))mw_connection_init); hook_registered = 1; }
-            lane->private_mode = true;
-            rc = mw_lane_open_main(f, lane);
+            rc = SQLITE_OK;
+            if (!hook_registered) {
+                rc = sqlite3_auto_extension((void (*)(void))mw_connection_init);
+                if (rc == SQLITE_OK) hook_registered = 1;
+            }
+            if (rc == SQLITE_OK) {
+                lane->private_mode = true;
+                rc = mw_lane_open_main(f, lane);
+            }
             if (rc == SQLITE_OK) {
                 db->open_done = true;
                 int ms = (int)sqlite3_uri_int64(name, "mw_compact_ms", db->mp_req ? 1000 : 0);   // multi-process: the log only shrinks through compaction

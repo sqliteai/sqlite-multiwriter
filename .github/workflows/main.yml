@@ -246,6 +246,25 @@ jobs:
           path: dist/${{ matrix.name == 'apple-xcframework' && 'MultiWriter.*' || 'multiwriter.*' }}
           if-no-files-found: error
 
+  # Data races: the tests of TSAN_TESTS (Makefile) built with ThreadSanitizer. A race that it reports in the engine fails the job.
+  tsan:
+    if: ${{ !contains(github.event.head_commit.message, '[auto-update]') }}
+    runs-on: ubuntu-22.04
+    name: linux ThreadSanitizer
+    timeout-minutes: 60
+    steps:
+      - name: where the tests make their databases
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4.2.2
+
+      # ThreadSanitizer cannot map its shadow memory with the address randomisation of the newer kernels of the runners
+      - name: lower the address randomisation
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: test the engine with ThreadSanitizer
+        run: make test-tsan CC=clang MW_SAN_TIMEOUT=600
+
   release:
     runs-on: ubuntu-22.04
     name: release

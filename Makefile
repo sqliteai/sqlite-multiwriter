@@ -113,6 +113,21 @@ test: $(FAST_BIN) test-sanitize-runner
 
 # the suite of the CI legs that run it on shared machines: without mw_serial (about a minute and a half of stress, which has a threshold of events that a loaded machine can miss); `make test` runs everything
 CI_BIN := $(filter-out $(DIST)/mw_serial$(EXE),$(FAST_BIN))
+# ThreadSanitizer: the tests that are clean under it (test/sanitize.sh tsan; CC=clang in the CI). Left out, on purpose:
+#   mw_closestall mw_format mw_openrepair mw_repairinstall mw_syfail mw_ticketring   fork a child and check its exit status, which TSan changes
+#   mw_identity mw_multiproc                                                          races inside SQLite itself (walTryBeginRead, randomnessPid)
+#   mw_multiproc_liveness                                                             does not finish under TSan
+#   mw_logswap                                                                        fails on its FTS4 statement under TSan
+#   mw_rollbackrace                                                                   a race on db->p1_cache_epoch between the rollback of publish_impl and a relocation (to fix)
+# (and the long ones: mw_serial mw_bigdb mw_ioerr mw_diskfull)
+TSAN_TESTS := mw_admitcap mw_appendfail mw_attachsync mw_autoextfail mw_compact mw_compactdeath mw_compactruns mw_compactsync mw_compat mw_ddl mw_durability mw_fastcommit mw_fullfsync mw_gc \
+    mw_holesync mw_lanes mw_lanetrim mw_logopen mw_logrewrite mw_mapfail mw_mpstale mw_multiproc_crash mw_openfail mw_openflags mw_openlocks mw_openrace mw_oslayer mw_ownepoch mw_procs mw_profile \
+    mw_readdeps mw_rebase mw_rebasecases mw_rebasefk mw_rebasefkstress mw_rebaseneg mw_rebasenoop mw_rebasepolicy mw_rebaseskew mw_rebasewr mw_recoverread mw_reloc mw_relocprep mw_rollback \
+    mw_routes mw_rowdiffoom mw_rowid mw_selfcommit mw_shared mw_sharedwindow mw_shidx mw_sizering mw_slotstuck mw_stacked mw_stagedlog mw_stagednormal mw_stalewal mw_store mw_strictany \
+    mw_structural mw_syncpragma mw_syncwindow mw_tailscan mw_tempbarrier mw_tempddl mw_trimfail mw_vfs_trace mw_walstatfail mw_warm mw_writeskew
+.PHONY: test-tsan
+test-tsan:
+	bash test/sanitize.sh tsan $(TSAN_TESTS)
 .PHONY: test-ci
 test-ci: $(CI_BIN) test-sanitize-runner
 	@set -e; for t in $(CI_BIN); do echo "== $$t"; ./$$t; done; echo "== mw_rebase (a WITHOUT ROWID table)"; MW_TEST_WR=1 ./$(DIST)/mw_rebase$(EXE)

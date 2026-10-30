@@ -1,5 +1,6 @@
 // Phase 7: page-version garbage collection against pinned snapshots.
 #include <pthread.h>
+#include <stdatomic.h>
 #include "mw_test.h"
 #include "multiwriter.h"
 
@@ -13,7 +14,7 @@ static mw_db_stats stats (sqlite3 *db) { mw_db_stats s; memset(&s, 0, sizeof s);
 static uint64_t gc (sqlite3 *db) { uint64_t n = 0; sqlite3_file_control(db, "main", MW_FCNTL_GC, &n); return n; }
 
 // ---- part 2: readers must always see a consistent snapshot while a writer commits and GC runs
-static volatile int stop_flag;
+static _Atomic int stop_flag;
 static const char *g_path;
 static int reader_errors;
 static void *reader (void *arg) {

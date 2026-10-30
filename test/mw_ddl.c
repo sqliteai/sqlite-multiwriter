@@ -5,6 +5,7 @@
 // can never publish (retryable SQLITE_BUSY_SNAPSHOT), even if it touches unrelated pages. DDL is never
 // merged or rebased.
 #include <pthread.h>
+#include <stdatomic.h>
 #include "mw_test.h"
 #include "multiwriter.h"
 
@@ -23,7 +24,7 @@ static int integrity_ok (sqlite3 *db) {
     return ok;
 }
 static const char *g_path;
-static volatile int stop_writers;
+static _Atomic int stop_writers;
 typedef struct { int id, ok, busy; int codes[1024]; int last_failed_id; } worker_t;
 static void *writer (void *arg) {
     worker_t *w = arg;

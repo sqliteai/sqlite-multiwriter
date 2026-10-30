@@ -11,7 +11,7 @@
 #include "multiwriter.h"
 #include "multiwriter_internal.h"
 
-static void *watchdog (void *a) { (void)a; for (int i = 0; i < 400; i++) { usleep(100000); if (*(volatile int *)a == 1) return NULL; } printf("FAIL: the commits hang\n"); fflush(stdout); _exit(1); }
+static void *watchdog (void *a) { (void)a; for (int i = 0; i < 400; i++) { usleep(100000); if (atomic_load((_Atomic int *)a) == 1) return NULL; } printf("FAIL: the commits hang\n"); fflush(stdout); _exit(1); }
 
 int main (void) {
     setenv("MW_SEG_MB", "1", 1);                                   // a roll every few hundred commits: the filling of the next segment is needed
@@ -47,7 +47,7 @@ int main (void) {
     atomic_store(&sh->compact_req_pid, me);
     atomic_store(&sh->adm_slot_pid[5], me);
     atomic_store(&sh->pub_owner, me);                               // (and the publication lock, with no record pending)
-    volatile int finished = 0;
+    _Atomic int finished = 0;
     pthread_t wd; pthread_create(&wd, NULL, watchdog, (void *)&finished);
     sqlite3 *a = NULL; CHECK_RC(sqlite3_open_v2(uri, &a, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL), SQLITE_OK);
     sqlite3_busy_timeout(a, 5000);

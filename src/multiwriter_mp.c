@@ -441,7 +441,7 @@ void mw_mp_writing (mw_lane *lane, bool on) {
 // With N processes all of them contend for the one publication lock, and past ~32 processes the throughput *falls* with N
 // (64: 5k, 128: 2k tx/s against 9.6k at 32). It engages with more than 1.5 processes per core.. Only a limited number of writer transactions may be in flight at once; the others sleep before taking their snapshot. FIFO tickets order the waiters, the first few poll the slot table, the rest sleep in proportion to their distance. A wait is
 // bounded (a transaction that cannot get a slot in 50 ms goes ahead without one) so that a holder that stays open for long, or a dead one, can never stop the others.
-static long mp_ncpu (void) { static long ncpu = 0; long n = ncpu; if (!n) { n = sysconf(_SC_NPROCESSORS_ONLN); if (n < 1) n = 1; ncpu = n; } return n; }     // (a system call per transaction otherwise)
+static long mp_ncpu (void) { static _Atomic long ncpu = 0; long n = atomic_load_explicit(&ncpu, memory_order_relaxed); if (!n) { n = sysconf(_SC_NPROCESSORS_ONLN); if (n < 1) n = 1; atomic_store_explicit(&ncpu, n, memory_order_relaxed); } return n; }     // (a system call per transaction otherwise)
 static int mp_admit_cap (int nprocs) {
     static _Atomic int c = MW_KNOB_UNSET;
     long n = mp_ncpu();

@@ -220,14 +220,16 @@ static const sqlite3_io_methods mw_io = {
 
 const sqlite3_io_methods *mw_vfs_pass_io (void) { return &mw_io; }
 
+static sqlite3_io_methods mw_pass_v1, mw_pass_v2;
+static void mw_init_pass_versions (void) { mw_pass_v1 = mw_io; mw_pass_v1.iVersion = 1; mw_pass_v2 = mw_io; mw_pass_v2.iVersion = 2; }
+
 static const sqlite3_io_methods *mw_pass_methods (sqlite3_file *real) {
     // Expose only the io-method version the real file supports: xShm* needs >=2, xFetch >=3.
     // A wrapper must not advertise methods the underlying file lacks.
-    static sqlite3_io_methods v1, v2;
-    static int init = 0;
-    if (!init) { v1 = mw_io; v1.iVersion = 1; v2 = mw_io; v2.iVersion = 2; init = 1; }
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, mw_init_pass_versions);
     if (real->pMethods == NULL) return &mw_io;
-    return (real->pMethods->iVersion >= 3) ? &mw_io : (real->pMethods->iVersion == 2) ? &v2 : &v1;
+    return (real->pMethods->iVersion >= 3) ? &mw_io : (real->pMethods->iVersion == 2) ? &mw_pass_v2 : &mw_pass_v1;
 }
 
 // URI mw=0: stock passthrough; mw=1: the engine (private lanes); mw=2: experimental (lane tracking on the stock shared WAL). true/on/yes and false/off/no are accepted for 1 and 0.
@@ -323,11 +325,11 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
             // after xOpen inside sqlite3_open_v2(), so registering at the first private-lane open is in time for it
             // (and keeps stock/passthrough users free of the global registration).
             // A failed registration fails the open (a connection without the hook would be unsafe) and is retried by the next one.
-            static int hook_registered = 0;
+            static _Atomic int hook_registered = 0;      // (two first opens may both register: SQLite keeps one entry for the same function)
             rc = SQLITE_OK;
-            if (!hook_registered) {
+            if (!atomic_load_explicit(&hook_registered, memory_order_acquire)) {
                 rc = sqlite3_auto_extension((void (*)(void))mw_connection_init);
-                if (rc == SQLITE_OK) hook_registered = 1;
+                if (rc == SQLITE_OK) atomic_store_explicit(&hook_registered, 1, memory_order_release);
             }
             if (rc == SQLITE_OK) {
                 lane->private_mode = true;

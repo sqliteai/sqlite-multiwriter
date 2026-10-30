@@ -3,6 +3,17 @@
 All notable changes of sqlite-multiwriter are recorded here, newest first. The version is `MW_VERSION` in `src/multiwriter.h`; a version that is not released yet is pushed to `main` and released by the CI.
 The format of the files on disk (`-mwlock`, `-mwidx`, `-mw.N`, `-mw`) is the same in the versions listed here.
 
+## Unreleased
+
+### Fixed
+- The first open of a private lane ignored the result of `sqlite3_auto_extension()` that registers the trace hook of the schema barrier, and remembered the registration as done: after an error (`SQLITE_NOMEM`) the connection opened without the hook, and no later open registered it. The open now fails with the error and the next one tries again (issue #5).
+- `mw_ensure_wal_db()` read a `stat()` of the `-wal` that fails as "no WAL": the first look could take the clean-header success path, and the look after the checkpoint could accept a WAL that a reader had kept from being checkpointed. An absent file is still "none"; any other failure is `SQLITE_IOERR_FSTAT` at both looks, and `mw_path_is_clean_wal_db()` answers false when it cannot tell (issue #6).
+- Data races, found with ThreadSanitizer. The cached CPU count of the admission limit (`admit_cap`, and the one of the processes mode) is atomic: concurrent first commits wrote it with no synchronisation (issue #7). The flag of the hook registration and the tables of the passthrough io methods are made safely when several connections open at once. `db->p1_cache_epoch` is atomic: the rollback of a publish cleared it without `reloc_mu` while a relocation read it, and the relocation read it twice, so that a clear in between gave a merge epoch of 0.
+
+### Added
+- A job of the CI builds the tests with ThreadSanitizer and runs them (`make test-tsan`: every test but the long ones). `test/sanitize.sh` takes `CC`, kills a test that runs longer than `MW_SAN_TIMEOUT` seconds (600), sets `die_after_fork=0` for `tsan`, and builds SQLite with FTS4 like the Makefile. `test/tsan.supp` suppresses the races inside SQLite itself (the read of the wal-index without a lock, `randomnessPid`) for the two tests that meet them.
+- Tests: `mw_autoextfail` (the registration of the hook fails), `mw_walstatfail` (the `stat` of the `-wal` fails), `mw_admitcap` (concurrent first calls of the admission limit; it sees the race only under `test/sanitize.sh tsan`).
+
 ## 0.6.3 - 2026-10-11
 
 ### Fixed

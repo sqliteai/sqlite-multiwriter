@@ -190,10 +190,10 @@ void mw_db_release (mw_db *db) {
         pthread_cond_destroy(&db->ddl_cv);
         pthread_mutex_destroy(&db->ddl_mu);
         sqlite3_mutex_free(db->mu);
-        sqlite3_free(db->path);
         sqlite3_mutex_enter(g);
         for (mw_db **pp = &mw_dbs; *pp; pp = &(*pp)->next) if (*pp == db) { *pp = db->next; break; }
         sqlite3_mutex_leave(g);
+        sqlite3_free(db->path);                  // (after it is out of the list: an open of a database walks the list comparing the paths, and it finds this one while it is closing)
         sqlite3_free(db);
         return;
     }

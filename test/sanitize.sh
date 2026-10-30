@@ -9,7 +9,7 @@ KIND=${1:-asan}; shift || true
 case $KIND in
   asan)  SAN="-fsanitize=address";;
   ubsan) SAN="-fsanitize=undefined,alignment,integer -fno-sanitize=unsigned-integer-overflow,unsigned-shift-base,implicit-conversion -fno-sanitize-recover=undefined";;
-  tsan)  SAN="-fsanitize=thread"; export TSAN_OPTIONS="die_after_fork=0 ${TSAN_OPTIONS:-}";;      # (the tests that fork while the compactor thread runs: the child starts threads of its own)
+  tsan)  SAN="-fsanitize=thread"; export TSAN_OPTIONS="die_after_fork=0 detect_deadlocks=0 ${TSAN_OPTIONS:-}";;      # (die_after_fork: the tests that fork while the compactor thread runs: the child starts threads of its own; detect_deadlocks: the stripes are taken together, more than the 64 locks that its detector holds, and it dies)
   *) echo "usage: $0 asan|ubsan|tsan [tests]"; exit 2;;
 esac
 OUT=build/$KIND; BIN=dist/$KIND; mkdir -p $OUT $BIN; rm -f $OUT/*.o

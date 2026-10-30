@@ -34,6 +34,8 @@ for t in $TESTS; do
     mw_autoextfail)
       cc -w $CF -Dsqlite3_auto_extension=inject_auto_extension -c src/multiwriter_vfs.c -o $OUT/injected.o
       TEST_LIBS="${LIBS//$OUT\/multiwriter_vfs.o/} $OUT/injected.o";;
+    mw_walstatfail)
+      TEST_LIBS="${LIBS//$OUT\/multiwriter_lane.o/}";;      # (the test includes multiwriter_lane.c itself)
     mw_rowdiffoom)
       cc -w $CF -Dmalloc=inject_malloc -Dcalloc=inject_calloc -Drealloc=inject_realloc -c src/multiwriter_rowdiff.c -o $OUT/injected.o
       TEST_LIBS="${LIBS//$OUT\/multiwriter_rowdiff.o/} $OUT/injected.o";;

@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include <assert.h>
 #include "multiwriter_os.h"
 #include "multiwriter_io.h"
@@ -888,11 +889,23 @@ static bool read_db_header (const char *path, uint8_t h[100]) {
     return ok;
 }
 
+// Whether a real -wal with content sits next to the database: an absent file is "no", a stat that fails for another reason is an error (the answer is not known, and it must not read as "no").
+static int wal_outstanding (const char *path, bool *out) {
+    size_t n = strlen(path); char *wp = malloc(n + 5); if (!wp) return SQLITE_NOMEM;
+    memcpy(wp, path, n); memcpy(wp + n, "-wal", 5);
+    struct stat sb;
+    int rc = SQLITE_OK;
+    if (stat(wp, &sb) == 0) *out = sb.st_size > 0;
+    else if (errno == ENOENT || errno == ENOTDIR) *out = false;
+    else rc = SQLITE_IOERR_FSTAT;
+    free(wp);
+    return rc;
+}
+
 // True if the file is a database in WAL mode with no real -wal that holds committed frames: what the engine can open without writing to it.
 bool mw_path_is_clean_wal_db (const char *path) {
-    size_t n = strlen(path); char *wp = malloc(n + 5); if (!wp) return false;
-    memcpy(wp, path, n); memcpy(wp + n, "-wal", 5);
-    struct stat sb; bool stale = stat(wp, &sb) == 0 && sb.st_size > 0; free(wp);
+    bool stale = false;
+    if (wal_outstanding(path, &stale) != SQLITE_OK) return false;
     uint8_t h[100];
     return read_db_header(path, h) && h[18] == 2 && h[19] == 2 && !stale;
 }
@@ -901,21 +914,14 @@ int mw_ensure_wal_db (const char *path) {
     // A real -wal left by stock use (a crashed process, the sqlite3 CLI) holds committed frames the lane store cannot see; and the compactor would
     // later overwrite the main file under it, so a stock connection replaying that WAL would corrupt newer pages. Checkpoint it first.
     bool stale_wal = false;
-    {
-        size_t n = strlen(path);
-        char *wp = malloc(n + 5);
-        if (!wp) return SQLITE_NOMEM;
-        memcpy(wp, path, n); memcpy(wp + n, "-wal", 5);
-        struct stat sb;
-        stale_wal = stat(wp, &sb) == 0 && sb.st_size > 0;
-        free(wp);
-    }
+    int rc = wal_outstanding(path, &stale_wal);
+    if (rc != SQLITE_OK) return rc;
     {
         uint8_t h[100];
         if (read_db_header(path, h) && h[18] == 2 && h[19] == 2 && !stale_wal) return SQLITE_OK;
     }
     sqlite3 *c = NULL;
-    int rc = sqlite3_open_v2(path, &c, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_PRIVATECACHE, mw_root_vfs()->zName);
+    rc = sqlite3_open_v2(path, &c, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_PRIVATECACHE, mw_root_vfs()->zName);
     if (rc == SQLITE_OK) {
         sqlite3_busy_timeout(c, 5000);                             // (two openers of a new database may convert it at the same time)
         rc = sqlite3_exec(c, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
@@ -928,8 +934,9 @@ int mw_ensure_wal_db (const char *path) {
         uint8_t h[100];
         if (!read_db_header(path, h) || h[18] != 2 || h[19] != 2) rc = SQLITE_BUSY;
         if (rc == SQLITE_OK && stale_wal) {
-            size_t n = strlen(path); char *wp = malloc(n + 5);
-            if (wp) { memcpy(wp, path, n); memcpy(wp + n, "-wal", 5); struct stat sb; if (stat(wp, &sb) == 0 && sb.st_size > 0) rc = SQLITE_BUSY; free(wp); }
+            bool left = false;
+            rc = wal_outstanding(path, &left);
+            if (rc == SQLITE_OK && left) rc = SQLITE_BUSY;
         }
     }
     return rc;

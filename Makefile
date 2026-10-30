@@ -79,6 +79,10 @@ $(BUILD)/inject_fsync.o: $(SRC_DIR)/multiwriter_log.c $(HEADERS)
 $(DIST)/mw_autoextfail$(EXE): $(BUILD)/t_mw_autoextfail.o $(filter-out $(BUILD)/multiwriter_vfs.o,$(LIB_OBJ)) $(BUILD)/inject_autoext.o
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LDFLAGS)
+$(BUILD)/t_mw_walstatfail.o: $(SRC_DIR)/multiwriter_lane.c      # (the test includes it)
+$(DIST)/mw_walstatfail$(EXE): $(BUILD)/t_mw_walstatfail.o $(filter-out $(BUILD)/multiwriter_lane.o,$(LIB_OBJ))
+	@mkdir -p $(DIST)
+	$(CC) $^ -o $@ $(LDFLAGS)
 $(DIST)/mw_holesync$(EXE): $(BUILD)/t_mw_holesync.o $(filter-out $(BUILD)/multiwriter_log.o,$(LIB_OBJ)) $(BUILD)/inject_fsync.o
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LDFLAGS)

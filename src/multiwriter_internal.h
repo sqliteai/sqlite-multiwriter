@@ -276,7 +276,7 @@ struct mw_db {
     int64_t           dbv_counter;      // highest db_version ever reserved (protected by mu)
     _Atomic uint64_t  n_rebases, n_rebase_grouped, n_rebase_retries, n_rebase_max_attempts, n_rebase_ns, n_unrebasable;
     uint8_t          *p1_cache;            // the page 1 image the last relocation installed and its epoch: the next one starts from it (reloc_mu)
-    uint64_t          p1_cache_epoch;
+    _Atomic uint64_t  p1_cache_epoch;      // (the image under reloc_mu; the epoch alone is also cleared, without it, by the rollback of a publish: hence atomic)
     pthread_mutex_t   reloc_mu;            // serialises page relocations (they all chase the same end of the file); not held across the log fsync
     _Atomic uint64_t  n_merges;            // interior pages merged three-way instead of refusing the transaction
     _Atomic uint64_t  n_reads_saved;       // read conflicts on interior pages whose routing for the pages the transaction used was unchanged

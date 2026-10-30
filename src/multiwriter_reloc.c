@@ -291,7 +291,8 @@ int mw_lane_relocate (mw_lane *lane, const mw_validate *v0, const uint32_t *pgno
             // Page 1 (the newest version): the previous relocation left its installed image in db->p1_cache; if nobody wrote page 1 since, that *is* the newest
             // version and there is no need to take page 1's stripe (which every transaction's header read also wants) and copy it again.
             if (!db->mp && !db->p1_cache) db->p1_cache = malloc((size_t)pgsz);
-            if (!db->mp && db->p1_cache && db->p1_cache_epoch != 0 && db->p1_cache_epoch == atomic_load_explicit(&st->p1_head_epoch, memory_order_acquire)) { memcpy(latest, db->p1_cache, (size_t)pgsz); e_merge = db->p1_cache_epoch; }
+            const uint64_t ce = db->mp ? 0 : atomic_load_explicit(&db->p1_cache_epoch, memory_order_acquire);      // (once: the rollback of a publish clears it without reloc_mu)
+            if (!db->mp && db->p1_cache && ce != 0 && ce == atomic_load_explicit(&st->p1_head_epoch, memory_order_acquire)) { memcpy(latest, db->p1_cache, (size_t)pgsz); e_merge = ce; }
             else if (!mw_store_head_image(st, 1, latest, &e_merge)) rc = NA(5);
             MW_T1(MW_ST_H_HEAD, th0);
             uint64_t thp0 = MW_T0();

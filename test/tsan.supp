@@ -1,0 +1,6 @@
+# Races inside SQLite itself, which ThreadSanitizer reports and which are not the engine's. test/sanitize.sh gives this file to mw_identity and mw_multiproc only.
+# The wal-index is read without a lock by design (walTryBeginRead checks the header twice and the checksums, and retries): the writer is walIndexRecover.
+race:walTryBeginRead
+race:walIndexRecover
+# unixOpen: the cached process id of the random generator (SQLite's randomnessPid)
+race:randomnessPid

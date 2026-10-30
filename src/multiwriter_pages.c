@@ -416,7 +416,7 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     for (int i = 0; i < n; i++) chain_install_batched(st, pgnos[i], chains[i], epoch, copies[i], &lc, &ld);
     lists_splice(st, &lc, &ld);                                  // (still under the stripe locks: the lists never miss a page a compactor could look for)
     if (lane && lane->holds_reloc && !db->mp) {                  // hand the new page 1 to the next relocation (it is the newest version: nobody else wrote page 1 since)
-        for (int i = 0; i < n; i++) if (pgnos[i] == 1 && db->p1_cache) { memcpy(db->p1_cache, copies[i], (size_t)st->pgsz); db->p1_cache_epoch = epoch; break; }
+        for (int i = 0; i < n; i++) if (pgnos[i] == 1 && db->p1_cache) { memcpy(db->p1_cache, copies[i], (size_t)st->pgsz); atomic_store_explicit(&db->p1_cache_epoch, epoch, memory_order_release); break; }
     }
     pub_release(db, st, &locked);
     if (lane && lane->holds_reloc) MW_T1(MW_ST_H_INSTALL, tin0);
@@ -460,7 +460,7 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
                 atomic_store_explicit(&st->p1_cookie, p1_prev_cookie, memory_order_relaxed);
                 atomic_store_explicit(&st->p1_head_epoch, p1_prev_head, memory_order_release);
             }
-            if (db->p1_cache_epoch == epoch) db->p1_cache_epoch = 0;
+            { uint64_t ce = epoch; atomic_compare_exchange_strong(&db->p1_cache_epoch, &ce, 0); }      // (reloc_mu is not held here: a later relocation may have replaced the image and its epoch, which stay)
         }
         stripes_unlock(st, &again);
         if (!latest) {

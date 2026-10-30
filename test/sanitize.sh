@@ -36,6 +36,8 @@ for t in $TESTS; do
       TEST_LIBS="${LIBS//$OUT\/multiwriter_vfs.o/} $OUT/injected.o";;
     mw_walstatfail)
       TEST_LIBS="${LIBS//$OUT\/multiwriter_lane.o/}";;      # (the test includes multiwriter_lane.c itself)
+    mw_admitcap)
+      TEST_LIBS="${LIBS//$OUT\/multiwriter_pages.o/}";;      # (the test includes multiwriter_pages.c itself)
     mw_rowdiffoom)
       cc -w $CF -Dmalloc=inject_malloc -Dcalloc=inject_calloc -Drealloc=inject_realloc -c src/multiwriter_rowdiff.c -o $OUT/injected.o
       TEST_LIBS="${LIBS//$OUT\/multiwriter_rowdiff.o/} $OUT/injected.o";;

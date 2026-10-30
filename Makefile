@@ -83,6 +83,10 @@ $(BUILD)/t_mw_walstatfail.o: $(SRC_DIR)/multiwriter_lane.c      # (the test incl
 $(DIST)/mw_walstatfail$(EXE): $(BUILD)/t_mw_walstatfail.o $(filter-out $(BUILD)/multiwriter_lane.o,$(LIB_OBJ))
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LDFLAGS)
+$(BUILD)/t_mw_admitcap.o: $(SRC_DIR)/multiwriter_pages.c      # (the test includes it)
+$(DIST)/mw_admitcap$(EXE): $(BUILD)/t_mw_admitcap.o $(filter-out $(BUILD)/multiwriter_pages.o,$(LIB_OBJ))
+	@mkdir -p $(DIST)
+	$(CC) $^ -o $@ $(LDFLAGS)
 $(DIST)/mw_holesync$(EXE): $(BUILD)/t_mw_holesync.o $(filter-out $(BUILD)/multiwriter_log.o,$(LIB_OBJ)) $(BUILD)/inject_fsync.o
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LDFLAGS)

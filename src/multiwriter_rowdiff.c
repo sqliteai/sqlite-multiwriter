@@ -30,6 +30,8 @@ typedef struct {
 
 static int be16 (const uint8_t *p) { return (p[0] << 8) | p[1]; }
 static uint32_t be32 (const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+// The largest payload of a cell that SQLite can have (SQLITE_MAX_LENGTH is at most 2^31-1): a larger one in a page is corruption, and its size must not reach an allocation
+#define MAX_PAYLOAD 0x7fffffffu
 // SQLite varint (1..9 bytes, big endian, 7 bits per byte, the 9th byte has 8)
 static int varint (const uint8_t *p, const uint8_t *end, uint64_t *out) {
     uint64_t v = 0;
@@ -123,6 +125,7 @@ static uint32_t old_owner (mw_lane *lane, const mw_cat *cat, uint32_t pgno, uint
             if (page == pgno) return tab->root;
             if (!mw_rd_snap_page(lane, page, tmp2) || tmp2[0] != 0x05) break;
             int n2 = be16(tmp2 + 3); uint32_t next = be32(tmp2 + 8);
+            if (12 + 2 * (uint32_t)n2 > pgsz) break;
             for (int c = 0; c < n2; c++) {
                 uint32_t co = (uint32_t)be16(tmp2 + 12 + 2 * c); if (co + 5 > pgsz) { next = 0; break; }
                 uint64_t k; if (!varint(tmp2 + co + 4, tmp2 + pgsz, &k)) { next = 0; break; }
@@ -157,6 +160,7 @@ static bool full_payload (mw_lane *lane, const uint8_t *const *imgs, bool new_st
 static int rows_of (mw_lane *lane, const uint8_t *const *imgs, bool new_state, const uint8_t *pg, uint32_t pgsz, rowset *rs, uint32_t root, const mw_cat *cat) {
     const mw_tab *tab = mw_cat_by_root(cat, root);
     int nc = be16(pg + 3);
+    if (8 + 2 * (uint32_t)nc > pgsz) return -1;
     const uint32_t U = pgsz, M = ((U - 12) * 32 / 255) - 23, X = U - 35;
     if (rs->n + nc > rs->cap) { int ncap = rs->cap ? rs->cap : 64; while (ncap < rs->n + nc) ncap *= 2; rd_row *p = realloc(rs->a, (size_t)ncap * sizeof *p); if (!p) return -1; rs->a = p; rs->cap = ncap; }
     for (int i = 0; i < nc; i++) {
@@ -166,7 +170,7 @@ static int rows_of (mw_lane *lane, const uint8_t *const *imgs, bool new_state, c
         uint64_t P, rid = 0; int a = varint(c, end, &P); if (!a) return -1;
         int b = varint(c + a, end, &rid); if (!b) return -1;
         uint32_t local = (uint32_t)P, ovfl = 0;
-        if (P > X) { uint32_t K = M + (uint32_t)((P - M) % (U - 4)); local = K <= X ? K : M; if (c + a + b + local + 4 > end) return -1; ovfl = be32(c + a + b + local); }
+        if (P > X) { if (P > MAX_PAYLOAD) return -1; uint32_t K = M + (uint32_t)((P - M) % (U - 4)); local = K <= X ? K : M; if (c + a + b + local + 4 > end) return -1; ovfl = be32(c + a + b + local); }
         else if (c + a + b + local > end) return -1;
         rd_row *r = &rs->a[rs->n++]; memset(r, 0, sizeof *r);
         r->root = root; r->tab = tab; r->rowid = (int64_t)rid; r->rec = c + a + b; r->reclen = local;
@@ -199,6 +203,7 @@ static int s_build (mw_lane *lane, const mw_cat *cat, ovmap *S, uint8_t *tmp) {
             for (size_t i = 0; i < nl; i++) {
                 if (++reads > 200000 || !mw_rd_snap_page(lane, lvl[i], tmp) || tmp[0] != 0x02) { free(lvl); free(nxt); return -1; }
                 int nc = be16(tmp + 3);
+                if (12 + 2 * (uint32_t)nc > pgsz) { free(lvl); free(nxt); return -1; }
                 for (int c = -1; c < nc; c++) {
                     uint32_t ch;
                     if (c < 0) ch = be32(tmp + 8); else { uint32_t off = (uint32_t)be16(tmp + 12 + 2 * c); if (off + 4 > pgsz) { free(lvl); free(nxt); return -1; } ch = be32(tmp + off); }
@@ -219,6 +224,7 @@ static int rows_of_index (mw_lane *lane, const uint8_t *const *imgs, bool new_st
     const mw_tab *tab = mw_cat_by_root(cat, root);
     bool interior = pg[0] == 0x02; uint32_t hdr = interior ? 12 : 8;
     int nc = be16(pg + 3);
+    if (hdr + 2 * (uint32_t)nc > pgsz) return -1;
     const uint32_t U = pgsz, M = ((U - 12) * 32 / 255) - 23, X = ((U - 12) * 64 / 255) - 23;
     if (rs->n + nc > rs->cap) { int ncap = rs->cap ? rs->cap : 64; while (ncap < rs->n + nc) ncap *= 2; rd_row *p = realloc(rs->a, (size_t)ncap * sizeof *p); if (!p) return -1; rs->a = p; rs->cap = ncap; }
     for (int i = 0; i < nc; i++) {
@@ -228,7 +234,7 @@ static int rows_of_index (mw_lane *lane, const uint8_t *const *imgs, bool new_st
         if (interior) c += 4;
         uint64_t P; int a = varint(c, end, &P); if (!a) return -1;
         uint32_t local = (uint32_t)P, ovfl = 0;
-        if (P > X) { uint32_t K = M + (uint32_t)((P - M) % (U - 4)); local = K <= X ? K : M; if (c + a + local + 4 > end) return -1; ovfl = be32(c + a + local); }
+        if (P > X) { if (P > MAX_PAYLOAD) return -1; uint32_t K = M + (uint32_t)((P - M) % (U - 4)); local = K <= X ? K : M; if (c + a + local + 4 > end) return -1; ovfl = be32(c + a + local); }
         else if (c + a + local > end) return -1;
         rd_row *r = &rs->a[rs->n++]; memset(r, 0, sizeof *r);
         r->root = root; r->tab = tab; r->rec = c + a; r->reclen = local;
@@ -237,13 +243,14 @@ static int rows_of_index (mw_lane *lane, const uint8_t *const *imgs, bool new_st
             uint64_t hs; int h = varint(r->rec, r->rec + r->reclen, &hs);
             if (!h || hs > r->reclen) r->bad = true;
             else {
-                uint32_t pos = (uint32_t)hs, hp = (uint32_t)h; int col = 0; uint8_t *kb = malloc((size_t)hs * 2 + 16 + r->reclen); uint32_t kl = 0;
+                uint32_t pos = (uint32_t)hs, hp = (uint32_t)h; int col = 0; uint32_t kl = 0;
+                uint8_t *kb = (uint64_t)hs * 2 + 16 + r->reclen <= (uint64_t)SIZE_MAX ? malloc((size_t)hs * 2 + 16 + r->reclen) : NULL;
                 while (kb && col < tab->npk_rec && hp < hs) {
                     uint64_t t; int k = varint(r->rec + hp, r->rec + hs, &t); if (!k) { r->bad = true; break; }
-                    uint32_t l = t < 12 ? ((const uint8_t[]){0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0})[t] : (uint32_t)((t - 12) / 2);
-                    if (pos + l > r->reclen) { r->bad = true; break; }
-                    memcpy(kb + kl, r->rec + hp, (size_t)k); kl += (uint32_t)k; memcpy(kb + kl, r->rec + pos, l); kl += l;
-                    hp += (uint32_t)k; pos += l; col++;
+                    uint64_t l = t < 12 ? ((const uint8_t[]){0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0})[t] : (t - 12) / 2;       // (pos <= reclen always: l is checked against what is left)
+                    if (l > r->reclen - pos) { r->bad = true; break; }
+                    memcpy(kb + kl, r->rec + hp, (size_t)k); kl += (uint32_t)k; memcpy(kb + kl, r->rec + pos, (size_t)l); kl += (uint32_t)l;
+                    hp += (uint32_t)k; pos += (uint32_t)l; col++;
                 }
                 if (!kb || col < tab->npk_rec) r->bad = true;
                 r->kbuf = kb; r->klen = kl;
@@ -294,6 +301,7 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_cat 
     if (!why && cat->has_wr) for (int i = 0; i < lane->ws_n && !why; i++) {
         const uint8_t *pg = imgs[i]; if (lane->ws_pgnos[i] == 1 || (pg[0] != 0x05 && pg[0] != 0x02)) continue;
         int nc = be16(pg + 3); uint32_t hdr = 12;
+        if (hdr + 2 * (uint32_t)nc > pgsz) { why = "an interior page does not decode"; break; }
         for (int c = -1; c < nc; c++) {
             uint32_t ch;
             if (c < 0) ch = be32(pg + 8); else { uint32_t off = (uint32_t)be16(pg + hdr + 2 * c); if (off + 4 > pgsz) continue; ch = be32(pg + off); }
@@ -311,6 +319,7 @@ int mw_rowdiff_compute (mw_lane *lane, const uint8_t *const *imgs, const mw_cat 
                 const uint8_t *pg = imgs[i]; if (lane->ws_pgnos[i] == 1 || pg[0] != 0x05) continue;
                 uint32_t r; NEW_OWNER(lane->ws_pgnos[i], r); if (!r) { unresolved++; continue; }
                 int nc = be16(pg + 3);
+                if (12 + 2 * (uint32_t)nc > pgsz) { why = "an interior page does not decode"; break; }
                 for (int c = -1; c < nc; c++) {
                     uint32_t ch;
                     if (c < 0) ch = be32(pg + 8);

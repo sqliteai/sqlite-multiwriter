@@ -3,6 +3,11 @@
 All notable changes of sqlite-multiwriter are recorded here, newest first. The version is `MW_VERSION` in `src/multiwriter.h`; a version that is not released yet is pushed to `main` and released by the CI.
 The format of the files on disk (`-mwlock`, `-mwidx`, `-mw.N`, `-mw`) is the same in the versions listed here.
 
+## 0.6.5 - 2026-10-31
+
+### Fixed
+- The decoders of the rebase (the rows of a page, the schema, the records) trusted the sizes in the page they read. A payload size near 2^64 wrapped the size of the buffer for its overflow chain (`malloc(size + 1)`) and the local part was copied into a buffer that was too small; a serial type could make `pos + len` wrap in 32 bits and pass the bounds check; a cell count larger than the page could read past the page. A payload larger than SQLite allows (2^31-1) is now corruption, the lengths are compared in 64 bits against what is left of the record, and the cell pointer array is checked against the page size. A page that does not decode makes the rebase refuse the transaction, as every other page that does not decode.
+
 ## 0.6.4 - 2026-10-30
 
 ### Fixed

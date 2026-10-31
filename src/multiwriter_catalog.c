@@ -19,15 +19,15 @@ typedef struct { srow *rows; int n, cap; } srows;
 static char *rec_col_text (const uint8_t *rec, uint32_t len, int col) {
     uint64_t hs = 0; int hl = 0;
     for (; hl < 9 && (uint32_t)hl < len; hl++) { hs = (hs << 7) | (rec[hl] & 0x7f); if (!(rec[hl] & 0x80)) { hl++; break; } }
-    uint32_t pos = (uint32_t)hs, hp = (uint32_t)hl; int idx = 0;
+    uint64_t pos = hs; uint32_t hp = (uint32_t)hl; int idx = 0;
     while (hp < hs && hp < len) {
         uint64_t t = 0; int k = 0; for (; k < 9 && hp + (uint32_t)k < len; k++) { t = (t << 7) | (rec[hp + (uint32_t)k] & 0x7f); if (!(rec[hp + (uint32_t)k] & 0x80)) { k++; break; } }
         hp += (uint32_t)k;
-        uint32_t l = t < 12 ? ((const uint8_t[]){0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0})[t] : (uint32_t)((t - 12) / 2);
+        uint64_t l = t < 12 ? ((const uint8_t[]){0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0})[t] : (t - 12) / 2;      // (a varint here has at most 63 bits: pos + l cannot wrap)
         if (idx == col) {
             if (pos + l > len) return NULL;
-            if (t >= 13 && (t & 1)) { char *s = malloc(l + 1); memcpy(s, rec + pos, l); s[l] = 0; return s; }
-            if (t >= 1 && t <= 6) { int64_t v = (int8_t)rec[pos]; for (uint32_t b = 1; b < l; b++) v = (v << 8) | rec[pos + b]; char *s = malloc(24); snprintf(s, 24, "%lld", (long long)v); return s; }
+            if (t >= 13 && (t & 1)) { char *s = malloc((size_t)l + 1); if (!s) return NULL; memcpy(s, rec + pos, (size_t)l); s[l] = 0; return s; }
+            if (t >= 1 && t <= 6) { int64_t v = (int8_t)rec[pos]; for (uint32_t b = 1; b < l; b++) v = (v << 8) | rec[pos + b]; char *s = malloc(24); if (!s) return NULL; snprintf(s, 24, "%lld", (long long)v); return s; }
             if (t == 8) return strdup("0");
             if (t == 9) return strdup("1");
             return NULL;
@@ -44,6 +44,7 @@ static uint8_t *cell_payload (mw_lane *lane, const uint8_t *cp, const uint8_t *e
     for (; b < 9 && cp + a + b < end; b++) { rid = (rid << 7) | (cp[a + b] & 0x7f); if (!(cp[a + b] & 0x80)) { b++; break; } }
     const uint32_t U = pgsz, X = U - 35, M = ((U - 12) * 32 / 255) - 23;
     uint32_t local = (uint32_t)P, ovfl = 0;
+    if (P > 0x7fffffffu) return NULL;                                           // (more than SQLite allows: corruption; and P + 1 must not reach malloc as a wrapped size)
     if (P > X) { uint32_t K = M + (uint32_t)((P - M) % (U - 4)); local = K <= X ? K : M; if (cp + a + b + local + 4 > end) return NULL; ovfl = be32(cp + a + b + local); }
     else if (cp + a + b + local > end) return NULL;
     uint8_t *buf = malloc((size_t)P + 1); if (!buf) return NULL;
@@ -66,6 +67,7 @@ static void schema_collect (mw_lane *lane, uint32_t pgno, uint32_t pgsz, srows *
     uint32_t base = pgno == 1 ? 100 : 0;
     if (pg[base] == 0x0d) {
         int nc = be16(pg + base + 3);
+        if (base + 8 + 2 * (uint32_t)nc > pgsz) { free(pg); return; }
         for (int i = 0; i < nc; i++) {
             uint32_t off = (uint32_t)be16(pg + base + 8 + 2 * i); if (off >= pgsz) continue;
             uint32_t plen = 0; uint8_t *rec = cell_payload(lane, pg + off, pg + pgsz, pgsz, &plen); if (!rec) continue;
@@ -78,7 +80,8 @@ static void schema_collect (mw_lane *lane, uint32_t pgno, uint32_t pgsz, srows *
         }
     } else if (pg[base] == 0x05) {
         int nc = be16(pg + base + 3);
-        for (int i = 0; i < nc; i++) schema_collect(lane, be32(pg + (uint32_t)be16(pg + base + 12 + 2 * i)), pgsz, out, depth + 1);
+        if (base + 12 + 2 * (uint32_t)nc > pgsz) { free(pg); return; }
+        for (int i = 0; i < nc; i++) { uint32_t co = (uint32_t)be16(pg + base + 12 + 2 * i); if (co + 4 <= pgsz) schema_collect(lane, be32(pg + co), pgsz, out, depth + 1); }
         schema_collect(lane, be32(pg + base + 8), pgsz, out, depth + 1);
     }
     free(pg);

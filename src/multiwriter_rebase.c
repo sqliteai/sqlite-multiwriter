@@ -90,8 +90,9 @@ static bool rec_parse (rec_t *r, const uint8_t *rec, uint32_t reclen) {
     uint32_t pos = (uint32_t)hs, hp = (uint32_t)h;
     while (hp < hs && r->n < 2048) {
         uint64_t t; int k = rd_varint(rec + hp, rec + hs, &t); if (!k) return false; hp += (uint32_t)k;
-        uint32_t l = t < 12 ? ((const uint8_t[]){0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0})[t] : (uint32_t)((t - 12) / 2);
-        r->ty[r->n] = t; r->off[r->n] = pos; r->len[r->n] = l; pos += l; r->n++;
+        uint64_t l = t < 12 ? ((const uint8_t[]){0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0})[t] : (t - 12) / 2;       // (pos <= reclen always: a column that does not fit ends the parse)
+        if (l > reclen - pos) return false;
+        r->ty[r->n] = t; r->off[r->n] = pos; r->len[r->n] = (uint32_t)l; pos += (uint32_t)l; r->n++;
     }
     return pos <= reclen;
 }

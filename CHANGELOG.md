@@ -19,6 +19,7 @@ The format of the files on disk (`-mwlock`, `-mwidx`, `-mw.N`, `-mw`) is the sam
 
 - The build has no warnings with gcc 12 (Linux), clang (macOS, Linux) and MinGW-w64: lines with several `if` on one line (`multiwriter_shidx.c`, `multiwriter_shared.c`, `mw_reloc`) are split; `install_impl` of the shared index refuses a negative count of pages (gcc could not exclude that its allocations wrap) and the repair of a commit that a publisher left half installed initialises its arrays; in the tests, a buffer of `mw_diskfull` that could truncate a command, values that `mw_ioerr` printed uninitialised, a counter that `mw_sharedwindow` did not use, variables of `mw_serial` used only outside Windows.
 - CI: the job of the Android x86_64 emulator gives the runner's user access to `/dev/kvm`. Without it the emulator ran with `-accel off`, which the emulator refuses since version 37 (the action installs the latest): the emulator never started and the job timed out.
+- Test `mw_relocprep`, scenario 1: it must exercise the rewrite of a prepared relocation, which needs threads that overlap; under ThreadSanitizer on a runner of 4 CPUs one run had 5 relocations and none rewritten. The scenario runs again, up to three times, until a rewrite happens (the data are checked every time).
 - `mw_multiproc` printed its lines more than once under ThreadSanitizer: each child wrote again what the parent had printed and not yet flushed. The parent flushes before it forks.
 
 ### Added

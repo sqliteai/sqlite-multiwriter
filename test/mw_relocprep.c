@@ -41,7 +41,8 @@ static void *worker (void *arg) {
     sqlite3_close(db); return NULL;
 }
 
-static void run (const char *name, int delay_us, int hot, int need_rewrite) {
+// Returns the number of prepared phases that were rewritten (the data checks are made in every run).
+static uint64_t run (const char *name, int delay_us, int hot) {
     char path[256]; mw_tmpdb(path, sizeof path, "relocprep");
     sqlite3 *s; CHECK_RC(sqlite3_open_v2(path, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, MW_PLAIN_VFS), SQLITE_OK);
     CHECK_RC(mw_exec(s, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT, v BLOB); CREATE INDEX ik ON t(k); CREATE TABLE hot(id INTEGER PRIMARY KEY, n INTEGER); INSERT INTO hot VALUES(1, 0)"), SQLITE_OK);
@@ -57,16 +58,20 @@ static void run (const char *name, int delay_us, int hot, int need_rewrite) {
            (unsigned long long)st.relocations, (unsigned long long)st.reloc_prep_used, (unsigned long long)st.reloc_prep_dropped, (unsigned long long)st.reloc_prep_rewrote);
     CHECK(rows == want_rows); CHECK(bytes == want_bytes); CHECK(idx == want_rows); CHECK(integrity_ok(obs));
     CHECK(st.reloc_prep_used > 0);
-    if (need_rewrite) CHECK(st.reloc_prep_rewrote > 0);
     sqlite3_close(obs);
     { sqlite3 *r; CHECK_RC(open_mp(path, &r, 0), SQLITE_OK); CHECK(scalar(r, "SELECT count(*) FROM t") == want_rows); CHECK(integrity_ok(r)); sqlite3_close(r); }       // (and after a reopen: the log replays what was published)
     mw_rmdb(path);
+    return st.reloc_prep_rewrote;
 }
 
 int main (void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    run("1. the end of the file moves between the preparation and the lock", 400, 0, 1);
-    run("2. no delay", 0, 0, 0);
-    run("3. with a hot row next to the inserts", 200, 1, 0);
+    // 1. must rewrite prepared phases (that is what it is for): that needs commits that extend the file while another waits between its preparation and the lock, and on a slow machine
+    //    (ThreadSanitizer on a runner of 4 CPUs: 5 relocations in a run, none rewritten) the threads may hardly overlap. Run again, up to three times, until it happens; the data are checked every time
+    uint64_t rewrote = 0;
+    for (int attempt = 0; attempt < 3 && rewrote == 0; attempt++) rewrote = run("1. the end of the file moves between the preparation and the lock", 400, 0);
+    CHECK(rewrote > 0);
+    run("2. no delay", 0, 0);
+    run("3. with a hot row next to the inserts", 200, 1);
     MW_DONE();
 }

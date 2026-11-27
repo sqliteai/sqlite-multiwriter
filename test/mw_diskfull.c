@@ -21,7 +21,7 @@
 static char img[256], mnt[256], ballast[300];
 
 static bool vol_make (long mb) {
-    char cmd[900];
+    char cmd[1600];                     // (room for the longest command: three paths of up to 255 bytes each, a file system name and the fixed text)
     snprintf(img, sizeof img, "/tmp/mw_full_%d.img", (int)getpid()); snprintf(mnt, sizeof mnt, "/tmp/mw_full_mnt_%d", (int)getpid());
     snprintf(ballast, sizeof ballast, "%s/ballast", mnt);
 #ifdef __APPLE__

@@ -28,6 +28,14 @@ Open a database through the VFS with `file:db?vfs=multiwriter` (threads of one p
 - **Snapshot.** The first read of a transaction takes the newest *visible* epoch. Every commit takes the next epoch and becomes visible only after the one before it (readers see a prefix of the commits, never a hole). A page read at
   a snapshot is the newest version with an epoch not above it, else the page of the real file. Versions are kept while an active snapshot can still see them (`oldest_active_snapshot`), and dropped by the garbage collector
   that the committing threads run every few dozens of commits.
+- **Speculative snapshot of a writer** (one process). A transaction whose first statement writes (or `BEGIN IMMEDIATE`/`EXCLUSIVE`; the statement hook tells the lane) takes its snapshot at the newest *installed* epoch
+  (`spec_epoch`: every epoch up to it has its versions in the store) instead of the newest visible one, so it may read commits whose record is not durable yet. Its own commit has a later epoch, the log is durable as a
+  prefix, and it is acknowledged only when its record is durable: it cannot be acknowledged without the commits it read. Without it, commits that depend on each other (inserts with the rowid that SQLite picks: each
+  one takes the key after the last one it sees) can only follow each other one fsync at a time (measured: 310 tx/s at every number of writers with an fsync of 3 ms); with it they share the group fsync. What is not
+  weakened: a transaction that does not write reads only durable commits; one that took a speculative snapshot and ends without a commit (a write statement that changed nothing, a `ROLLBACK`) waits, when it ends,
+  until what it read is durable; a commit whose record cannot be written is taken back (its epoch and versions) and `spec_gen` is bumped, and a speculative transaction of an older generation is refused at its
+  commit (`SQLITE_BUSY_SNAPSHOT`) and fails its reads (`SQLITE_IOERR_READ`); the recovery in place bumps it too. Only the commits of a failed fsync were ever readable this way, and they fail with the database, as in the
+  processes mode. URI `mw_spec=0` turns it off for a connection (the helper of its rebase follows it), `MW_NO_SPEC=1` makes that the default of the process. Test `mw_spec`.
 - **Commit.** Under the locks of the pages it wrote, a commit is validated: (1) the schema cookie is the one the transaction began with; (2) no page that it *read and did not write* has a newer version (a read of an interior b-tree page
   is forgiven if the path that the transaction took through it is unchanged: *routing*); (3) no page that it wrote has a newer version than its snapshot. Then its record (pages) goes to the log, its versions are installed, and
   it becomes visible when the log is durable (group commit). A commit that fails (2) or the cookie is refused; one that fails (3) may be saved:
@@ -35,7 +43,8 @@ Open a database through the VFS with `file:db?vfs=multiwriter` (threads of one p
     merged, and the commit is published again, inside the same hold of the locks;
   - **merge of interior pages** (`multiwriter_btree.c`): both commits rewrote an interior table page (typically the parent of leaves both split): the page is merged three-way with the newest version;
   - **rebase** (below), if `mw_rebase=1`.
-  Otherwise the commit is refused and the lane's transaction ends; hot spots are served by a turn (a connection that lost serialises its next few transactions).
+  Otherwise the commit is refused and the lane's transaction ends; hot spots are served by a turn (a connection that lost serialises its next few transactions). With speculative snapshots (one process) the turn is taken after the
+  first refusal and given back as soon as the commit is installed or conflicts (the next holder reads it at once, it does not wait for the fsync, nor for the replay of a holder that lost); without them (`MW_NO_SPEC=1`), and in the processes mode, after 16 refusals in a row and at the end of the transaction.
 - **What is guaranteed.** Snapshot isolation with first-committer-wins at the level of pages, plus the validation of the pages read: no lost update, no write over a row that was deleted meanwhile, no UNIQUE value held by two
   rows, and a read-only transaction sees one consistent prefix of the commits. A transaction that read a page that another commit rewrote after its snapshot is refused (`SQLITE_BUSY_SNAPSHOT`). That is what stops write skew:
   in the pair "T1 reads A and writes B, T2 reads B and writes A" the second to commit read a page that the first rewrote, also when A and B are on different pages, when the page caches are warm, with the rebase, when a
@@ -64,7 +73,7 @@ a commit conflicts, not at every commit.
 2. **The replay** (`multiwriter_rebase.c`), on a helper connection of the lane (`mw_norebase=1`: never recursive; triggers off; foreign keys as the application's connection has them; same `synchronous`), in one transaction at the latest snapshot: the schema cookie is
    the one the transaction had; for every row that was changed or deleted the row is *exactly what the transaction saw* (the whole row, with `COLLATE BINARY IS`, so the type affinities and collations of the columns do not hide a difference);
    the deletes, then the updates, then the inserts are run (a key that one frees and another takes); a row that was inserted must not be there, and the constraints (UNIQUE, CHECK, NOT NULL, the key) are evaluated by SQLite on the rows as
-   they are now. Any of these that fails is a **true conflict**: the transaction is refused (`SQLITE_BUSY_SNAPSHOT`) and the application runs it again, as without the rebase. If the helper's commit loses a race (a commit that was assigned an epoch but is not yet visible has already installed its pages, so the snapshot of the replay is always older than the page heads) the publication gate is closed after the **first** lost attempt (`MW_REBASE_GATE_AFTER 1`), so that the next attempt runs against a frozen state. The replays are serialised and **batched** (a group replay): the connections whose commit conflicted queue a request (their decoded changes), the first becomes the leader and replays everything that is queued (up to 64) in ONE transaction of its helper, in the order the requests came, a savepoint for each (a request that is a true conflict is rolled back alone, the others see the rows as the ones before them left them), and the successful ones commit together at one epoch (`mw_tx_info.commit_order`: their order in it; the result is a serial execution in that order). One commit and one install of the pages for the group instead of a lost race and a commit for each. In the processes mode the batches are serialised across all the processes by an `fcntl` lock. The decoding of the pages is not serialised: every connection decodes its own.
+   they are now. Any of these that fails is a **true conflict**: the transaction is refused (`SQLITE_BUSY_SNAPSHOT`) and the application runs it again, as without the rebase. If the helper's commit loses a race (a commit that was assigned an epoch but is not yet visible has already installed its pages, so the snapshot of the replay is always older than the page heads) the publication gate is closed after the **first** lost attempt (`MW_REBASE_GATE_AFTER 1`), so that the next attempt runs against a frozen state (with speculative snapshots the helper reads what is installed, at least what the transaction it replays read, and the gate waits until every assigned commit is installed, not until it is durable). The replays are serialised and **batched** (a group replay): the connections whose commit conflicted queue a request (their decoded changes), the first becomes the leader and replays everything that is queued (up to 64) in ONE transaction of its helper, in the order the requests came, a savepoint for each (a request that is a true conflict is rolled back alone, the others see the rows as the ones before them left them), and the successful ones commit together at one epoch (`mw_tx_info.commit_order`: their order in it; the result is a serial execution in that order). One commit and one install of the pages for the group instead of a lost race and a commit for each. In the processes mode the batches are serialised across all the processes by an `fcntl` lock. The decoding of the pages is not serialised: every connection decodes its own.
    The `UPDATE` of a replay sets only the columns that changed (naming an unchanged indexed column rewrites its index, which refuses the transactions that only read that page). A connection whose replay was refused skips the replay of its next 1, 3, 7... conflicts (the true conflicts of a hot row would fail again
    at the cost of the decoding; `mw_rebase_backoff=0` turns it off, for the tests), and a conflict that was rebased does not make the connection take the hot-spot turn.
 3. **What the result is.** The state that a serial execution of the two commits could have produced: the replay has the epoch of the helper's commit, and every row that the transaction touched is, in that order, what it was when it read it.
@@ -125,7 +134,7 @@ copies of a relocation are made before the lock too. The group fsync is shared b
 
 ## Durability and recovery
 
-- A commit is durable when its record is in the log and the log is synced; it is visible after that (one process) or before (several processes: an acknowledged commit is never lost, and a failed fsync fails every commit that is not durable yet,
+- A commit is durable when its record is in the log and the log is synced; it is visible after that (one process; a write transaction may read it before, see "Speculative snapshot of a writer") or before (several processes: an acknowledged commit is never lost, and a failed fsync fails every commit that is not durable yet,
   in every process, until the log is closed by all).
 - Recovery replays the valid prefix of the log (a record is valid as a whole: its checksum covers the pages), cuts a torn tail durably (`fsync` of the file and of the directory), refuses a header that does not check out
   with records behind it (`SQLITE_CORRUPT`) and a read that fails (it is not the end of the log).
@@ -193,11 +202,11 @@ the relocation prepared before the lock, the rebase (`mw_rebase`: what is replay
 
 ## Parameters (URI and environment)
 
-URI parameters (read at open): `mw` (0 off, 2 lanes: the engine), `mw_mp` (0 one process, 1 processes: the shared mode), **`mw_rebase`** (1: the rebase), `mw_fullfsync`, `mw_profile` (`small`: the cache of pages of the
+URI parameters (read at open): `mw` (0 off, 2 lanes: the engine), `mw_mp` (0 one process, 1 processes: the shared mode), **`mw_rebase`** (1: the rebase), **`mw_spec`** (1, the default: speculative snapshots of the writers; 0: off), `mw_fullfsync`, `mw_profile` (`small`: the cache of pages of the
 real file at 8 MB, a log of 16 MB before it is compacted), `mw_base_cache_mb`, `mw_log_max_mb`, `mw_gc` (commits between two collections of versions), `mw_hot_credit`, `mw_readcheck` (0: no validation of the pages read: fewer retries, write skew becomes possible), and, for tests and
 measurements, `mw_noreloc`, `mw_noroute`, `mw_nomerge`, `mw_norebase` (marks a connection that never rebases: the helper), `mw_rebase_backoff` (0: replay every conflict), `mw_prep_delay_us` (waits between the preparation of a relocation and the publication lock).
 
-Environment: `MW_FULLFSYNC`, `MW_PROFILE`, `MW_SEG_MB` (size of a segment of the shared log), `MW_IDX_ENTRIES`, `MW_SIDECAR_DIR` (where the shared maps go: `/dev/shm` on Linux), `MW_SPIN_US`, `MW_POOL_BATCH`, `MW_ENOSPC_WAIT_MS`;
+Environment: `MW_FULLFSYNC`, `MW_PROFILE`, `MW_NO_SPEC` (`mw_spec=0` by default), `MW_SHORT_STARVE` (refusals in a row before a short transaction takes the hot-spot turn), `MW_SEG_MB` (size of a segment of the shared log), `MW_IDX_ENTRIES`, `MW_SIDECAR_DIR` (where the shared maps go: `/dev/shm` on Linux), `MW_SPIN_US`, `MW_POOL_BATCH`, `MW_ENOSPC_WAIT_MS`;
 diagnostics: `MW_DEBUG`, `MW_TIMING` (time spent in each stage of a commit), `MW_IO_TRACE`, `MW_COMPACT_TRACE`, `MW_PAGE_TRACE`. Measurement only (`make EXPERIMENTS=1`): `MW_EXP_*`.
 
 ## Security of the files
@@ -217,6 +226,23 @@ that reorders writes around a flush. Platforms: macOS and Linux (arm64 tested); 
 The code is under the Apache License 2.0 (`LICENSE`, `NOTICE`). `third_party/sqlite` is SQLite 3.53.4 (public domain), unchanged. The measurements are in `bench/results/`.
 
 ## Measurements
+
+**The appends of the external comparison** (`bench/events_bench.c`: 100 inserts of 64 bytes per transaction with the rowid that SQLite picks, an index on the writer, 4 readers, `busy_timeout=5000`, a refused transaction is run again and its latency counts the retries; this Mac, 6 s per point, 2026-11-27). Every commit takes the rowid after the last one it sees, so every two concurrent commits are a true conflict and every commit depends on the one before. Before the speculative snapshots and the cheaper turn / after:
+
+| profile | writers | tx/s | p99 ms | p99.9 ms | retries per 100 tx |
+|---|---:|---:|---:|---:|---:|
+| fsync of ~3 ms (`MW_FULLFSYNC=1`) | 1 | 303 / 316 | 4.2 / 4.1 | 9.7 / 7.8 | 0 / 0 |
+| | 8 | 314 / 1,075 | 410 / 14.9 | 679 / 18.6 | 674 / 7.5 |
+| | 24 | 333 / 2,547 | 694 / 20.0 | 1,043 / 22.8 | 545 / 7.1 |
+| fast fsync (`synchronous=FULL`) | 8 | 8,880 / 11,058 | 22.3 / 3.7 | 101 / 6.4 | 130 / 6.7 |
+| | 24 | 7,978 / 10,180 | 55.8 / 11.1 | 117 / 56.3 | 143 / 6.8 |
+| `synchronous=OFF` | 8 | 11,599 / 11,764 | 19.1 / 8.0 | 86 / 15.0 | 108 / 17.9 |
+| | 24 | 11,330 / 11,372 | 59.4 / 16.8 | 175 / 27.3 | 111 / 15.2 |
+
+Linux (Debian 12 in a Docker container on the same Mac, arm64, 18 CPUs, a virtual disk whose fsync takes about 0.3 ms), 24 writers: disk with `synchronous=FULL` 1,820 / 7,625 tx/s, p99 145 / 8.6 ms, 239 / 7 retries per 100 tx;
+tmpfs with `synchronous=FULL` 9,935 / 9,262 tx/s, p99 64 / 14 ms; disk with `synchronous=OFF` 9,660 / 9,145 tx/s, p99 62 / 13 ms. Without a durable fsync the appends stay serial (each needs the one before): the gain there is the
+latency and the retries, not the throughput, which is 3-7% lower from 8 writers up (the turn after the first refusal; `MW_SHORT_STARVE=16` gives the old behaviour).
+
 
 The tables for the readers are in `docs/benchmarks.md` (2026-10-07, this Mac, 18 cores, SQLite 3.53.4, `synchronous=FULL`, one run of 8 s per point; `bench/results/simple_*_2026-10-07.jsonl`, made by `bench/compare_sqlite.py` and `bench/make_report.py`).
 For this engine a retry is a commit that was refused and that the application ran again; the replays that the rebase lost to other commits and repeated inside the engine are the "lost replays per merged commit". "Gave up" is a transaction that did not commit after 1000 retries.

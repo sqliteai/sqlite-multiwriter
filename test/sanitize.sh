@@ -31,7 +31,7 @@ for t in $TESTS; do
     mw_stagednormal)
       "$CC" -w $CF -Dpwritev=inject_pwritev -c src/multiwriter_log.c -o $OUT/injected.o
       TEST_LIBS="${LIBS//$OUT\/multiwriter_log.o/} $OUT/injected.o";;
-    mw_holesync)
+    mw_holesync|mw_spec)
       "$CC" -w $CF -Dfsync=inject_fsync -c src/multiwriter_log.c -o $OUT/injected.o
       TEST_LIBS="${LIBS//$OUT\/multiwriter_log.o/} $OUT/injected.o";;
     mw_autoextfail)

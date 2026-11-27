@@ -91,8 +91,12 @@ shidx *shidx_open (const char *path, const shidx_params *params) {
     if (fstat(fd, &sb) != 0) { flock(fd, LOCK_UN); close(fd); return NULL; }
     if (sb.st_size == 0) {                                          // first opener: lay the file out
         shidx_params p = { 24, 4u << 20, 4096, 0 };
-        if (params) { if (params->max_pages_log2) p.max_pages_log2 = params->max_pages_log2; if (params->max_entries) p.max_entries = params->max_entries;
-                      if (params->nslots) p.nslots = params->nslots; if (params->max_cands) p.max_cands = params->max_cands; }
+        if (params) {
+            if (params->max_pages_log2) p.max_pages_log2 = params->max_pages_log2;
+            if (params->max_entries) p.max_entries = params->max_entries;
+            if (params->nslots) p.nslots = params->nslots;
+            if (params->max_cands) p.max_cands = params->max_cands;
+        }
         if (!p.max_cands) p.max_cands = p.max_entries + 1;                   // (a page is queued once: never more candidates than versions)
         if (p.max_pages_log2 < BLOCK_BITS + 1 || p.max_pages_log2 > 32) { errno = EINVAL; flock(fd, LOCK_UN); close(fd); return NULL; }
         hdr h;
@@ -251,6 +255,7 @@ void (*shidx_install_hook)(int done);                                 // (tests:
 
 static int install_impl (shidx *ix, uint64_t epoch, uint32_t dbsize, bool with_size, int n, const uint32_t *pgnos, const uint64_t *locs) {
     hdr *h = ix->h;
+    if (n < 0) return -2;                                                 // (never: a count of pages; said so that the sizes of the allocations below cannot wrap)
     const int i0 = with_size ? -1 : 0;                                    // (the size record is item -1)
     uint32_t need = (uint32_t)n + (with_size ? 1u : 0u);
     uint32_t room = h->n_free + (h->max_entries - h->arena_top);
@@ -308,8 +313,8 @@ int shidx_install (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint
 // installed. The same call finishes a commit of which nothing was installed.
 int shidx_install_missing (shidx *ix, uint64_t epoch, uint32_t dbsize, int n, const uint32_t *pgnos, const uint64_t *locs) {
     const bool with_size = shidx_head_epoch(ix, 0) != epoch;
-    uint32_t pg_small[130]; uint64_t lc_small[130];
-    uint32_t *pg = (size_t)n <= 130 ? pg_small : malloc((size_t)n * sizeof *pg); uint64_t *lc = (size_t)n <= 130 ? lc_small : malloc((size_t)n * sizeof *lc);
+    uint32_t pg_small[130] = {0}; uint64_t lc_small[130] = {0};          // (initialised, and calloc below: gcc cannot tell that install_impl reads only the m that are filled; this is the repair of a publisher that died, not a hot path)
+    uint32_t *pg = (size_t)n <= 130 ? pg_small : calloc((size_t)n, sizeof *pg); uint64_t *lc = (size_t)n <= 130 ? lc_small : calloc((size_t)n, sizeof *lc);
     if (!pg || !lc) { if (pg != pg_small) free(pg); if (lc != lc_small) free(lc); return -2; }
     int m = 0;
     for (int i = 0; i < n; i++) if (shidx_head_epoch(ix, pgnos[i]) != epoch) { pg[m] = pgnos[i]; lc[m] = locs[i]; m++; }

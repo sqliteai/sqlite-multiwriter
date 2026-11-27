@@ -95,7 +95,7 @@ static long run_once (const char *path, bool shared, const scenario *sc, long nt
 static void verify (const char *path, bool shared, int acked, const char *what, long nth) {
     sqlite3 *r; int rc = open_db(path, &r, shared);
     if (rc != SQLITE_OK) { printf("FAIL %s n=%ld: cannot open the database again (%d)\n", what, nth, rc); mw_failures++; return; }
-    int64_t sum; int rows; int bad = check_rows(r, &sum, &rows);
+    int64_t sum = 0; int rows = 0; int bad = check_rows(r, &sum, &rows);
     if (bad != 0 || rows != NROWS || (sum & 1) || sum < 2 * acked) {
         printf("FAIL %s n=%ld: %d rows (want %d), %d disagree with the metadata, sum(n)=%lld, acknowledged %d\n", what, nth, rows, NROWS, bad, (long long)sum, acked);
         mw_failures++;

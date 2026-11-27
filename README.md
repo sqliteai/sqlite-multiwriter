@@ -44,6 +44,22 @@ each other. If another commit got there first on the same page, the transaction 
 loser: it takes the row changes of its transaction and applies them again on top of the latest state, then commits. The application sees no error. A transaction that really conflicts (the same row changed by both)
 is still refused. The rebase is limited to simple transactions: `INSERT`s and `UPDATE`/`DELETE`s of a row by its key. See Limits.
 
+**Commits that depend on each other** (new in 0.7, `mw_spec`, on by default). A commit is acknowledged only when it is on disk, and it used to become visible to the other connections only then too. That
+made a chain of commits that each need the previous one (inserts with the rowid that SQLite picks: each one takes the key after the last one it sees) pay one fsync each, whatever the number of writers. Now
+a transaction that writes reads the newest commits that are *installed*, even if their fsync is still running, so a whole chain shares one group fsync:
+
+    before:  T1 installed -- fsync -- visible, OK
+             T2                       reads T1 -- installed -- fsync -- OK          one fsync per commit
+    now:     T1 installed -- fsync ------------ OK
+             T2   reads T1 -- installed -- the fsync that covers T1 and T2 -- OK   many commits per fsync
+
+What stays the same: a commit is acknowledged only when it is durable, and the log is durable in order, so a commit is never acknowledged before the ones it read; a transaction that only reads sees only
+durable commits; a transaction that read speculatively and ends without writing waits until what it read is durable. The one difference: if the machine crashes before the fsync, a write transaction that
+had read the lost commits (and was not acknowledged, since it came after them) may have shown their rows to the application before failing. If a commit cannot be written, it is taken back and the
+transactions that read it fail with `SQLITE_BUSY_SNAPSHOT` and are run again. This is what the processes mode (`mw_mp=1`) always did. `mw_spec=0` on a connection, or `MW_NO_SPEC=1` for the whole process,
+restores the old behaviour. With it, a connection that lost a conflict takes a turn after its first refusal (it was after 16) and gives it back as soon as its commit is installed: fewer retries and much
+shorter tails under contention.
+
 Isolation is snapshot isolation plus validation of the pages a transaction read: if another commit rewrote one of them after the snapshot, the commit is refused, which rules out the usual write skew (`docs/design.md`, "What is guaranteed"). It is tested, not proved serializable. The application must retry a transaction that fails with `SQLITE_BUSY_SNAPSHOT`, the whole transaction.
 
 ## Two ways to use it
@@ -64,7 +80,7 @@ Every release has the extension for each platform ([releases](https://github.com
 allows extensions, then open the database with the VFS:
 
     .load ./multiwriter                              -- the sqlite3 shell (multiwriter.so, .dylib or .dll)
-    SELECT mw_version();                             -- 0.6.5
+    SELECT mw_version();                             -- 0.7.0
 
 From C:
 
@@ -100,12 +116,13 @@ Options (URI parameters, read when the database is opened):
 |---|---|
 | `mw` | `1`: the engine, and the default when the URI has `vfs=multiwriter`; `0`: off for that database; any other value fails the open |
 | `mw_rebase=1` | replay a commit that lost only on shared pages instead of refusing it |
+| `mw_spec` | `1` (default): the write transactions read commits that are installed and not yet durable, and commits that depend on each other share one fsync (see How it works); `0`: they read only durable commits, as before 0.7 |
 | `mw_profile=small` | smaller caches (8 MB of pages, 16 MB of log before compaction), for a phone or a small server |
 | `mw_log_max_mb` | size of the log before it is compacted into the database |
 | `mw_fullfsync=1` | `F_FULLFSYNC` for the log and the compaction on macOS |
 | `mw_readcheck=0` | do not validate the pages a transaction read: fewer retries, but write skew becomes possible |
 
-The complete list is in `docs/design.md`.
+Environment variables: `MW_NO_SPEC=1` makes `mw_spec=0` the default for the process; `MW_SHORT_STARVE=n` sets after how many refusals in a row a connection takes the turn of a hot spot (1 with `mw_spec`, 16 without). The complete list is in `docs/design.md`.
 
 ### Against stock SQLite, threads
 
@@ -222,7 +239,7 @@ Build one yourself: `make extension [PLATFORM=macos|ios|ios-sim|mac-catalyst|and
 ## Build and test
 
     git clone https://github.com/sqliteai/sqlite-multiwriter && cd sqlite-multiwriter
-    make test           # the test suite (about 50 programs, a few minutes)
+    make test           # the test suite (about 95 programs, a few minutes)
     make test-mp        # the transaction tests with processes (mw_mp=1)
     make test-io        # errors of the file system and a full disk (minutes)
     make bench          # dist/mw_bench;  bench/compare_sqlite.py: against stock SQLite
@@ -241,6 +258,7 @@ What to know before relying on it (details and measurements in `docs/design.md`)
 - `PRAGMA data_version` changes with every transaction (also of the connection itself).
 
 **Isolation and retries**
+- A write transaction may read commits that are installed and not yet durable (`mw_spec`, default on): it is never acknowledged before them, but if the machine crashes before their fsync, rows it showed the application may be gone. `mw_spec=0` turns it off.
 - Snapshot isolation with first-committer-wins on pages, plus validation of the pages read, which refuses the classic write skew (two transactions that each read what the other writes). It is still possible in three cases: `mw_readcheck=0` (the validation is off), the reads of page 1 (the header of the file: not validated), and transactions on attached databases (not atomic across the files). Serializability is tested, not proved. To protect an invariant that a transaction only reads, make both transactions write a shared row with a real change (`UPDATE guard SET n = n + 1`): they then conflict whatever they read. The application must retry a transaction that fails with `SQLITE_BUSY_SNAPSHOT` (the whole transaction).
 - A schema change waits up to 2 s for the write transactions of the other connections to end, then goes ahead; a transaction that overlapped it fails on the schema cookie with `SQLITE_BUSY_SNAPSHOT` when it tries to write, and is retried (as a stock WAL reader that tries to write after a commit). A change of the temporary schema does not wait.
 - Throughput of one database is bounded by the publication of a commit (about 40 us in the processes mode) and by true conflicts: many writers on the same row serialise, and the rebase does not help them.

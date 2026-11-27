@@ -45,7 +45,7 @@ void mw_lane_rebase_free (mw_lane *lane) {
 }
 
 // Percent-escape the characters that would end a URI path.
-static char *uri_for (const char *path, bool mp) {
+static char *uri_for (const char *path, bool mp, bool spec) {
     size_t n = strlen(path);
     char *esc = sqlite3_malloc64(n * 3 + 1), *o = esc;
     if (!esc) return NULL;
@@ -54,13 +54,13 @@ static char *uri_for (const char *path, bool mp) {
         else *o++ = path[i];
     }
     *o = 0;
-    char *uri = sqlite3_mprintf("file:%s?mw=1&mw_norebase=1&mw_mp=%d", esc, mp ? 1 : 0);
+    char *uri = sqlite3_mprintf("file:%s?mw=1&mw_norebase=1&mw_rbhelper=1&mw_mp=%d&mw_spec=%d", esc, mp ? 1 : 0, spec ? 1 : 0);      // (the helper reads speculatively when the connection it replays for does)
     sqlite3_free(esc);
     return uri;
 }
 static int helper_open (mw_lane *lane) {
     if (lane->rb_db) return SQLITE_OK;
-    char *uri = uri_for(lane->db->path, lane->db->mp_req);
+    char *uri = uri_for(lane->db->path, lane->db->mp_req, lane->spec_on);
     if (!uri) return SQLITE_NOMEM;
     sqlite3 *h = NULL;
     int rc = sqlite3_open_v2(uri, &h, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_PRIVATECACHE, MW_VFS_NAME);

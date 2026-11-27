@@ -228,6 +228,15 @@ jobs:
           make ${{ matrix.make }} dist/loadable
           echo 'set -e; cd /data/local/tmp; export TMPDIR=/data/local/tmp; ./loadable ./multiwriter.so; echo EXIT_CODE=0' > dist/commands.sh
 
+      # The runner has /dev/kvm but not for the runner's user: without it the action runs the emulator with -accel off, which the emulator refuses since version 37 ("Software CPU
+      # emulation (-accel off) is not supported"). With KVM the emulator is accelerated (the setup that the action documents).
+      - name: android emulator - enable KVM
+        if: matrix.test == 'emulator'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
       - name: android emulator - run
         if: matrix.test == 'emulator'
         uses: reactivecircus/android-emulator-runner@v2.34.0

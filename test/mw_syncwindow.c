@@ -2,11 +2,14 @@
 // a sync of its own. So the point must be one where the log is complete and stays: it used to be taken from the append cursor (sl_seg and sl_end, two words), and
 //   1. while the log rolled to the next segment, a leader could see the new segment with the end of the old one (about a megabyte that was then taken for synced);
 //   2. a record that was appended and then taken out of the log (the install of its versions failed) was below the point that a leader had already declared durable, and the commit that
-//      took its place was acknowledged without a sync.
+//      took its place was acknowledged without a sync;
+//   3. a leader that found its own record made durable by the leader before it (which finished between its look and its turn) synced nothing and still moved the durable point to the end of
+//      the log as it was after its delay: past records that others had installed meanwhile, which were then acknowledged without a sync.
 // Each commit is checked by the number of syncs of the log that were made while it ran (the I/O injection counts them): a commit with synchronous=FULL that returns with none was
 // covered by a sync that finished before its record was written.
 #include <pthread.h>
 #include <errno.h>
+#include <sys/wait.h>
 #include "mw_test.h"
 #include "multiwriter.h"
 
@@ -52,11 +55,25 @@ static void scenario (const char *label, const char *env, const char *val, const
 
 int main (void) {
     setenv("MW_SEG_MB", "1", 1);
+    {   // 3. (first, in a child: the engine reads its knobs once per process) every committer waits 2 ms before it tries to be the leader, and the leader takes its look 3 ms late: another leader
+        //    often finishes in between, and the one that takes over finds its own record durable already
+        fflush(NULL);
+        pid_t c = fork();
+        if (c == 0) {
+            setenv("MW_TEST_SYNC_DELAY_US", "3000", 1);
+            scenario("leader after a leader", "MW_TEST_SYNC_PRELEAD_US", "2000", NULL, NULL, 0, 200);
+            fflush(NULL);
+            _exit(mw_failures ? 1 : 0);
+        }
+        int st = 0; waitpid(c, &st, 0);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
     // 1. segments of 1 MB (a roll every 120 commits); the roll takes 20 ms between its two words, and the leaders take their look 10 ms late
     setenv("MW_TEST_SYNC_DELAY_US", "10000", 1);
     scenario("roll", "MW_TEST_ROLL_DELAY_US", "20000", NULL, NULL, 0, 300);
     // 2. the install of the 60th commit fails after 30 ms, the leaders take their look 15 ms late
     setenv("MW_TEST_SYNC_DELAY_US", "15000", 1);
     scenario("install failure", "MW_FAULT_DELAY_US", "30000", NULL, NULL, 60, 200);
+
     MW_DONE();
 }

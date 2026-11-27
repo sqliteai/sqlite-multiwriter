@@ -494,6 +494,7 @@ int mw_seglog_sync (mw_db *db, uint32_t seg, uint64_t end) {
     for (;;) {
         if (atomic_load_explicit(&sh->sy_done, memory_order_acquire) >= target) return SQLITE_OK;
         if (atomic_load_explicit(&sh->sy_failed, memory_order_acquire)) return SQLITE_IOERR_FSYNC;
+        { static _Atomic int d = MW_KNOB_UNSET; int us = mw_knob_int(&d, "MW_TEST_SYNC_PRELEAD_US", 0); if (us > 0) usleep((useconds_t)us); }     // (tests: a leader that finishes between our look at sy_done and our turn as the leader)
         int32_t exp = 0;
         if (atomic_compare_exchange_strong(&sh->sy_leader, &exp, me)) {
             // The leader: one fsync for every commit written so far, by any process (the processes share one active segment).
@@ -505,8 +506,10 @@ int mw_seglog_sync (mw_db *db, uint32_t seg, uint64_t end) {
             uint32_t tseg = (uint32_t)MW_LOG_GEN(tpos);
             uint64_t tend = MW_LOG_END(tpos);
             if (tpos < target) { tseg = seg; tend = end; tpos = target; }
-            int frc = 0;
-            if (atomic_load_explicit(&sh->sy_done, memory_order_acquire) >= target) frc = 0;     // (somebody finished while we were taking over)
+            int frc = 0; bool synced = false;
+            // (somebody finished while we were taking over: nothing is synced here, and sy_done must not move. It used to move to tpos all the same, and tpos, read after that, can be past
+            // records that other processes installed meanwhile and nobody synced: they were then acknowledged without an fsync. mw_syncwindow, about 1 run in 20 on a Linux of 4 CPUs)
+            if (atomic_load_explicit(&sh->sy_done, memory_order_acquire) >= target) frc = 0;
             else if (mw_fault_hit(MW_FAULT_LOG_SYNC_ERR)) frc = -1;
             else {
                 segmap *m = map_acquire(sl, tseg);
@@ -518,10 +521,11 @@ int mw_seglog_sync (mw_db *db, uint32_t seg, uint64_t end) {
                     uint64_t to = (tend + (uint64_t)osp - 1) & ~((uint64_t)osp - 1); if (to > m->len) to = m->len;
                     frc = to > from ? mw_io_msync(m->base + from, (size_t)(to - from), MS_SYNC) : 0;
                     if (frc == 0) frc = mw_io_fsync(m->fd);
+                    synced = frc == 0;
                     map_release(m);
                 } else frc = -1;
             }
-            if (frc == 0) {
+            if (synced) {                                                                // (only what this leader made durable)
                 uint64_t cur = atomic_load(&sh->sy_done);
                 while (cur < tpos && !atomic_compare_exchange_weak(&sh->sy_done, &cur, tpos)) {}
                 atomic_fetch_add(&db->n_log_syncs, 1);

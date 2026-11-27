@@ -1,6 +1,6 @@
 # sqlite-multiwriter
 
-**With 16 threads writing one database, 49,277 transactions per second against 8,630 for SQLite (5.7x), and the slowest 1 in 1000 commits takes 2.08 ms instead of 157 ms.**
+**With 16 threads writing one database, 51,558 transactions per second against 8,910 for SQLite (5.8x), and the slowest 1 in 1000 commits takes 1.93 ms instead of 138 ms.**
 **With 16 processes, 25,987 against 8,636 (3.0x), and 1.54 ms against 233 ms.**
 
 SQLite is the most widely used database in the world, and it has one well-known limit: a database accepts only one writer at a time. With many threads, or many processes (several agents working on the
@@ -20,13 +20,13 @@ write the same database at once. Every commit is durable, and the file remains a
 
 | 16 writers | SQLite tx/s | multiwriter tx/s | Gain | Retries per 100 tx | Slowest 1 in 1000 commits |
 |---|---:|---:|---:|---:|---:|
-| Threads, each inserting its own rows | 8,630 | **49,277** | 5.7x | 189 → **0.2** | 157 → **2.08** ms |
-| Threads, own rows on shared pages (with rebase) | 13,562 | **55,098** | 4.1x | 35 → **0** | 584 → **0.93** ms |
+| Threads, each inserting its own rows | 8,910 | **51,558** | 5.8x | 156 → **0.0** | 138 → **1.93** ms |
+| Threads, own rows on shared pages (with rebase) | 9,788 | **71,788** | 7.3x | 29 → **0** | 760 → **0.87** ms |
 | Processes, each inserting its own rows | 8,636 | **25,987** | 3.0x | 189 → **0.1** | 233 → **1.54** ms |
 | Processes, own rows on shared pages (with rebase) | 13,225 | **51,472** | 3.9x | 30 → **0** | 664 → **16.6** ms |
-| Threads, all on the same 4 rows | 13,277 | **29,976** | 2.3x | 24 → **17** | 609 → **122** ms |
+| Threads, all on the same 4 rows | 10,189 | **73,234** | 7.2x | 30 → **6.1** | 717 → **0.86** ms |
 
-One writer is not slower than SQLite (15,959 against 13,746 tx/s). When writers change the same rows they really conflict: the gain is smaller and the retries stay.
+One writer is not slower than SQLite (16,216 against 14,455 tx/s). When writers change the same rows they really conflict: some retries stay, but since 0.7 a connection that lost takes a turn and runs its next transactions on fresh state (rows with threads measured with 0.7.0 on 2026-11-27, rows with processes with 0.6 on 2026-10-09: the processes mode did not change).
 
 ## How it works
 
@@ -43,6 +43,22 @@ each other. If another commit got there first on the same page, the transaction 
 **The rebase** (`mw_rebase=1`, optional). Two writers that change different rows can still land on the same page, and that is the usual cause of a refused commit. With the rebase the engine does not refuse the
 loser: it takes the row changes of its transaction and applies them again on top of the latest state, then commits. The application sees no error. A transaction that really conflicts (the same row changed by both)
 is still refused. The rebase is limited to simple transactions: `INSERT`s and `UPDATE`/`DELETE`s of a row by its key. See Limits.
+
+**Commits that depend on each other** (new in 0.7, `mw_spec`, on by default). A commit is acknowledged only when it is on disk, and it used to become visible to the other connections only then too. That
+made a chain of commits that each need the previous one (inserts with the rowid that SQLite picks: each one takes the key after the last one it sees) pay one fsync each, whatever the number of writers. Now
+a transaction that writes reads the newest commits that are *installed*, even if their fsync is still running, so a whole chain shares one group fsync:
+
+    before:  T1 installed -- fsync -- visible, OK
+             T2                       reads T1 -- installed -- fsync -- OK          one fsync per commit
+    now:     T1 installed -- fsync ------------ OK
+             T2   reads T1 -- installed -- the fsync that covers T1 and T2 -- OK   many commits per fsync
+
+What stays the same: a commit is acknowledged only when it is durable, and the log is durable in order, so a commit is never acknowledged before the ones it read; a transaction that only reads sees only
+durable commits; a transaction that read speculatively and ends without writing waits until what it read is durable. The one difference: if the machine crashes before the fsync, a write transaction that
+had read the lost commits (and was not acknowledged, since it came after them) may have shown their rows to the application before failing. If a commit cannot be written, it is taken back and the
+transactions that read it fail with `SQLITE_BUSY_SNAPSHOT` and are run again. This is what the processes mode (`mw_mp=1`) always did. `mw_spec=0` on a connection, or `MW_NO_SPEC=1` for the whole process,
+restores the old behaviour. With it, a connection that lost a conflict takes a turn after its first refusal (it was after 16) and gives it back as soon as its commit is installed: fewer retries and much
+shorter tails under contention.
 
 Isolation is snapshot isolation plus validation of the pages a transaction read: if another commit rewrote one of them after the snapshot, the commit is refused, which rules out the usual write skew (`docs/design.md`, "What is guaranteed"). It is tested, not proved serializable. The application must retry a transaction that fails with `SQLITE_BUSY_SNAPSHOT`, the whole transaction.
 
@@ -64,7 +80,7 @@ Every release has the extension for each platform ([releases](https://github.com
 allows extensions, then open the database with the VFS:
 
     .load ./multiwriter                              -- the sqlite3 shell (multiwriter.so, .dylib or .dll)
-    SELECT mw_version();                             -- 0.6.5
+    SELECT mw_version();                             -- 0.7.0
 
 From C:
 
@@ -100,16 +116,17 @@ Options (URI parameters, read when the database is opened):
 |---|---|
 | `mw` | `1`: the engine, and the default when the URI has `vfs=multiwriter`; `0`: off for that database; any other value fails the open |
 | `mw_rebase=1` | replay a commit that lost only on shared pages instead of refusing it |
+| `mw_spec` | `1` (default): the write transactions read commits that are installed and not yet durable, and commits that depend on each other share one fsync (see How it works); `0`: they read only durable commits, as before 0.7 |
 | `mw_profile=small` | smaller caches (8 MB of pages, 16 MB of log before compaction), for a phone or a small server |
 | `mw_log_max_mb` | size of the log before it is compacted into the database |
 | `mw_fullfsync=1` | `F_FULLFSYNC` for the log and the compaction on macOS |
 | `mw_readcheck=0` | do not validate the pages a transaction read: fewer retries, but write skew becomes possible |
 
-The complete list is in `docs/design.md`.
+Environment variables: `MW_NO_SPEC=1` makes `mw_spec=0` the default for the process; `MW_SHORT_STARVE=n` sets after how many refusals in a row a connection takes the turn of a hot spot (1 with `mw_spec`, 16 without). The complete list is in `docs/design.md`.
 
 ### Against stock SQLite, threads
 
-Apple M5 Pro (18 cores, 64 GB, SSD, APFS), SQLite 3.53.4 in WAL mode, `synchronous=FULL`, 8-second runs on a fresh database. "Retries" is how many times, per 100 committed transactions, the application had to
+Apple M5 Pro (18 cores, 64 GB, SSD, APFS), SQLite 3.53.4 in WAL mode, `synchronous=FULL`, 8-second runs on a fresh database, version 0.7.0 (2026-11-27). "Retries" is how many times, per 100 committed transactions, the application had to
 run a transaction again after `SQLITE_BUSY`; the engine refuses a commit that conflicts and the application runs it again, up to 1000 times. Best result of each row in bold. More scenarios and the rows written:
 `docs/benchmarks.md`. To repeat the runs: `make bench`, then `VARIANTS=mw,mwr,sqlite WORKLOAD=bulk python3 bench/compare_sqlite.py threads out.jsonl 8 1 4 16 64` (`WORKLOAD` is `bulk`, `groups` or `hot`).
 
@@ -117,42 +134,58 @@ run a transaction again after `SQLITE_BUSY`; the engine refuses a commit that co
 
 | Threads | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 13,746 | **0** | **15,959** | **0** | 15,687 | **0** |
-| 4 | 9,307 | 128 | **33,258** | **0.0** | 32,898 | **0.0** |
-| 16 | 8,630 | 189 | **49,277** | **0.2** | 48,275 | **0.2** |
-| 64 | 8,128 | 398 | **45,906** | 1.1 | 45,689 | **1.0** |
+| 1 | 14,455 | **0** | **16,216** | **0** | 15,708 | **0** |
+| 4 | 9,368 | 108 | **35,539** | **0.0** | 34,444 | **0.0** |
+| 16 | 8,910 | 156 | 51,558 | **0.0** | **51,989** | **0.0** |
+| 64 | 8,015 | 348 | **47,613** | **0.1** | 45,420 | **0.1** |
 
 **Each thread updates its own row, rows share pages** (one row per transaction)
 
 | Threads | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 13,401 | **0** | 34,911 | **0** | **35,885** | **0** |
-| 4 | 13,632 | 4.6 | **49,173** | 0.6 | 36,628 | **0** |
-| 16 | 13,562 | 35 | 37,789 * | 8.2 | **55,098** | **0** |
-| 64 | 13,623 | 132 | **40,012** | 64 | 39,500 | **0** |
-
-\* a few transactions gave up after 1000 retries.
+| 1 | 9,146 | **0** | 31,089 | **0** | **34,439** | **0** |
+| 4 | 9,591 | 5.9 | **57,733** | 2.1 | 57,376 | **0** |
+| 16 | 9,788 | 29 | **74,440** | 5.2 | 71,788 | **0** |
+| 64 | 10,733 | 119 | **60,778** | 5.3 | 58,018 | **0** |
 
 **Every thread updates the same 4 rows** (`a = a + 1`): a real conflict, which no engine can merge
 
 | Threads | SQLite tx/s | retries | multiwriter tx/s | retries | with rebase tx/s | retries |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 13,770 | **0** | **37,196** | **0** | 32,939 | **0** |
-| 4 | 14,248 | 6.7 | **36,895** | **2.5** | 27,225 | 7.6 |
-| 16 | 13,277 | 24 | **29,976** | **17** | 28,014 | 34 |
-| 64 | 14,057 | 101 | **32,186** | **81** | 26,782 | 142 |
+| 1 | 10,056 | **0** | 33,659 | **0** | **35,044** | **0** |
+| 4 | 10,143 | 5.7 | 42,882 | 5.9 | **51,020** | **5.5** |
+| 16 | 10,189 | 30 | **73,234** | **6.1** | 72,177 | 6.2 |
+| 64 | 9,333 | 125 | **61,685** | **5.9** | 60,037 | 6.0 |
 
 **Commit latency** (milliseconds, each thread inserting its own rows): time from the start of a transaction to its commit, retries included
 
 | Threads | SQLite p50 | p99 | p99.9 | multiwriter p50 | p99 | p99.9 |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.07 | 0.09 | 1.26 | **0.06** | **0.08** | **0.13** |
-| 4 | 0.21 | 1.54 | 55.8 | **0.11** | **0.24** | **0.69** |
-| 16 | **0.23** | 53.9 | 157 | 0.28 | **1.15** | **2.08** |
-| 64 | **0.26** | 146 | 271 | 1.18 | **3.97** | **31.4** |
+| 1 | 0.06 | 0.08 | 1.17 | **0.06** | **0.08** | **0.11** |
+| 4 | 0.21 | 1.57 | 52.0 | **0.10** | **0.19** | **0.66** |
+| 16 | **0.22** | 54.4 | 138 | 0.27 | **0.93** | **1.93** |
+| 64 | **0.26** | 141 | 253 | 1.14 | **3.39** | **38.4** |
 
 SQLite's median can be lower with many writers: a writer that finds the database busy fails at once and the application retries, and the cost shows in the 99.9th percentile. When writers fight over the
-same rows the gain is about 2x and the rebase does not help.
+same rows the rebase does not help (they really conflict); what keeps their throughput up since 0.7 is the turn: a connection that lost runs its next transactions one after the other on fresh state, and gives
+the turn back as soon as its commit is installed, without waiting for the fsync.
+
+### Commits that depend on each other
+
+The workload of the external comparison ["SQLite vs WAL vs Turso MVCC vs sqlite-multiwriter"](https://esbencarlsen.substack.com/p/sqlite-vs-wal-vs-turso-mvcc-vs-sqlite), in C (`bench/events_bench.c`, `make bench`): 100 inserts of 64 bytes per
+transaction with the rowid that SQLite picks and an index on the writer, 4 readers at the same time, `busy_timeout=5000`, latency with the retries. Every commit takes the key after the last one it sees, so two
+concurrent commits always conflict and each needs the one before: before 0.7 such a chain paid one fsync per commit. 24 writers, before (0.6.5) and after (0.7.0, `mw_spec` on):
+
+| Where | fsync | tx/s | p99 | p99.9 | retries per 100 tx |
+|---|---|---:|---:|---:|---:|
+| macOS, `MW_FULLFSYNC=1` | ~3 ms | 333 → **2,547** | 694 → **20** ms | 1,043 → **23** ms | 545 → **7.1** |
+| macOS, `synchronous=FULL` | fast | 7,978 → **10,180** | 56 → **11** ms | 117 → **56** ms | 143 → **6.8** |
+| Linux (Docker, ext4 on the VM's disk) | ~0.3 ms | 1,820 → **7,625** | 145 → **8.6** ms | 247 → **37** ms | 239 → **7.1** |
+| Linux, tmpfs | none | **9,935** → 9,262 | 64 → **14** ms | 161 → **22** ms | 113 → **15** |
+| Linux, `synchronous=OFF` | none | **9,660** → 9,145 | 62 → **13** ms | 147 → **20** ms | 121 → **13** |
+
+With a durable fsync the chain now shares one group fsync (8 writers: 314 → 1,075 tx/s, 16: 329 → 1,800 with the fsync of 3 ms). Without one the appends stay serial (each needs the one before): the gain is in
+the tails and the retries, and the throughput is 3-7% lower from 8 writers up (`MW_SHORT_STARVE=16` gives the old behaviour of the turn).
 
 ## Multi-process
 
@@ -222,7 +255,7 @@ Build one yourself: `make extension [PLATFORM=macos|ios|ios-sim|mac-catalyst|and
 ## Build and test
 
     git clone https://github.com/sqliteai/sqlite-multiwriter && cd sqlite-multiwriter
-    make test           # the test suite (about 50 programs, a few minutes)
+    make test           # the test suite (about 95 programs, a few minutes)
     make test-mp        # the transaction tests with processes (mw_mp=1)
     make test-io        # errors of the file system and a full disk (minutes)
     make bench          # dist/mw_bench;  bench/compare_sqlite.py: against stock SQLite
@@ -241,6 +274,7 @@ What to know before relying on it (details and measurements in `docs/design.md`)
 - `PRAGMA data_version` changes with every transaction (also of the connection itself).
 
 **Isolation and retries**
+- A write transaction may read commits that are installed and not yet durable (`mw_spec`, default on): it is never acknowledged before them, but if the machine crashes before their fsync, rows it showed the application may be gone. `mw_spec=0` turns it off.
 - Snapshot isolation with first-committer-wins on pages, plus validation of the pages read, which refuses the classic write skew (two transactions that each read what the other writes). It is still possible in three cases: `mw_readcheck=0` (the validation is off), the reads of page 1 (the header of the file: not validated), and transactions on attached databases (not atomic across the files). Serializability is tested, not proved. To protect an invariant that a transaction only reads, make both transactions write a shared row with a real change (`UPDATE guard SET n = n + 1`): they then conflict whatever they read. The application must retry a transaction that fails with `SQLITE_BUSY_SNAPSHOT` (the whole transaction).
 - A schema change waits up to 2 s for the write transactions of the other connections to end, then goes ahead; a transaction that overlapped it fails on the schema cookie with `SQLITE_BUSY_SNAPSHOT` when it tries to write, and is retried (as a stock WAL reader that tries to write after a commit). A change of the temporary schema does not wait.
 - Throughput of one database is bounded by the publication of a commit (about 40 us in the processes mode) and by true conflicts: many writers on the same row serialise, and the rebase does not help them.

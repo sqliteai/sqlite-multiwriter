@@ -177,6 +177,8 @@ struct mw_lane {
     uint32_t   *rs_list;
     int         rs_n, rs_cap;
     bool        norebase;       // this connection is itself a rebase helper: never rebase recursively
+    bool        spec_on;        // speculative snapshots for this connection's write transactions (URI mw_spec, default 1; MW_NO_SPEC=1 turns the default off): see mw_lane_snapshot_begin
+    bool        rb_helper;      // it is the helper of the rebase (not only a connection that asked not to rebase): it reads speculatively, and its reads reach no application
     bool        rebase_on;      // URI mw_rebase=1: a commit that conflicts on pages only is replayed at the latest snapshot (multiwriter_rebase.c)
     bool        rb_nobackoff;   // URI mw_rebase_backoff=0 (tests): replay every conflict, whatever happened to the last ones
     sqlite3_stmt *rd_cur;   // the statement that is running (mw_rebase=1 connections; set by the statement hook), and what the transaction did before it:
@@ -218,6 +220,9 @@ struct mw_lane {
     int         sync_level;     // PRAGMA synchronous as observed on this connection (default FULL = 2)
     int         retry_credit;   // >0: the lane recently conflicted; its next transactions are serialised (hot spots); decays per successful commit
     bool        holds_hot;      // this lane's current snapshot holds db->hot_mu
+    bool        write_intent;   // the statement that is starting writes (or is BEGIN IMMEDIATE/EXCLUSIVE): a snapshot taken now may be speculative
+    bool        spec;           // the current snapshot is above the visible epoch: it includes commits that are installed and not yet durable
+    uint64_t    spec_gen;       // db->spec_gen when that snapshot was taken
     bool        ddl_active;     // this lane owns the schema barrier (released when its transaction ends)
     _Atomic bool write_locked;   // WAL write lock held inside the current snapshot
     bool        snapshot_held;  // registered in db->lanes as an active snapshot
@@ -254,6 +259,8 @@ struct mw_lane {
 #define MW_VIS_SLOTS 256
 struct mw_vis_slot { pthread_mutex_t mu; pthread_cond_t cv; _Atomic int waiters; _Atomic uint64_t ready; };
 
+#define MW_SPEC_RING 1024
+#define MW_SPEC_SCAN 256     /* the longest run of installed epochs a speculative snapshot looks at */
 struct mw_db {
     char             *path;
     int               mode;             // 1 = lane tracking on the stock WAL, 2 = private lanes
@@ -343,10 +350,12 @@ struct mw_db {
     // multi-process mode (mw_mp=1)
     bool              mp_req, mp;          // requested at open / active
     bool              has_log;             // a log file exists (set once when it is opened, before any commit): read by publishers instead of the logfd that a rewrite replaces
-    _Atomic int       inflight;            // commits inside lane_publish (the recovery of a failed log waits for them to leave)
+    // (the atomics that follow plain fields start a word of their own: gcc reads mp_req, mp and has_log together with one 8-byte load, which took in the atomic that came next, a data race for
+    // ThreadSanitizer built with gcc, in mw_log_rewrite_prepare against lane_publish)
+    _Alignas(8) _Atomic int inflight;      // commits inside lane_publish (the recovery of a failed log waits for them to leave)
     _Atomic int       recovering;          // a recovery in place is running
     mw_store         *retired[8]; int nretired;   // stores replaced by a recovery: readers that were inside them may still look (freed with the database)
-    _Atomic bool      open_done;           // the first connection finished opening (a database whose open failed has nothing to flush)
+    _Alignas(8) _Atomic bool open_done;    // the first connection finished opening (a database whose open failed has nothing to flush)
     _Atomic int       mp_nprocs;           // processes registered on this database, as last counted by the admission control
     bool              compact_claimed;     // this process holds the compaction claim (shared mode)
     struct mw_seglog *sl;                  // the segmented log (shared mode)
@@ -362,6 +371,9 @@ struct mw_db {
     pthread_mutex_t   mp_mu;               // serialises publication inside this process
     _Atomic int       failed;              // sticky I/O failure: no further commits
     _Atomic uint64_t  next_epoch;          // last *assigned* epoch (>= epoch; the difference is in-flight commits)
+    _Atomic uint64_t  spec_inst[MW_SPEC_RING];   // one process: slot e % MW_SPEC_RING holds e once the versions of epoch e are installed (visible or not yet durable); a speculative snapshot is the
+                                                //   contiguous run of them above the visible epoch. No committer waits for another: one that is late leaves a gap, and the snapshots stop below it
+    _Atomic uint64_t  spec_gen;            // bumped whenever installed epochs are taken back (a commit whose record failed, a recovery): a speculative snapshot of an older generation must not commit
     _Atomic uint64_t  n_pages_published, n_log_sync_ns;
     _Atomic uint64_t  n_compactions, n_compaction_ns, n_compacted_pages, n_log_syncs;
     int               fd_real;             // real database file (compaction), -1 when closed
@@ -612,6 +624,13 @@ int       mw_shared_compact (mw_db *db, mw_compact_result *out);
 bool      mw_shared_compact_claim (mw_db *db, bool by_size);        // election: one process (the first to claim) runs the next background compaction
 uint64_t  mw_snap_for (const mw_validate *v, uint32_t pgno);              // the epoch a page is validated against (pages.c)
 static inline uint64_t mw_db_visible_epoch (mw_db *db) { return db->mp_req ? mw_shared_visible_epoch(db) : atomic_load(&db->epoch); }
+// Speculative snapshots (one process): a write transaction reads at the newest *installed* epoch, not at the newest durable one, so that a chain of commits that depend on each other
+// (appends to one table: each takes the rowid after the previous one) shares one group fsync instead of paying one each. Per connection: URI mw_spec=0 turns it off; MW_NO_SPEC=1 makes 0 the default.
+bool mw_spec_on (void);
+void mw_lane_turn_release (mw_lane *lane);
+void mw_lane_spec_settle (mw_lane *lane);
+void mw_spec_forget (mw_db *db);
+uint64_t mw_spec_top (mw_db *db);
 
 // The log size at which compaction is requested. Many processes (> 16): 8 MB instead of the configured size: measured 8 MB vs 32 MB, 32 processes 10.2k -> 11.2k,
 // 64: 7.3k -> 8.2k tx/s (the mapping's working set stays in the caches), but 8 processes -8%.

@@ -224,6 +224,12 @@ void mw_gate_close (mw_db *db, mw_lane *owner) {
     while (atomic_load(&db->gate_active) > 0) { sched_yield(); if (!warned && now_ns() - tg0 > 3000000000ull && mw_debug_on()) { warned = true; fprintf(stderr, "gate_close: stuck waiting for publishers (active=%d)\n", atomic_load(&db->gate_active)); } }             // let in-flight publishers finish
     // ... and let every epoch already assigned become visible, so the next snapshot is the final state
     // shared mode: commits are visible in one step under the publication lock; the local epoch counters do not follow other processes'
+    // With speculative snapshots the replay reads what is installed: every epoch assigned must be installed, not durable (waiting for their fsync held every publisher for it)
+    if (!db->mp && !db->mp_req && owner && owner->spec_on) {
+        while (mw_spec_top(db) < atomic_load(&db->next_epoch) && atomic_load(&db->epoch) != atomic_load(&db->next_epoch) && !atomic_load(&db->failed)) sched_yield();
+        atomic_fetch_add(&db->n_gate_closures, 1);
+        return;
+    }
     while (!db->mp_req && atomic_load(&db->epoch) != atomic_load(&db->next_epoch) && !atomic_load(&db->failed)) { sched_yield(); if (!warned && now_ns() - tg0 > 3000000000ull && mw_debug_on()) { warned = true; fprintf(stderr, "gate_close: stuck waiting for epoch %llu to become visible (next_epoch %llu)\n", (unsigned long long)atomic_load(&db->epoch), (unsigned long long)atomic_load(&db->next_epoch)); } }
     atomic_fetch_add(&db->n_gate_closures, 1);
 }
@@ -385,6 +391,9 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
     uint64_t tsq0 = MW_T0();
     if (db->has_log) mw_log_decide_mode(db, sync);
     mw_spinlock(&st->seq_mu);
+    if (lane && lane->spec && atomic_load(&db->spec_gen) != lane->spec_gen) {      // (commits that the speculative snapshot includes were taken back: under seq_mu, where they are taken back)
+        pthread_mutex_unlock(&st->seq_mu); pub_release(db, st, &locked); atomic_fetch_add(&db->n_read_conflicts, 1); rc = MW_CONFLICT_READ; goto fail_free;
+    }
     uint64_t epoch = atomic_load(&db->next_epoch) + 1;
     if (st->nsizes == st->sizes_cap) {
         int cap = st->sizes_cap ? st->sizes_cap * 2 : 64;
@@ -419,6 +428,10 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
         for (int i = 0; i < n; i++) if (pgnos[i] == 1 && db->p1_cache) { memcpy(db->p1_cache, copies[i], (size_t)st->pgsz); atomic_store_explicit(&db->p1_cache_epoch, epoch, memory_order_release); break; }
     }
     pub_release(db, st, &locked);
+    if (!db->mp) {
+        atomic_store_explicit(&db->spec_inst[epoch % MW_SPEC_RING], epoch, memory_order_release);      // installed: a speculative snapshot may include it (once the epochs before it are installed too)
+        if (lane && lane->holds_hot && lane->spec_on) mw_lane_turn_release(lane);
+    }
     if (lane && lane->holds_reloc) MW_T1(MW_ST_H_INSTALL, tin0);
     if (lane && lane->holds_reloc) { lane->holds_reloc = false; MW_T1(MW_ST_RELOCHOLD, lane->reloc_t0); pthread_mutex_unlock(&db->reloc_mu); }      // (a relocation: the next one may go, our pages are installed)
     if (n > 16) { free(copies); free(chains); }
@@ -441,6 +454,8 @@ static int publish_impl (mw_db *db, mw_lane *lane, const mw_validate *v, const u
         bool latest = atomic_load(&db->next_epoch) == epoch && MW_LOG_OFF(db) == log_off + mw_log_record_size(db, n, 0);
         if (latest) {
             st->nsizes--;
+            atomic_store(&db->spec_inst[epoch % MW_SPEC_RING], 0);              // (its mark first, then the generation: a snapshot that read the new generation cannot include it)
+            atomic_fetch_add(&db->spec_gen, 1);
             atomic_store(&db->next_epoch, epoch - 1);
             __atomic_store_n(&db->log_off, log_off, __ATOMIC_RELAXED);
         } else {

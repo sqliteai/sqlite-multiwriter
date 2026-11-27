@@ -293,7 +293,9 @@ int mw_shared_publish (mw_db *db, mw_lane *lane, const mw_validate *v, const uin
         mw_seglog_discard(db, atomic_load(&sh->pend_seg), atomic_load(&sh->pend_off));
         atomic_store(&sh->sl_seg, atomic_load(&sh->pend_seg)); atomic_store_explicit(&sh->sl_end, atomic_load(&sh->pend_off), memory_order_release);
         atomic_store_explicit(&sh->pend_epoch, 0, memory_order_release);
-        if (n > 16) free(locs); ADOPT_FREE(); return SQLITE_FULL;
+        if (n > 16) free(locs);
+        ADOPT_FREE();
+        return SQLITE_FULL;
     }
     MW_T1(MW_ST_SH_INSTALL, ti0);
     if (n > 16) free(locs);

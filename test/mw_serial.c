@@ -374,7 +374,10 @@ static void procs_run (const char *path, int keys, int nprocs, double secs, int 
     g_procs_mode = 1; g_path = path; g_keys = keys; g_secs = secs;
     proc_h pid[32]; int gen[32]; struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int i = 0; i < nprocs; i++) { gen[i] = 0; pid[i] = proc_start(i, 0); }
-    unsigned rng = 555u; int kills = 0, crashes = 0; double next_kill = (double)kill_ms / 1000.0; int sampled = 0; long long last_tot = -2; double last_move = 0, last_poll = 0;
+    unsigned rng = 555u; int kills = 0, crashes = 0; double next_kill = (double)kill_ms / 1000.0;
+#ifndef _WIN32
+    int sampled = 0; long long last_tot = -2; double last_move = 0, last_poll = 0;      // (the sampling of a stall below: POSIX only)
+#endif
     for (;;) {
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         double el = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;

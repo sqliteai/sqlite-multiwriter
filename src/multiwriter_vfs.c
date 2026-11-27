@@ -81,10 +81,24 @@ static bool mw_is_ddl_sql (const char *sql) {
     for (unsigned i = 0; i < sizeof(kw) / sizeof(kw[0]); i++) if (sqlite3_strnicmp(sql, kw[i], (int)strlen(kw[i])) == 0) return !mw_is_temp_ddl(sql);
     return false;
 }
+// A statement that writes (sqlite3_stmt_readonly is true for BEGIN, which takes the snapshot when it is IMMEDIATE or EXCLUSIVE).
+static bool mw_writes_stmt (sqlite3_stmt *st) {
+    if (!sqlite3_stmt_readonly(st)) return true;
+    const char *sql = sqlite3_sql(st);
+    if (!sql) return false;
+    char w[16]; const char *p = ddl_word(sql, w, sizeof w);
+    if (strcmp(w, "begin")) return false;
+    ddl_word(p, w, sizeof w);
+    return strcmp(w, "immediate") == 0 || strcmp(w, "exclusive") == 0;
+}
 static int mw_trace_cb (unsigned type, void *ctx, void *p, void *x) {
     (void)x;
     if (type != SQLITE_TRACE_STMT && type != SQLITE_TRACE_PROFILE) return 0;
     sqlite3_stmt *st = (sqlite3_stmt *)p;
+    if (mw_writes_stmt(st)) {                                   // (a write: the snapshot that it takes, if it takes one, may include commits that are not durable yet; see mw_spec_on)
+        int on = type == SQLITE_TRACE_STMT;
+        sqlite3_file_control(sqlite3_db_handle(st), "main", MW_FCNTL_WRITE_INTENT, &on);
+    }
     if (ctx) {                                                  // a mw_rebase=1 connection: what the transaction reads (mw_lane_reads_unchanged)
         mw_stmt_note n = { type == SQLITE_TRACE_PROFILE, sqlite3_get_autocommit(sqlite3_db_handle(st)), st };
         sqlite3_file_control(sqlite3_db_handle(st), "main", MW_FCNTL_STMT, &n);
@@ -309,6 +323,8 @@ static int mw_open (sqlite3_vfs *vfs, const char *name, sqlite3_file *pf, int fl
         if (small || sqlite3_uri_parameter(name, "mw_base_cache_mb")) { db->base_cache_bytes = (uint64_t)sqlite3_uri_int64(name, "mw_base_cache_mb", small ? 8 : 64) << 20; if (db->store) db->store->base_limit = db->base_cache_bytes; }
         if (small && !sqlite3_uri_parameter(name, "mw_log_max_mb")) db->log_max_bytes = 16ull << 20;
         lane->norebase = sqlite3_uri_boolean(name, "mw_norebase", 0) != 0;
+        lane->rb_helper = lane->norebase && sqlite3_uri_boolean(name, "mw_rbhelper", 0);      // (internal: the helper connection of the rebase, see mw_lane_snapshot_begin)
+        lane->spec_on = sqlite3_uri_boolean(name, "mw_spec", mw_spec_on()) != 0;            // (speculative snapshots of the writers: on unless the URI or MW_NO_SPEC says otherwise)
         lane->rebase_on = sqlite3_uri_boolean(name, "mw_rebase", 0) != 0 && !lane->norebase;
         lane->rb_nobackoff = !sqlite3_uri_boolean(name, "mw_rebase_backoff", 1);
         lane->noreloc = sqlite3_uri_boolean(name, "mw_noreloc", 0) != 0;

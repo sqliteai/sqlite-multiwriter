@@ -14,7 +14,8 @@
 //    2. outside any lock the record is written; with synchronous>=FULL it is fsynced (group commit);
 //    3. only then does the epoch become visible, and only after the previous epoch did.
 //  A commit is therefore never visible before its record is persisted according to the requested
-//  synchronous level. Recovery replays the longest prefix of valid, epoch-contiguous records past
+//  synchronous level. (A write transaction may read it before, speculatively: it is acknowledged only when
+//  its own record, which comes later in the log, is persisted; see mw_spec_on.) Recovery replays the longest prefix of valid, epoch-contiguous records past
 //  base_epoch (the compacted epoch), ignoring a torn tail.
 //
 //  The log file is flock()ed for the lifetime of the database: a second Multi-Writer process opening
@@ -395,6 +396,7 @@ int mw_db_recover (mw_db *db) {
     free(db->p1_cache); db->p1_cache = NULL; db->p1_cache_epoch = 0;
     pthread_mutex_lock(&nst->seq_mu);
     __atomic_store_n(&db->log_off, E, __ATOMIC_RELAXED);
+    mw_spec_forget(db);                                                                // (the speculative snapshots above V read commits that are gone: refused, see spec_gen)
     atomic_store(&db->next_epoch, V);
     pthread_mutex_unlock(&nst->seq_mu);
     pthread_mutex_lock(&db->log_mu);

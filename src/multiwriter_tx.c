@@ -21,6 +21,42 @@ static int turn_slots (void) { static _Atomic int c = MW_KNOB_UNSET; int v = mw_
 
 static inline bool db_mp_flag (mw_lane *lane) { return lane->db->mp; }
 
+// Epochs are taken back (a record that could not be written, a recovery): their marks go first, then the generation is bumped (seq_mu held: no epoch is assigned meanwhile).
+void mw_spec_forget (mw_db *db) {
+    for (int i = 0; i < MW_SPEC_RING; i++) atomic_store(&db->spec_inst[i], 0);
+    atomic_fetch_add(&db->spec_gen, 1);
+}
+
+// The newest epoch up to which every epoch is installed (the top of a speculative snapshot taken now).
+uint64_t mw_spec_top (mw_db *db) {
+    uint64_t s = mw_db_visible_epoch(db);
+    for (int k = 0; k < MW_SPEC_SCAN && atomic_load_explicit(&db->spec_inst[(s + 1) % MW_SPEC_RING], memory_order_acquire) == s + 1; k++) s++;
+    return s;
+}
+
+bool mw_spec_on (void) { static _Atomic int c = MW_KNOB_UNSET; return !mw_knob_flag(&c, "MW_NO_SPEC"); }
+
+// The turn of a hot spot is given back as soon as the commit that holds it is installed (speculative snapshots): the next holder reads it at once, it does not wait for the fsync.
+void mw_lane_turn_release (mw_lane *lane) {
+    if (!lane->holds_hot || lane->db->mp || lane->hot_shared) return;
+    lane->holds_hot = false;
+    atomic_fetch_sub(&lane->db->hot_held, 1);
+}
+
+// A speculative snapshot that ends without a commit of its own (the write statement changed nothing, or the transaction was rolled back) may have shown the application rows of commits
+// that are not durable yet: the transaction ends only once they are (or the database failed, or they were taken back). A commit needs none of this: it is acknowledged when its own record
+// is durable, and the log is durable as a prefix.
+void mw_lane_spec_settle (mw_lane *lane) {
+    if (!lane->spec) return;
+    lane->spec = false;
+    mw_db *db = lane->db;
+    const uint64_t s = lane->tx.snapshot_epoch;
+    for (unsigned i = 0; atomic_load_explicit(&db->epoch, memory_order_acquire) < s && !atomic_load(&db->failed) && atomic_load(&db->spec_gen) == lane->spec_gen; i++) {
+        if (i < 64) sched_yield();
+        else { struct timespec ts = { 0, 20000 }; nanosleep(&ts, NULL); }
+    }
+}
+
 void mw_lane_init (mw_lane *lane, mw_db *db) {
     memset(lane, 0, sizeof(*lane));
     lane->db = db;
@@ -106,6 +142,13 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
     for (;;) {
         sqlite3_mutex_enter(db->mu);
         lane->tx.snapshot_epoch = mw_db_visible_epoch(db);
+        lane->spec = false;
+        if ((lane->write_intent || lane->rb_helper) && !db->mp && !db->mp_req && lane->private_mode && !atomic_load(&db->failed) && lane->spec_on) {      // (the helper of the rebase: its replay must read at least what the transaction it replays read, which may be speculative; it shows nothing to an application; a failed database has installed commits that will never be durable: the commit that recovers it must not have read them)
+            // (the generation first: if epochs are taken back after it was read, the commit of this snapshot is refused; if before, their marks were cleared before it was bumped)
+            uint64_t g = atomic_load(&db->spec_gen), s = mw_spec_top(db);
+            if (s > lane->tx.snapshot_epoch) { lane->tx.snapshot_epoch = s; lane->spec = true; lane->spec_gen = g; }
+        }
+        lane->write_intent = false;
         lane->next_active = db->active;
         lane->prev_active = NULL;
         if (db->active) db->active->prev_active = lane;
@@ -154,6 +197,9 @@ void mw_lane_snapshot_begin (mw_lane *lane) {
 void mw_lane_snapshot_end (mw_lane *lane) {
     mw_db *db = lane->db;
     if (!lane->snapshot_held) return;
+    // (not after a commit: it waited for its own record; not after a refusal: the application was told that the transaction failed; not for the helper of the rebase: the transaction it replays is told the outcome of its own commit)
+    if (lane->spec && lane->tx.state == MW_TX_ACTIVE && !lane->rb_helper) mw_lane_spec_settle(lane);
+    lane->spec = false;
     sqlite3_mutex_enter(db->mu);
     if (lane->prev_active) lane->prev_active->next_active = lane->next_active;
     else db->active = lane->next_active;

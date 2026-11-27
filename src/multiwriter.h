@@ -23,10 +23,10 @@ extern "C" {
 #endif
 
 // The version of the extension: the single place it is written (the Makefile, the packages and the release read it from here).
-#define MW_VERSION "0.6.5"
+#define MW_VERSION "0.7.0"
 #define MW_VERSION_MAJOR 0
-#define MW_VERSION_MINOR 6
-#define MW_VERSION_PATCH 5
+#define MW_VERSION_MINOR 7
+#define MW_VERSION_PATCH 0
 #define MW_VERSION_NUMBER (MW_VERSION_MAJOR * 1000000 + MW_VERSION_MINOR * 1000 + MW_VERSION_PATCH)
 #if defined(MW_LOADABLE) && defined(_WIN32)
 #define MW_API __declspec(dllexport)         // the loadable extension exports its entry points and nothing else
@@ -99,6 +99,7 @@ typedef struct {
 
 #define MW_FCNTL_DDL_RELEASE_IDLE 0x4d57000f   // internal: a statement ended; the schema barrier it raised is given back if no snapshot of the main file is open
 #define MW_FCNTL_STMT 0x4d570011   // internal: mw_stmt_note * (a statement of a mw_rebase=1 connection starts or ends)
+#define MW_FCNTL_WRITE_INTENT 0x4d570012   // internal: int * (1: a statement that writes is starting, 0: it ended)
 typedef struct { int ending; int autocommit; sqlite3_stmt *stmt; } mw_stmt_note;
 #define MW_FCNTL_DDL_BEGIN 0x4d570009   // internal: a schema-changing statement is about to run (exclusive schema barrier)
 #define MW_FCNTL_LANE_PTR 0x4d57000b   // internal: void ** (the connection's lane)

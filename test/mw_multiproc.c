@@ -2,6 +2,8 @@
 // Children are forked BEFORE the database is opened in the parent (a forked lane state is not shareable).
 #include <pthread.h>
 #include <signal.h>
+#include <poll.h>
+#include <time.h>
 #include <sys/wait.h>
 #include "mw_test.h"
 #include "multiwriter.h"
@@ -42,6 +44,7 @@ static void make_db (const char *path) {
 
 typedef struct { const char *path; int proc, thread, row, iters, kind; int64_t ok, retries; const char *extra; } job_t;
 static volatile int g_stop;
+static int g_ack_fd = -1;          // the victim of a kill (scenario 4): a byte for each of the first commits of each thread, so that it is killed after it has committed, not after a fixed time
 
 // kind 0: own row, disjoint pages; 1: shared counter (retry until committed); 2: unique inserts into a tracked table
 static void *worker (void *arg) {
@@ -55,7 +58,7 @@ static void *worker (void *arg) {
         else snprintf(sql, sizeof sql, "INSERT INTO docs VALUES('p%d-t%d-%d',%d,'body %d')", j->proc, j->thread, i, j->proc, i);
         for (int a = 0; a < 5000; a++) {
             int rc = mw_exec(db, sql);
-            if (rc == SQLITE_OK) { j->ok++; break; }
+            if (rc == SQLITE_OK) { j->ok++; if (g_ack_fd >= 0 && j->ok <= 25) (void)!write(g_ack_fd, "x", 1); break; }
             if ((rc & 0xff) != SQLITE_BUSY) { fprintf(stderr, "proc %d thread %d iter %d: rc=%d ext=%d %s\n", j->proc, j->thread, i, rc, sqlite3_extended_errcode(db), sqlite3_errmsg(db)); break; }
             j->retries++;
             if (a == 4999) fprintf(stderr, "proc %d thread %d iter %d: gave up after 5000 retries, last rc=%d\n", j->proc, j->thread, i, sqlite3_extended_errcode(db));
@@ -82,6 +85,7 @@ static void child_main (int wfd, const char *path, int proc, int nthreads, int k
 
 static int spawn (int *rfd, const char *path, int proc, int nthreads, int kind, int iters, int row_base, const char *extra) {
     int pfd[2]; CHECK(pipe(pfd) == 0);
+    fflush(NULL);                                       // (a child must not inherit what the parent has printed and not yet written: under ThreadSanitizer its _exit writes it again)
     pid_t pid = fork();
     if (pid == 0) { close(pfd[0]); child_main(pfd[1], path, proc, nthreads, kind, iters, row_base, extra); }
     close(pfd[1]);
@@ -149,9 +153,20 @@ int main (void) {
     // ---- 4. SIGKILL one process while the others keep writing
     mw_tmpdb(path, sizeof path, "mp4"); snprintf(lp, sizeof lp, "%s-mw", path); snprintf(mp, sizeof mp, "%s-mwlock", path); unlink(lp); unlink(mp);
     make_db(path);
-    for (int p = 0; p < 3; p++) pid[p] = spawn(&rfd[p], path, p, 4, 0, p == 0 ? 0 : 3000, 1 + p * 4, "&mw_compact_ms=5");   // proc 0 runs until killed
-    struct timespec ts = { 0, 150 * 1000000L }; nanosleep(&ts, NULL);
+    int ack[2]; CHECK(pipe(ack) == 0);
+    g_ack_fd = ack[1];
+    for (int p = 0; p < 3; p++) { pid[p] = spawn(&rfd[p], path, p, 4, 0, p == 0 ? 0 : 3000, 1 + p * 4, "&mw_compact_ms=5"); g_ack_fd = -1; }   // proc 0 runs until killed (only it acknowledges)
+    close(ack[1]);
+    {   // killed once it has committed 50 updates (at most a minute): on a slow machine (ThreadSanitizer) a fixed 150 ms killed it before its first commit, and "killed > 0" failed
+        int got = 0; char buf[64];
+        for (int waited = 0; got < 50 && waited < 60000; ) {
+            struct pollfd pf = { ack[0], POLLIN, 0 };
+            if (poll(&pf, 1, 100) > 0) { ssize_t r = read(ack[0], buf, sizeof buf); if (r <= 0) break; got += (int)r; } else waited += 100;
+        }
+        if (got < 50) fprintf(stderr, "mw_multiproc: the process to kill had %d acknowledged commits (wanted 50)\n", got);
+    }
     kill(pid[0], SIGKILL);
+    close(ack[0]);
     int st; waitpid(pid[0], &st, 0); CHECK(WIFSIGNALED(st));
     int64_t survivors = 0;
     for (int p = 1; p < 3; p++) { survivors += collect(rfd[p], NULL); waitpid(pid[p], &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0); }
@@ -175,6 +190,7 @@ int main (void) {
     make_db(path);
     {
         int go[2], done[2]; CHECK(pipe(go) == 0 && pipe(done) == 0);
+        fflush(NULL);
         pid_t w = fork();
         if (w == 0) {                                   // writer process: waits for the go signal, commits 500 updates, exits
             char c; if (read(go[0], &c, 1) != 1) _exit(2);

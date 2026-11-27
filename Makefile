@@ -90,6 +90,9 @@ $(DIST)/mw_admitcap$(EXE): $(BUILD)/t_mw_admitcap.o $(filter-out $(BUILD)/multiw
 $(DIST)/mw_holesync$(EXE): $(BUILD)/t_mw_holesync.o $(filter-out $(BUILD)/multiwriter_log.o,$(LIB_OBJ)) $(BUILD)/inject_fsync.o
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LDFLAGS)
+$(DIST)/mw_spec$(EXE): $(BUILD)/t_mw_spec.o $(filter-out $(BUILD)/multiwriter_log.o,$(LIB_OBJ)) $(BUILD)/inject_fsync.o
+	@mkdir -p $(DIST)
+	$(CC) $^ -o $@ $(LDFLAGS)
 $(DIST)/mw_stagednormal$(EXE): $(BUILD)/t_mw_stagednormal.o $(filter-out $(BUILD)/multiwriter_log.o,$(LIB_OBJ)) $(BUILD)/inject_log.o
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LDFLAGS)
@@ -119,7 +122,7 @@ TSAN_TESTS := mw_admitcap mw_appendfail mw_attachsync mw_autoextfail mw_closesta
     mw_fastcommit mw_format mw_fullfsync mw_gc mw_holesync mw_identity mw_lanes mw_lanetrim mw_logopen mw_logrewrite mw_logswap mw_mapfail mw_mpstale mw_multiproc \
     mw_multiproc_crash mw_multiproc_liveness mw_openfail mw_openflags mw_openlocks mw_openrace mw_openrepair mw_oslayer mw_ownepoch mw_procs mw_profile mw_readdeps \
     mw_rebase mw_rebasecases mw_rebasefk mw_rebasefkstress mw_rebaseneg mw_rebasenoop mw_rebasepolicy mw_rebaseskew mw_rebasewr mw_recoverread mw_reloc mw_relocprep \
-    mw_repairinstall mw_rollback mw_rollbackrace mw_routes mw_rowdiffoom mw_rowid mw_selfcommit mw_shared mw_sharedwindow mw_shidx mw_sizering mw_slotstuck mw_stacked \
+    mw_repairinstall mw_rollback mw_rollbackrace mw_routes mw_rowdiffoom mw_rowid mw_selfcommit mw_shared mw_sharedwindow mw_shidx mw_sizering mw_slotstuck mw_spec mw_stacked \
     mw_stagedlog mw_stagednormal mw_stalewal mw_store mw_strictany mw_structural mw_syfail mw_syncpragma mw_syncwindow mw_tailscan mw_tempbarrier mw_tempddl mw_ticketring \
     mw_trimfail mw_vfs_trace mw_walstatfail mw_warm mw_writeskew
 .PHONY: test-tsan
@@ -139,6 +142,13 @@ $(BUILD)/b_mw_bench.o: bench/mw_bench.c $(HEADERS)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(DIST)/mw_bench$(EXE): $(BUILD)/b_mw_bench.o $(LIB_OBJ)
+	@mkdir -p $(DIST)
+	$(CC) $^ -o $@ $(LDFLAGS)
+bench: $(DIST)/events_bench$(EXE)
+$(BUILD)/b_events_bench.o: bench/events_bench.c $(HEADERS)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(DIST)/events_bench$(EXE): $(BUILD)/b_events_bench.o $(LIB_OBJ)
 	@mkdir -p $(DIST)
 	$(CC) $^ -o $@ $(LDFLAGS)
 

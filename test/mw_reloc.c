@@ -135,7 +135,8 @@ int main (void) {
       CHECK_RC(mw_exec(a, "COMMIT"), SQLITE_OK);
       int rb = mw_exec(b, "COMMIT"), rc = mw_exec(c, "COMMIT");
       printf("index test: commits rc=%d,%d relocations=%llu\n", rb, rc, (unsigned long long)stats(a).relocations);
-      if (rb) mw_exec(b, "ROLLBACK"); if (rc) mw_exec(c, "ROLLBACK");
+      if (rb) mw_exec(b, "ROLLBACK");
+      if (rc) mw_exec(c, "ROLLBACK");
       int64_t expect = 1 + 401 + (rb == 0 ? 401 : 0) + (rc == 0 ? 401 : 0);
       CHECK(mw_scalar(a, "SELECT count(*) FROM t") == expect);
       CHECK(mw_scalar(a, "SELECT count(*) FROM t INDEXED BY tk") == expect);

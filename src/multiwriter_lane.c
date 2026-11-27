@@ -277,6 +277,9 @@ static bool lane_can_rebase (mw_lane *lane, const uint8_t *pg1, uint32_t snapsho
 
 // Publishes the captured write set as one atomic commit at a new epoch.
 // Consecutive refusals after which a long transaction takes the turn (MW_LONG_STARVE).
+// Refusals in a row before a short transaction takes the turn (MW_SHORT_STARVE). With speculative snapshots the turn is given back when the commit is installed, so the next holder does not wait for
+// the fsync and the turn costs little: it is taken at the first refusal (appends with the rowid that SQLite picks: 145 -> 7 retries per 100 tx with 24 writers). Without them, and in the processes mode, after 16.
+static int short_starve (const mw_lane *lane) { static _Atomic int c = MW_KNOB_UNSET; int v = mw_knob_int(&c, "MW_SHORT_STARVE", 0); return v > 0 ? v : lane->spec_on && !lane->db->mp ? 1 : 16; }      // (the processes mode keeps the turn to the end of the transaction: 16)
 static int long_starve (void) { static _Atomic int c = MW_KNOB_UNSET; return mw_knob_int(&c, "MW_LONG_STARVE", 2); }
 
 static int lane_publish_inner (mw_lane *lane);
@@ -375,6 +378,7 @@ static int lane_publish_inner (mw_lane *lane) {
             atomic_fetch_add(&db->schema_generation, 1);
         }
     } else if (rc == MW_CONFLICT) {
+        if (!db->mp && lane->spec_on) mw_lane_turn_release(lane);       // (its attempt on fresh state is made; the relocation or the replay that follows does not need the others to wait, and a replay waits for its own fsync)
         // 1. Was the conflict only that other commits extended the file? Then the transaction's new pages are renumbered above the new end and it commits.
         uint64_t tr0 = MW_T0();
         int rr = lane->noreloc ? MW_RELOC_NA : mw_lane_relocate(lane, &v, lane->ws_pgnos, imgs, lane->ws_n, lane->ws_dbsize, snap_size, lane->sync_level >= 2, &epoch);
@@ -407,7 +411,7 @@ static int lane_publish_inner (mw_lane *lane) {
         // Serialising pays off where a conflict is expensive: a tracked (rebasable) transaction that loses costs a whole rebase. An untracked one just runs
         // its statement again, and waiting for a turn costs more than the occasional retry (measured: 8-32 concurrent bulk / append writers, 1.3-1.5x faster without).
         lane->consec_aborts++;
-        const bool starving = lane->consec_aborts >= (long_tx ? long_starve() : 16);          // (a long transaction that lost twice in a row takes the turn and keeps it for hot_credit*16 transactions: FIFO queue, bounded tail)
+        const bool starving = lane->consec_aborts >= (long_tx ? long_starve() : short_starve(lane));          // (a long transaction that lost twice in a row takes the turn and keeps it for hot_credit*16 transactions: FIFO queue, bounded tail)
         if (!lane->norebase && rc != MW_CONFLICT_SCHEMA && rc != MW_CONFLICT_READ && (starving)) {
             lane->retry_credit = long_tx ? lane->hot_credit * 16 : lane->hot_credit;
             if (mw_timing_on) { extern _Atomic uint64_t mw_grants[2]; atomic_fetch_add(&mw_grants[lane->rebase_on ? 0 : 1], 1); }
@@ -628,6 +632,7 @@ static int lm_read (sqlite3_file *pf, void *buf, int n, sqlite3_int64 off) {
     mw_ev(MW_EV_READ, (mw_file *)pf, off, n, 2);
     mw_store *st = lane->db->store;
     uint64_t snap = lane_snapshot(lane);
+    if (lane->spec && atomic_load(&lane->db->spec_gen) != lane->spec_gen) return SQLITE_IOERR_READ;      // (commits that this snapshot includes were taken back: what is left of it is not one state)
     uint8_t *dst = buf;
     int remaining = n;
     sqlite3_int64 o = off;
@@ -710,6 +715,7 @@ static int lm_file_control (sqlite3_file *pf, int op, void *arg) {
     }
     if (op == MW_FCNTL_DBSTATS) { mw_lane_fill_stats(lane, (mw_db_stats *)arg); return SQLITE_OK; }
     if (op == MW_FCNTL_STMT) { mw_lane_stmt_note(lane, (mw_stmt_note *)arg); return SQLITE_OK; }
+    if (op == MW_FCNTL_WRITE_INTENT) { lane->write_intent = *(int *)arg != 0 && !lane->snapshot_held; return SQLITE_OK; }
     if (op == MW_FCNTL_DDL_BEGIN) { mw_lane_ddl_begin(lane); return SQLITE_OK; }
     if (op == MW_FCNTL_DDL_RELEASE_IDLE) { if (lane->ddl_active && !lane->snapshot_held) mw_lane_ddl_end(lane); return SQLITE_OK; }
     if (op == MW_FCNTL_COMPACT) { mw_compact_result *r = (mw_compact_result *)arg; return mw_db_compact(lane->db, r); }

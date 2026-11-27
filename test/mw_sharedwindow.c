@@ -34,9 +34,8 @@ int main (void) {
         if (pid == 0) {
             sqlite3 *b; if (open_mp(path, &b) != SQLITE_OK) _exit(2);
             mw_fault_arm(pts[p], nth);
-            int acked = 0;
             for (int i = 0; i < 20; i++) {
-                if (mw_exec(b, "UPDATE t SET n=n+1 WHERE id=1") == SQLITE_OK) { acked++; (void)!write(fd[1], "x", 1); }
+                if (mw_exec(b, "UPDATE t SET n=n+1 WHERE id=1") == SQLITE_OK) (void)!write(fd[1], "x", 1);      // (the parent counts the acknowledgements from the pipe)
             }
             _exit(0);                              // (the fault point did not fire)
         }
